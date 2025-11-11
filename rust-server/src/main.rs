@@ -35,6 +35,7 @@ async fn eval_handler(Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
         ema_slow = response.ema_slow_last,
         tp_pips = response.tp_pips,
         sl_pips = response.sl_pips,
+        atr = response.atr,
         "Sending evaluation response"
     );
 

@@ -14,7 +14,7 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     if req.closes.len() < required_data {
         return EvalResponse {
             action_advice: "none".into(), tp_pips, sl_pips, // Use default pips
-            reason: format!("insufficient data: need at least {}", required_data),
+            reason: format!("insufficient data: need at least {}", required_data), atr: 0.0,
             rsi: 50.0, ema_fast_last: 0.0, ema_slow_last: 0.0
         };
     }
@@ -61,5 +61,5 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
         tp_pips = (last_atr * tp_multiplier) / pip_size;
     }
 
-    EvalResponse { action_advice: action, tp_pips, sl_pips, reason, rsi: last_rsi, ema_fast_last: last_fast, ema_slow_last: last_slow }
+    EvalResponse { action_advice: action, tp_pips, sl_pips, reason, rsi: last_rsi, ema_fast_last: last_fast, ema_slow_last: last_slow, atr: last_atr }
 }

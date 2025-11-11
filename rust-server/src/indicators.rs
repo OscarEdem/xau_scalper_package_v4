@@ -26,6 +26,7 @@ pub struct EvalResponse {
     pub rsi: f64,
     pub ema_fast_last: f64,
     pub ema_slow_last: f64,
+    pub atr: f64,
 }
 
 pub fn ema(values: &Vec<f64>, period: usize) -> Vec<f64> {
