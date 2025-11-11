@@ -1,0 +1,3 @@
+# Tell linguist to ignore Cargo.lock for language statistics
+# It's a generated file and skews the repository's language breakdown.
+rust-server/Cargo.lock linguist-vendored
