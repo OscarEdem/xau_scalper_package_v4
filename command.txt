@@ -1,0 +1,4 @@
+docker build -t xau-scalper-v4:latest .
+
+todo:
+How can I deploy this Docker container to a cloud server so it can run 24/7?

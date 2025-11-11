@@ -1,0 +1,22 @@
+# Rust / Cargo
+# Ignore the build directory
+/rust-server/target/
+
+# Generated data files
+# This file is created by the Dockerfile or convert.ps1 from xauusd_m1_data.csv
+/rust-server/data.csv
+
+# Ignore local command history or notes
+/command.txt
+
+# IDE/Editor configuration
+.vscode/
+.idea/
+*.iml
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log

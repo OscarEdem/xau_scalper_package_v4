@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  scalper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xau/scalper:v4
+    container_name: xau_scalper_v4
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    environment:
+      - RUST_LOG=info
