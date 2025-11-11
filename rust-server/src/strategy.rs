@@ -1,8 +1,8 @@
-use crate::{atr, ema, rsi, EvalRequest, EvalResponse};
+use crate::{atr, ema, rsi, sma, EvalRequest, EvalResponse}; // Import sma
 
 pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
-    let rsi_period = req.rsi_period.unwrap_or(14); // From backtest: 14
-    let ema_fast_p = req.ema_fast.unwrap_or(11); // From backtest: 11
+    let rsi_period = req.rsi_period.unwrap_or(16); // From backtest: 16
+    let ema_fast_p = req.ema_fast.unwrap_or(5);   // From backtest: 5
     let ema_slow_p = req.ema_slow.unwrap_or(50); // From backtest: 50
     let atr_period = req.atr_period.unwrap_or(14);
     let mut tp_pips = req.tp_pips.unwrap_or(0.0); // Will be calculated by ATR
@@ -29,6 +29,11 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     let prev_slow = ema_s[n-2]; let last_slow = ema_s[n-1];
     let last_rsi = rsi_vals[n-1];
     let last_atr = atr_vals.last().cloned().unwrap_or(0.0);
+    
+    // --- NEW: Add RSI Momentum Filter ---
+    let rsi_ma = sma(&rsi_vals, 10); // 10-period SMA of RSI
+    let last_rsi_ma = rsi_ma.last().cloned().unwrap_or(50.0);
+    let rsi_momentum_confirms_buy = last_rsi > last_rsi_ma;
 
     // --- Trader's Insight: Add Price Action Confirmation ---
     // For a buy, the close should be above the slow EMA. For a sell, below.
@@ -36,9 +41,9 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     let price_confirms_buy = last_close > last_slow;
     let price_confirms_sell = last_close < last_slow;
 
-    let (action, reason) = if prev_fast <= prev_slow && last_fast > last_slow && price_confirms_buy {
-        if last_rsi < 80.0 { ("buy".to_string(), format!("bull cross; RSI {:.1} < 80", last_rsi)) }
-        else { ("none".to_string(), format!("bull cross; RSI {:.1} >= 80 (skip)", last_rsi)) }
+    let (action, reason) = if prev_fast <= prev_slow && last_fast > last_slow && price_confirms_buy && rsi_momentum_confirms_buy {
+        if last_rsi < 80.0 { ("buy".to_string(), format!("bull cross; RSI momo ok; RSI {:.1} < 80", last_rsi)) }
+        else { ("none".to_string(), format!("bull cross; RSI momo ok; RSI {:.1} >= 80 (skip)", last_rsi)) }
     } else if prev_fast >= prev_slow && last_fast < last_slow && price_confirms_sell {
         if last_rsi > 20.0 { ("sell".to_string(), format!("bear cross; RSI {:.1} > 20", last_rsi)) }
         else { ("none".to_string(), format!("bear cross; RSI {:.1} <= 20 (skip)", last_rsi)) }
@@ -48,7 +53,7 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
 
     // --- Trader's Insight: Use ATR for dynamic TP/SL ---
     if action != "none" {
-        let sl_multiplier = req.sl_atr_multiplier.unwrap_or(2.0); // From backtest: 2.0
+        let sl_multiplier = req.sl_atr_multiplier.unwrap_or(1.0); // From backtest: 1.0
         let tp_multiplier = req.tp_atr_multiplier.unwrap_or(1.5); // From backtest: 1.5
 
         let pip_size = 0.01;

@@ -1,7 +1,7 @@
 // XAU_ScalperBridge.mq5 v4 — production-leaning bridge (Exness).
 // Modified to call the external Rust server for trading logic.
 #property strict
-#property version   "4.1"
+#property version   "4.2"
 #include <Trade\Trade.mqh>
 
 #property description "Calls an external server for XAU/USD scalping signals."
@@ -15,11 +15,17 @@ input double DefaultSL = 10.0;
 input double MaxSpreadPoints = 160; // Changed default value to 50
 input ulong  MagicNumber = 1337;
 
+// --- Trailing Stop Inputs ---
+input bool   UseTrailingStop = true;
+input double TrailingStopATRMlt = 1.0; // From best backtest result
+input int    TrailingATRPeriod = 14;
+
 // --- Global Variables ---
 CTrade trade;
 char post_data[];
 char result[];
 string result_headers;
+int    atr_handle; // Handle for the ATR indicator
 
 // --- Function Prototypes ---
 void ClosePositions(ENUM_POSITION_TYPE direction);
@@ -27,6 +33,7 @@ void CreateLabel(const long chart_ID, const string name, const int x, const int 
 void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, double current_spread, double current_balance);
 double CalculateLotSize(double stop_loss_pips, string symbol, double point_value);
 string GetJsonValue(string json, string key, bool is_string);
+void ManageTrailingStops();
 
 int OnInit() {
   // Make sure the terminal is configured to allow WebRequest
@@ -34,19 +41,28 @@ int OnInit() {
   // Go to Tools -> Options -> Expert Advisors and add the ServerUrl
   Print("XAU Scalper Bridge initialized. Server URL: ", ServerUrl);
   return(INIT_SUCCEEDED);
+  
+  // Create ATR indicator handle for trailing stop
+  atr_handle = iATR(_Symbol, PERIOD_M1, TrailingATRPeriod);
+  if(atr_handle == INVALID_HANDLE) {
+    Print("Failed to create ATR indicator handle. Error: ", GetLastError());
+    return(INIT_FAILED);
+  }
+  return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason) {
   // Clean up all graphical objects created by this EA
   ObjectsDeleteAll(0, "XauBridge_");
   Comment(""); // Clear the corner comment
+  IndicatorRelease(atr_handle); // Release the indicator handle
   ChartRedraw();
 }
 
 void OnTick(){
   static datetime last_bar=0;
   MqlRates rates[];
-  
+
   // Only run on the open of a new M1 bar
   if(CopyRates(_Symbol, PERIOD_M1, 0, 1, rates) < 1) return;
   if(rates[0].time == last_bar) return;
@@ -158,6 +174,12 @@ void OnTick(){
       trade.Sell(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL");
     }
   }
+  
+  // --- Trailing Stop Management (runs on every tick) ---
+  // This part is outside the new bar check
+  if(UseTrailingStop) {
+    ManageTrailingStops();
+  }
 }
 
 // --- Trade Management Functions ---
@@ -170,6 +192,58 @@ void ClosePositions(ENUM_POSITION_TYPE direction) {
   }
 }
 
+void ManageTrailingStops() {
+  // Get the latest ATR value
+  double atr_buffer[];
+  if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1) {
+    Print("Could not get ATR value for trailing stop.");
+    return;
+  }
+  double current_atr = atr_buffer[0];
+
+  // Loop through all open positions
+  for(int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong ticket = PositionGetTicket(i);
+    if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+      
+      double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      double current_sl = PositionGetDouble(POSITION_SL);
+      double current_tp = PositionGetDouble(POSITION_TP);
+      
+      double new_sl = 0;
+      
+      // --- Logic for a LONG position ---
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+        double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        // Calculate potential new stop loss
+        new_sl = current_bid - (current_atr * TrailingStopATRMlt);
+        
+        // Check if the new SL is higher than the entry price and also higher than the current SL
+        if(new_sl > entry_price && new_sl > current_sl) {
+          // Modify the position with the new trailing stop
+          if(!trade.PositionModify(ticket, new_sl, current_tp)) {
+            Print("Error modifying position #", ticket, " for trailing stop. Code: ", GetLastError());
+          }
+        }
+      }
+      
+      // --- Logic for a SHORT position ---
+      else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
+        double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        // Calculate potential new stop loss
+        new_sl = current_ask + (current_atr * TrailingStopATRMlt);
+        
+        // Check if the new SL is lower than the entry price and also lower than the current SL
+        if(new_sl < entry_price && (new_sl < current_sl || current_sl == 0)) {
+          // Modify the position with the new trailing stop
+          if(!trade.PositionModify(ticket, new_sl, current_tp)) {
+            Print("Error modifying position #", ticket, " for trailing stop. Code: ", GetLastError());
+          }
+        }
+      }
+    }
+  }
+}
 // --- Graphical Dashboard Functions ---
 
 // Helper to create or update a text label on the chart
@@ -211,7 +285,7 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
     signal_color = clrSilver;
   }
 
-  CreateLabel(chart_ID, "XauBridge_Title", x_pos, y_pos, "🌉 XAU SCALPER BRIDGE v4.1", default_color); y_pos -= y_step;
+  CreateLabel(chart_ID, "XauBridge_Title", x_pos, y_pos, "🌉 XAU SCALPER BRIDGE v4.2", default_color); y_pos -= y_step;
   CreateLabel(chart_ID, "XauBridge_Sep1", x_pos, y_pos, "━━━━━━━━━━━━━━━━━━━━━━━━━━", default_color); y_pos -= y_step;
   CreateLabel(chart_ID, "XauBridge_Signal", x_pos, y_pos, signal_text, signal_color); y_pos -= y_step;
   CreateLabel(chart_ID, "XauBridge_Reason", x_pos, y_pos, "Reason : " + reason, default_color); y_pos -= y_step;

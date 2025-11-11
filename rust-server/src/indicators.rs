@@ -104,3 +104,29 @@ pub fn atr(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, period: usize) 
     }
     atrs
 }
+
+pub fn sma(values: &Vec<f64>, period: usize) -> Vec<f64> {
+    let mut out = vec![0.0; values.len()];
+    if values.is_empty() || period == 0 || values.len() < period {
+        return out;
+    }
+
+    // Calculate the initial sum for the first window
+    let mut sum: f64 = values.iter().take(period).sum();
+    out[period - 1] = sum / period as f64;
+
+    // Use a rolling sum for the rest of the values for efficiency
+    for i in period..values.len() {
+        sum += values[i] - values[i - period];
+        out[i] = sum / period as f64;
+    }
+
+    // Pad the beginning of the output with the first calculated SMA value
+    // This provides a consistent, non-zero value for early candles.
+    let first_val = out[period - 1];
+    for i in 0..(period - 1) {
+        out[i] = first_val;
+    }
+
+    out
+}

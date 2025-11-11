@@ -2,3 +2,32 @@ docker build -t xau-scalper-v4:latest .
 
 todo:
 How can I deploy this Docker container to a cloud server so it can run 24/7?
+
+
+
+Best Result (Optimized for Sharpe Ratio) ---
+Parameters: EMA(11/50), RSI(14), SL: 2.0*ATR, TP: 1.5*ATR
+Sharpe Ratio: 0.175
+Final Balance: 647114.88
+Net Profit: 637114.88
+Max Drawdown: 6.84%
+Total Trades: 1876
+Win Rate: 70.04%
+
+--- Best Result (Optimized for Sharpe Ratio) ---
+Parameters: EMA(11/50), RSI(12), SL: 2.0*ATR, TP: 1.5*ATR
+Sharpe Ratio: 0.192 | Profit Factor: 1.92
+Final Balance: 872862.64
+Net Profit: 862862.64
+Max Drawdown: 5.86%
+Total Trades: 2305
+Win Rate: 57.27%
+
+--- Best Result (Optimized for Profit Factor / Max Drawdown) ---
+Parameters: EMA(5/50), RSI(16), SL: 1.0*ATR, TP: 1.5*ATR
+Sharpe Ratio: 0.167 | Profit Factor: 3.99
+Final Balance: 123093006844.01
+Net Profit: 123092996844.01
+Max Drawdown: 2.68%
+Total Trades: 3546
+Win Rate: 66.84%
