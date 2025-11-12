@@ -86,18 +86,18 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     if stoch_confirms_sell { potential_sell_score += 1; }
 
     // --- Determine final action and conviction score ---
-    if potential_buy_score == 5 { // All 5 conditions met for buy
+    if potential_buy_score >= 4 { // At least 4 conditions met for buy
         action = "buy".to_string();
-        reason = format!("bull cross; price/trend/stoch confirm; RSI {:.1} < 80", last_rsi);
-        conviction_score = 5;
-    } else if potential_sell_score == 5 { // All 5 conditions met for sell
+        reason = format!("potential buy signal with score {}/5", potential_buy_score);
+        conviction_score = potential_buy_score;
+    } else if potential_sell_score >= 4 { // At least 4 conditions met for sell
         action = "sell".to_string();
-        reason = format!("bear cross; price/trend/stoch confirm; RSI {:.1} > 20", last_rsi);
-        conviction_score = 5;
+        reason = format!("potential sell signal with score {}/5", potential_sell_score);
+        conviction_score = potential_sell_score;
     } else {
         // If no full signal, we still want to return the highest conviction score for potential signals
         conviction_score = potential_buy_score.max(potential_sell_score);
-        if conviction_score > 0 {
+        if conviction_score > 0 { // conviction_score will be < 4 here
             reason = format!("no full signal (max score: {})", conviction_score);
         } else {
             reason = "no signal".to_string();
@@ -106,7 +106,7 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
 
     // --- Trader's Insight: Use ATR for dynamic TP/SL ---
     // Only calculate TP/SL if a full signal is generated
-    if conviction_score == 5 {
+    if conviction_score >= 4 {
         let sl_multiplier = req.sl_atr_multiplier.unwrap_or(1.0); // From backtest: 1.0
         let tp_multiplier = req.tp_atr_multiplier.unwrap_or(1.5); // From backtest: 1.5
 
