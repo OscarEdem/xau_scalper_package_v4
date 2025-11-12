@@ -7,10 +7,17 @@ pub struct EvalRequest {
     pub closes: Vec<f64>,
     pub highs: Vec<f64>, // Needed for ATR
     pub lows: Vec<f64>,  // Needed for ATR
+    pub m5_closes: Vec<f64>, // New: M5 data for trend confirmation
+    pub m5_highs: Vec<f64>,
+    pub m5_lows: Vec<f64>,
     pub rsi_period: Option<usize>,
     pub ema_fast: Option<usize>,
     pub ema_slow: Option<usize>,
     pub atr_period: Option<usize>, // ATR period
+    pub sma_period: Option<usize>, // New: SMA period for trend filtering
+    pub stoch_k_period: Option<usize>, // New: Stochastic K period
+    pub stoch_d_period: Option<usize>, // New: Stochastic D period
+    pub stoch_slowing: Option<usize>,  // New: Stochastic slowing period
     pub tp_pips: Option<f64>,
     pub sl_pips: Option<f64>,
     pub sl_atr_multiplier: Option<f64>,
@@ -27,7 +34,27 @@ pub struct EvalResponse {
     pub ema_fast_last: f64,
     pub ema_slow_last: f64,
     pub atr: f64,
+    pub sma_last: f64,
+    pub stoch_k_last: f64, // New: Return the last Stochastic %K value
+    pub stoch_d_last: f64, // New: Return the last Stochastic %D value
+    pub conviction_score: u8, // New: Signal conviction score
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TradeLog {
+    pub timestamp: String,
+    pub event_type: String, // "Open" or "Close"
+    pub ticket: u64,
+    pub symbol: String,
+    pub direction: String,
+    pub lot_size: f64,
+    pub price: f64,
+    pub sl: f64,
+    pub tp: f64,
+    pub profit: f64,
+    pub comment: String,
+}
+
 
 pub fn ema(values: &Vec<f64>, period: usize) -> Vec<f64> {
     let mut out = vec![0.0; values.len()];
@@ -130,4 +157,34 @@ pub fn sma(values: &Vec<f64>, period: usize) -> Vec<f64> {
     }
 
     out
+}
+
+pub fn stochastic(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, k_period: usize, d_period: usize, slowing_period: usize) -> (Vec<f64>, Vec<f64>) {
+    let n = closes.len();
+    if n == 0 || k_period == 0 || d_period == 0 || slowing_period == 0 || n < k_period {
+        return (vec![0.0; n], vec![0.0; n]);
+    }
+
+    let mut raw_k_values = vec![0.0; n];
+    for i in (k_period - 1)..n {
+        let period_highs = &highs[(i - k_period + 1)..=i];
+        let period_lows = &lows[(i - k_period + 1)..=i];
+
+        let highest_high = period_highs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let lowest_low = period_lows.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+
+        if (highest_high - lowest_low).abs() < f64::EPSILON { // Avoid division by zero
+            raw_k_values[i] = 50.0; // Neutral value
+        } else {
+            raw_k_values[i] = ((closes[i] - lowest_low) / (highest_high - lowest_low)) * 100.0;
+        }
+    }
+
+    // Smooth raw_k_values to get %K (using slowing_period)
+    let k_values = sma(&raw_k_values, slowing_period);
+
+    // Smooth %K to get %D (using d_period)
+    let d_values = sma(&k_values, d_period);
+
+    (k_values, d_values)
 }

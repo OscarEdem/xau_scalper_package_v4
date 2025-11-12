@@ -18,6 +18,10 @@ input int    RsiPeriod = 16;
 input int    EmaFastPeriod = 5;
 input int    EmaSlowPeriod = 50;
 input int    AtrPeriod = 14;
+input int    SmaPeriod = 200;
+input int    StochKPeriod = 14; // New: Stochastic K Period
+input int    StochDPeriod = 3;  // New: Stochastic D Period
+input int    StochSlowing = 3;  // New: Stochastic Slowing Period
 input double SlAtrMultiplier = 1.0;
 input double TpAtrMultiplier = 1.5;
 
@@ -26,6 +30,15 @@ input bool   UseTrailingStop = true;
 input double TrailingStopATRMlt = 1.0; // From best backtest result
 input int    TrailingATRPeriod = 14;
 
+// --- Pyramiding Inputs ---
+input bool   EnablePyramiding = true;         // Enable adding to winning positions
+input int    MaxPyramidEntries = 3;           // Maximum number of simultaneous entries
+input double PyramidProfitPips = 15.0;        // Pips in profit required before adding a position
+input double PyramidRiskScale = 0.5;          // Scale risk for next entry (e.g., 0.5 = 50% of previous risk)
+
+// --- Logging Inputs ---
+input bool   EnableServerLogging = true;
+
 // --- Global Variables ---
 CTrade trade;
 char post_data[];
@@ -33,13 +46,22 @@ char result[];
 string result_headers;
 int    atr_handle; // Handle for the ATR indicator for trailing stops
 
+
+// --- NEW: Global variables for backtester-style trailing stop ---
+long   g_trade_ticket = 0;       // Ticket of the currently managed trade
+double g_high_since_entry = 0.0; // Highest high since the long trade was opened
+double g_low_since_entry = 0.0;  // Lowest low since the short trade was opened
+
+
 // --- Function Prototypes ---
 void ClosePositions(ENUM_POSITION_TYPE direction);
 void CreatePanel(const long chart_ID, const string name, const int x, const int y, const int width, const int height, const color bg_color, const color border_color);
 void CreateLabel(const long chart_ID, const string name, const int x, const int y, const string text, const color text_color);
-void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string tp, string sl, double current_spread, double current_balance, double current_pl);
-double CalculateLotSize(double stop_loss_pips, string symbol, double point_value);
+void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string sma, string stoch_k, string stoch_d, string conviction_score, string tp, string sl, double current_spread, double current_balance, double current_pl);
+double CalculateLotSize(double stop_loss_pips, string symbol, double point_value, double risk_percentage_override);
 string GetJsonValue(string json, string key, bool is_string);
+int CountOpenPositions(ENUM_POSITION_TYPE direction);
+void LogEvent(string event_type, ulong ticket, string symbol, string direction, double lot_size, double price, double sl, double tp, double profit, string comment);
 void ManageTrailingStops(); // Uses internal ATR handle
 
 int OnInit() {
@@ -103,39 +125,59 @@ void OnTick(){
   if(spread_pts > MaxSpreadPoints) {
     Print("Spread is too high: ", spread_pts, " points. Skipping.");
     // Still update dashboard to show high spread
-    UpdateDashboard("hold", "Spread too high", "-", "-", "-", "-", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl);
+    UpdateDashboard("hold", "Spread too high", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl);
     return;
   }
 
   // --- Prepare data for server ---
-  if(CopyRates(_Symbol, PERIOD_M1, 0, NumCloses, rates) < NumCloses) {
-    Print("Could not get enough bar data. Need ", NumCloses, " bars.");
+  MqlRates m1_rates[], m5_rates[];
+  if(CopyRates(_Symbol, PERIOD_M1, 0, NumCloses, m1_rates) < NumCloses) {
+    Print("Could not get enough M1 bar data. Need ", NumCloses, " bars.");
+    return;
+  }
+  if(CopyRates(_Symbol, PERIOD_M5, 0, NumCloses, m5_rates) < NumCloses) {
+    Print("Could not get enough M5 bar data. Need ", NumCloses, " bars.");
     return;
   }
 
   // Build the JSON payload
-  string closes_str = "";
-  string highs_str = "";
-  string lows_str = "";
+  string m1_closes_str = "", m1_highs_str = "", m1_lows_str = "";
+  string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "";
 
-  for(int i = 0; i < ArraySize(rates); i++) {
-    closes_str += DoubleToString(rates[i].close, _Digits);
-    highs_str += DoubleToString(rates[i].high, _Digits);
-    lows_str += DoubleToString(rates[i].low, _Digits);
-    if(i < ArraySize(rates) - 1) {
-      closes_str += ",";
-      highs_str += ",";
-      lows_str += ",";
+  for(int i = 0; i < ArraySize(m1_rates); i++) {
+    m1_closes_str += DoubleToString(m1_rates[i].close, _Digits);
+    m1_highs_str += DoubleToString(m1_rates[i].high, _Digits);
+    m1_lows_str += DoubleToString(m1_rates[i].low, _Digits);
+    if(i < ArraySize(m1_rates) - 1) {
+      m1_closes_str += ",";
+      m1_highs_str += ",";
+      m1_lows_str += ",";
+    }
+  }
+  
+  for(int i = 0; i < ArraySize(m5_rates); i++) {
+    m5_closes_str += DoubleToString(m5_rates[i].close, _Digits);
+    m5_highs_str += DoubleToString(m5_rates[i].high, _Digits);
+    m5_lows_str += DoubleToString(m5_rates[i].low, _Digits);
+    if(i < ArraySize(m5_rates) - 1) {
+      m5_closes_str += ",";
+      m5_highs_str += ",";
+      m5_lows_str += ",";
     }
   }
 
   string json_payload = StringFormat(
-    "{\"symbol\":\"%s\",\"timeframe\":\"M1\",\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],"
-    "\"rsi_period\":%d,\"ema_fast\":%d,\"ema_slow\":%d,\"atr_period\":%d,"
+    "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
+    "\"closes\":[%s],\"highs\":[%s],\"lows\":[%s]," // M1 data
+    "\"m5_closes\":[%s],\"m5_highs\":[%s],\"m5_lows\":[%s]," // M5 data
+    "\"rsi_period\":%d,\"ema_fast\":%d,\"ema_slow\":%d,\"atr_period\":%d,\"sma_period\":%d," // Existing params
+    "\"stoch_k_period\":%d,\"stoch_d_period\":%d,\"stoch_slowing\":%d," // New Stochastic params
     "\"sl_atr_multiplier\":%.1f,\"tp_atr_multiplier\":%.1f}",
     _Symbol,
-    closes_str, highs_str, lows_str,
-    RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod,
+    m1_closes_str, m1_highs_str, m1_lows_str,
+    m5_closes_str, m5_highs_str, m5_lows_str,
+    RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, // Existing values
+    StochKPeriod, StochDPeriod, StochSlowing, // New Stochastic values
     SlAtrMultiplier, TpAtrMultiplier
   );
 
@@ -152,6 +194,10 @@ void OnTick(){
   string tp_pips = "-";
   string sl_pips = "-";
   string atr_val_str = "-";
+  string sma_val_str = "-";
+  string stoch_k_val_str = "-"; // New
+  string stoch_d_val_str = "-"; // New
+  string conviction_score_val_str = "-"; // New
 
   if(res == -1) {
     Print("WebRequest failed. Error code: ", GetLastError());
@@ -171,33 +217,119 @@ void OnTick(){
     tp_pips = GetJsonValue(response_str, "tp_pips", false);
     sl_pips = GetJsonValue(response_str, "sl_pips", false);
     atr_val_str = GetJsonValue(response_str, "atr", false);
+    sma_val_str = GetJsonValue(response_str, "sma_last", false);
+    stoch_k_val_str = GetJsonValue(response_str, "stoch_k_last", false); // New
+    stoch_d_val_str = GetJsonValue(response_str, "stoch_d_last", false); // New
+    conviction_score_val_str = GetJsonValue(response_str, "conviction_score", false); // New
     
-    PrintFormat("Server response: action=%s, reason=%s, rsi=%s, ema_fast=%s, ema_slow=%s, tp_pips=%s, sl_pips=%s, atr=%s",
-                action, reason, rsi_val, ema_fast, ema_slow, tp_pips, sl_pips, atr_val_str);
+    PrintFormat("Server response: action=%s, reason=%s, rsi=%s, ema_fast=%s, ema_slow=%s, atr=%s, sma=%s, stoch_k=%s, stoch_d=%s, conviction=%s, tp_pips=%s, sl_pips=%s",
+                action, reason, rsi_val, ema_fast, ema_slow, atr_val_str, sma_val_str, stoch_k_val_str, stoch_d_val_str, conviction_score_val_str, tp_pips, sl_pips);
   }
 
   // --- Display graphical dashboard on chart ---
-  UpdateDashboard(action, reason, rsi_val, ema_fast, ema_slow, atr_val_str, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl);
+  UpdateDashboard(action, reason, rsi_val, ema_fast, ema_slow, atr_val_str, sma_val_str, stoch_k_val_str, stoch_d_val_str, conviction_score_val_str, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl);
 
   // --- Trade Execution ---
   double sl = StringToDouble(sl_pips);
   double tp = StringToDouble(tp_pips);
+  int conviction = StringToInteger(conviction_score_val_str);
+
+  double adjusted_risk_percent = 0.0;
+  if (conviction == 5) {
+      adjusted_risk_percent = RiskPercent; // Full risk
+  } else if (conviction == 4) {
+      adjusted_risk_percent = RiskPercent * 0.75; // 75% risk
+  } else if (conviction == 3) {
+      adjusted_risk_percent = RiskPercent * 0.5; // 50% risk
+  } else {
+      // If conviction is too low, do not trade
+      adjusted_risk_percent = 0.0;
+  }
 
   if(action == "buy") {
     ClosePositions(POSITION_TYPE_SELL);
-    if(PositionsTotal() == 0) {
-      double lot_size = CalculateLotSize(sl, _Symbol, _Point);
+    // Only trade if no open positions and adjusted_risk_percent is positive
+    if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
+      // Get the high of the current bar for initializing the trailing stop
+      MqlRates current_rates[];
+      CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
+      
+      double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
       double stop_loss_price = bid - sl * _Point * 10.0;
       double take_profit_price = bid + tp * _Point * 10.0;
-      if(lot_size > 0) trade.Buy(lot_size, _Symbol, bid, stop_loss_price, take_profit_price, "XAU Scalper Bridge BUY");
+      if(lot_size > 0 && trade.Buy(lot_size, _Symbol, bid, stop_loss_price, take_profit_price, "XAU Scalper Bridge BUY")) {
+        // --- NEW: Initialize trailing stop state on successful trade ---
+        g_trade_ticket = trade.ResultDeal();
+        // --- NEW: Log the trade opening ---
+        string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
+                                           conviction, reason, sl, tp);
+        if(PositionSelectByTicket(g_trade_ticket)) {
+          LogEvent("Open", g_trade_ticket, _Symbol, "Buy", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                   PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
+        }
+
+        g_high_since_entry = current_rates[0].high;
+      }
     }
   } else if(action == "sell") {
     ClosePositions(POSITION_TYPE_BUY);
-    if(PositionsTotal() == 0) {
-      double lot_size = CalculateLotSize(sl, _Symbol, _Point);
+    // Only trade if no open positions and adjusted_risk_percent is positive
+    if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
+      // Get the low of the current bar for initializing the trailing stop
+      MqlRates current_rates[];
+      CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
+
+      double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
       double stop_loss_price = ask + sl * _Point * 10.0;
       double take_profit_price = ask - tp * _Point * 10.0;
-      if(lot_size > 0) trade.Sell(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL");
+      if(lot_size > 0 && trade.Sell(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL")) {
+        // --- NEW: Initialize trailing stop state on successful trade ---
+        g_trade_ticket = trade.ResultDeal();
+        // --- NEW: Log the trade opening ---
+        string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
+                                           conviction, reason, sl, tp);
+        if(PositionSelectByTicket(g_trade_ticket)) {
+          LogEvent("Open", g_trade_ticket, _Symbol, "Sell", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                   PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
+        }
+
+        g_low_since_entry = current_rates[0].low;
+      }
+    }
+  }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &res) {
+  // --- NEW: Log trade closures ---
+  if(!EnableServerLogging) return;
+
+  // We are interested in completed deals that close a position
+  if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL) {
+    // A deal is added to history. Check if it closes a position.
+    // We can check this by looking for a corresponding position ticket in the deal.
+    if(HistoryDealSelect(trans.deal)) {
+      long position_id = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      if(PositionSelectByTicket(position_id)) {
+        // Position still exists, this was an entry deal.
+        return;
+      } else {
+        // Position does not exist, this was a closing deal.
+        if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber) {
+          string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+          if(deal_symbol == _Symbol) {
+            ulong ticket = HistoryDealGetInteger(trans.deal, DEAL_TICKET);
+            string direction = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY) ? "Buy Close" : "Sell Close";
+            double lots = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+            double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+            double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+            string comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+            
+            // Log the closing event
+            LogEvent("Close", ticket, deal_symbol, direction, lots, price, 0.0, 0.0, profit, comment);
+
+          }
+        }
+      }
     }
   }
 }
@@ -212,7 +344,31 @@ void ClosePositions(ENUM_POSITION_TYPE direction) {
   }
 }
 
+int CountOpenPositions(ENUM_POSITION_TYPE direction) {
+  int count = 0;
+  for(int i = PositionsTotal() - 1; i >= 0; i--) {
+    if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetInteger(POSITION_TYPE) == direction) {
+      count++;
+    }
+  }
+  return count;
+}
+
 void ManageTrailingStops() {
+  // --- Reset tracking variables if our tracked position is closed ---
+  if(g_trade_ticket != 0 && PositionSelectByTicket(g_trade_ticket) == false) {
+    g_trade_ticket = 0;
+    g_high_since_entry = 0.0;
+    g_low_since_entry = 0.0;
+    return; // No active trade to manage
+  }
+
+  // --- Get the high/low of the most recently completed bar ---
+  MqlRates rates[1];
+  if(CopyRates(_Symbol, PERIOD_M1, 1, 1, rates) < 1) return; // Use bar[1] (last closed bar)
+  double last_bar_high = rates[0].high;
+  double last_bar_low = rates[0].low;
+
   // Get the latest ATR value from the handle created in OnInit
   double atr_buffer[];
   if(CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) < 1) {
@@ -230,35 +386,48 @@ void ManageTrailingStops() {
       double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
       double current_sl = PositionGetDouble(POSITION_SL);
       double current_tp = PositionGetDouble(POSITION_TP);
-      
       double new_sl = 0;
       
-      // --- Logic for a LONG position ---
       if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
-        double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-        new_sl = current_bid - (current_atr * TrailingStopATRMlt);
+        g_high_since_entry = MathMax(g_high_since_entry, last_bar_high);
+        new_sl = g_high_since_entry - (current_atr * TrailingStopATRMlt);
         if(new_sl > entry_price && new_sl > current_sl) {
-          if(!trade.PositionModify(ticket, new_sl, current_tp)) {
-            Print("Error modifying position #", ticket, " for trailing stop. Code: ", GetLastError());
-          }
+          trade.PositionModify(ticket, new_sl, current_tp);
         }
-      }
-      
-      // --- Logic for a SHORT position ---
-      else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
-        double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        new_sl = current_ask + (current_atr * TrailingStopATRMlt);
-        if(new_sl < entry_price && (current_sl == 0 || new_sl < current_sl)) { // Corrected logic for short SL
-          if(!trade.PositionModify(ticket, new_sl, current_tp)) {
-            Print("Error modifying position #", ticket, " for trailing stop. Code: ", GetLastError());
-          }
+      } else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
+        g_low_since_entry = (g_low_since_entry == 0.0) ? last_bar_low : MathMin(g_low_since_entry, last_bar_low);
+        new_sl = g_low_since_entry + (current_atr * TrailingStopATRMlt);
+        if(new_sl < entry_price && (current_sl == 0 || new_sl < current_sl)) {
+          trade.PositionModify(ticket, new_sl, current_tp);
         }
       }
     }
   }
 }
 
-// --- Graphical Dashboard Functions ---
+void LogEvent(string event_type, ulong ticket, string symbol, string direction, double lot_size, double price, double sl, double tp, double profit, string comment) {
+  if(!EnableServerLogging) return;
+
+  // Escape special characters in comment for JSON
+  string json_comment = comment;
+  StringReplace(json_comment, "\\", "\\\\");
+  StringReplace(json_comment, "\"", "\\\"");
+
+  string log_payload = StringFormat(
+    "{\"timestamp\":\"%s\",\"event_type\":\"%s\",\"ticket\":%llu,\"symbol\":\"%s\","
+    "\"direction\":\"%s\",\"lot_size\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,"
+    "\"profit\":%.2f,\"comment\":\"%s\"}",
+    TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), event_type, ticket, symbol,
+    direction, lot_size, price, sl, tp, profit, json_comment
+  );
+
+  // Use separate buffers for logging to not interfere with the main eval request
+  char log_post_data[];
+  char log_result[];
+  string log_result_headers;
+  StringToCharArray(log_payload, log_post_data);
+  WebRequest("POST", "http://127.0.0.1:3000/log_trade", "Content-Type: application/json", 1000, log_post_data, log_result, log_result_headers);
+}
 
 void CreatePanel(const long chart_ID, const string name, const int x, const int y, const int width, const int height, const color bg_color) {
   if(ObjectFind(chart_ID, name) < 0) {
@@ -326,10 +495,11 @@ void CreateDashboardRow(long chart_ID, string key, string value, int x_key, int 
   ObjectSetString(chart_ID, val_name, OBJPROP_FONT, "Segoe UI");
 }
 
-void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string tp, string sl, double current_spread, double current_balance, double current_pl) {
+void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string sma, string stoch_k, string stoch_d, string conviction_score, string tp, string sl, double current_spread, double current_balance, double current_pl) {
   long chart_ID = ChartID();
   int x_pos = 15;
-  int y_pos = 270; // Increased y_pos to make space for the new P/L row
+  // Adjusted y_pos and panel height for new indicators and conviction score
+  int y_pos = 321; 
   int y_step = 17;
   
   color clr_panel_bg = C'33,33,33';
@@ -341,7 +511,7 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
   color clr_spread_bad = C'244,67,54';
   color clr_profit = C'0,230,118';
   color clr_loss = C'244,67,54';
-  CreatePanel(chart_ID, "XauBridge_Panel", 5, 5, 260, 240, clr_panel_bg, clr_panel_border); // Increased panel height
+  CreatePanel(chart_ID, "XauBridge_Panel", 5, 5, 260, 291, clr_panel_bg, clr_panel_border); // Increased panel height
 
   string signal_text;
   color signal_color;
@@ -387,6 +557,11 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
   CreateDashboardRow(chart_ID, "EMA Fast", ema_fast, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step;
   CreateDashboardRow(chart_ID, "EMA Slow", ema_slow, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step;
   CreateDashboardRow(chart_ID, "ATR", atr, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step + 7;
+  CreateDashboardRow(chart_ID, "SMA (Trend)", sma, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step;
+  CreateDashboardRow(chart_ID, "Stoch %K", stoch_k, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step; // New
+  CreateDashboardRow(chart_ID, "Stoch %D", stoch_d, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step + 7; // New
+  
+  CreateDashboardRow(chart_ID, "Conviction Score", conviction_score, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step + 7; // New
   
   // Trade Plan
   CreateDashboardRow(chart_ID, "Take Profit Pips", tp, x_pos, x_val_pos, y_pos, clr_label, clr_value); y_pos -= y_step;
@@ -397,14 +572,14 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
 
 // --- Calculation Functions ---
 
-double CalculateLotSize(double stop_loss_pips, string symbol, double point_value) {
+double CalculateLotSize(double stop_loss_pips, string symbol, double point_value, double risk_percentage_override) {
   if(stop_loss_pips <= 0) {
     Print("Invalid stop loss (<= 0), cannot calculate lot size.");
     return 0.0;
   }
 
   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-  double risk_amount = balance * (RiskPercent / 100.0);
+  double risk_amount = balance * (risk_percentage_override / 100.0); // Use override
 
   double contract_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
   double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);

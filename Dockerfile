@@ -29,15 +29,18 @@ COPY --from=builder /app/rust-server/target/release/backtest /usr/local/bin/back
 EXPOSE 3000
 
 # Copy the CSV data into the final image
-COPY rust-server/xauusd_m1_data.csv /app/xauusd_m1_data.csv
+COPY m1_data.csv /app/m1_data.csv
+COPY m5_data.csv /app/m5_data.csv
 
 # Convert the tab-delimited data to comma-separated for the backtester
 # This awk script does two things:
 # 1. NR==1: For the first record (the header), it prints the correct CSV headers.
-# 2. NR>1: For all other records, it combines the first two fields (date and time)
-#    into a single 'time' field and prints the required columns.
-RUN dos2unix /app/xauusd_m1_data.csv && \
-    awk -F'\t' 'BEGIN {OFS=","} NR==1 {print "time,open,high,low,close,volume"} NR>1 {print $1" "$2, $3, $4, $5, $6, $7}' /app/xauusd_m1_data.csv > /app/data.csv
+# 2. NR>1: For all other records, it prints the required columns.
+# We now process both M1 and M5 files.
+RUN dos2unix /app/m1_data.csv && \
+    dos2unix /app/m5_data.csv && \
+    (head -n 1 /app/m1_data.csv | tr '\t' ',' && tail -n +2 /app/m1_data.csv | tr '\t' ',') > /app/m1_data_comma.csv && \
+    (head -n 1 /app/m5_data.csv | tr '\t' ',' && tail -n +2 /app/m5_data.csv | tr '\t' ',') > /app/m5_data_comma.csv
 
 # Set the default container command to run the server
 CMD ["xau-scalper-server"]
