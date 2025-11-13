@@ -246,57 +246,59 @@ void OnTick(){
       adjusted_risk_percent = 0.0;
   }
 
-  if(action == "buy") {
-    ClosePositions(POSITION_TYPE_SELL);
-    // Only trade if no open positions and adjusted_risk_percent is positive
-    if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
-      // Get the high of the current bar for initializing the trailing stop
-      MqlRates current_rates[];
-      CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
-      
-      double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
-      double stop_loss_price = bid - sl * _Point * 10.0;
-      double take_profit_price = bid + tp * _Point * 10.0;
-      if(lot_size > 0 && trade.Buy(lot_size, _Symbol, bid, stop_loss_price, take_profit_price, "XAU Scalper Bridge BUY")) {
-        // --- NEW: Initialize trailing stop state on successful trade ---
-        g_trade_ticket = trade.ResultDeal();
-        // --- NEW: Log the trade opening ---
-        string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
-                                           conviction, reason, sl, tp);
-        if(PositionSelectByTicket(g_trade_ticket)) {
-          LogEvent("Open", g_trade_ticket, _Symbol, "Buy", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
-                   PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
+  /*
+    if(action == "buy") {
+      ClosePositions(POSITION_TYPE_SELL);
+      // Only trade if no open positions and adjusted_risk_percent is positive
+      if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
+        // Get the high of the current bar for initializing the trailing stop
+        MqlRates current_rates[];
+        CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
+        
+        double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
+        double stop_loss_price = bid - sl * _Point * 10.0;
+        double take_profit_price = bid + tp * _Point * 10.0;
+        if(lot_size > 0 && trade.Buy(lot_size, _Symbol, bid, stop_loss_price, take_profit_price, "XAU Scalper Bridge BUY")) {
+          // --- NEW: Initialize trailing stop state on successful trade ---
+          g_trade_ticket = trade.ResultDeal();
+          // --- NEW: Log the trade opening ---
+          string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
+                                             conviction, reason, sl, tp);
+          if(PositionSelectByTicket(g_trade_ticket)) {
+            LogEvent("Open", g_trade_ticket, _Symbol, "Buy", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                     PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
+          }
+  
+          g_high_since_entry = current_rates[0].high;
         }
-
-        g_high_since_entry = current_rates[0].high;
+      }
+    } else if(action == "sell") {
+      ClosePositions(POSITION_TYPE_BUY);
+      // Only trade if no open positions and adjusted_risk_percent is positive
+      if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
+        // Get the low of the current bar for initializing the trailing stop
+        MqlRates current_rates[];
+        CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
+  
+        double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
+        double stop_loss_price = ask + sl * _Point * 10.0;
+        double take_profit_price = ask - tp * _Point * 10.0;
+        if(lot_size > 0 && trade.Sell(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL")) {
+          // --- NEW: Initialize trailing stop state on successful trade ---
+          g_trade_ticket = trade.ResultDeal();
+          // --- NEW: Log the trade opening ---
+          string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
+                                             conviction, reason, sl, tp);
+          if(PositionSelectByTicket(g_trade_ticket)) {
+            LogEvent("Open", g_trade_ticket, _Symbol, "Sell", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
+                     PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
+          }
+  
+          g_low_since_entry = current_rates[0].low;
+        }
       }
     }
-  } else if(action == "sell") {
-    ClosePositions(POSITION_TYPE_BUY);
-    // Only trade if no open positions and adjusted_risk_percent is positive
-    if(PositionsTotal() == 0 && adjusted_risk_percent > 0.0) {
-      // Get the low of the current bar for initializing the trailing stop
-      MqlRates current_rates[];
-      CopyRates(_Symbol, PERIOD_M1, 0, 1, current_rates);
-
-      double lot_size = CalculateLotSize(sl, _Symbol, _Point, adjusted_risk_percent);
-      double stop_loss_price = ask + sl * _Point * 10.0;
-      double take_profit_price = ask - tp * _Point * 10.0;
-      if(lot_size > 0 && trade.Sell(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL")) {
-        // --- NEW: Initialize trailing stop state on successful trade ---
-        g_trade_ticket = trade.ResultDeal();
-        // --- NEW: Log the trade opening ---
-        string open_details = StringFormat("Conviction: %d; Reason: %s; SL Pips: %.1f; TP Pips: %.1f",
-                                           conviction, reason, sl, tp);
-        if(PositionSelectByTicket(g_trade_ticket)) {
-          LogEvent("Open", g_trade_ticket, _Symbol, "Sell", PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN),
-                   PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP), 0.0, open_details);
-        }
-
-        g_low_since_entry = current_rates[0].low;
-      }
-    }
-  }
+  */
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &res) {

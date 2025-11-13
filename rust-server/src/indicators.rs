@@ -25,7 +25,7 @@ pub struct EvalRequest {
     pub tp_atr_multiplier: Option<f64>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Clone, ToSchema)]
 pub struct EvalResponse {
     pub action_advice: String,
     pub tp_pips: f64,

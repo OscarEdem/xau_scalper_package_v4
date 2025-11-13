@@ -86,17 +86,25 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     if stoch_confirms_sell { potential_sell_score += 1; }
 
     // --- Determine final action and conviction score ---
-    if potential_buy_score >= 4 { // At least 4 conditions met for buy
+    if potential_buy_score >= 4 { // Strong buy signal
+        action = "buy".to_string();
+        reason = format!("strong buy signal with score {}/5", potential_buy_score);
+        conviction_score = potential_buy_score;
+    } else if potential_sell_score >= 4 { // Strong sell signal
+        action = "sell".to_string();
+        reason = format!("strong sell signal with score {}/5", potential_sell_score);
+        conviction_score = potential_sell_score;
+    } else if potential_buy_score == 3 { // Weak buy signal
         action = "buy".to_string();
         reason = format!("potential buy signal with score {}/5", potential_buy_score);
         conviction_score = potential_buy_score;
-    } else if potential_sell_score >= 4 { // At least 4 conditions met for sell
+    } else if potential_sell_score == 3 { // Weak sell signal
         action = "sell".to_string();
         reason = format!("potential sell signal with score {}/5", potential_sell_score);
         conviction_score = potential_sell_score;
     } else {
         // If no full signal, we still want to return the highest conviction score for potential signals
-        conviction_score = potential_buy_score.max(potential_sell_score);
+        conviction_score = potential_buy_score.max(potential_sell_score); // will be < 3
         if conviction_score > 0 { // conviction_score will be < 4 here
             reason = format!("no full signal (max score: {})", conviction_score);
         } else {
@@ -105,8 +113,8 @@ pub fn evaluate_strategy(req: &EvalRequest) -> EvalResponse {
     }
 
     // --- Trader's Insight: Use ATR for dynamic TP/SL ---
-    // Only calculate TP/SL if a full signal is generated
-    if conviction_score >= 4 {
+    // Calculate TP/SL if a potential or full signal is generated
+    if conviction_score >= 3 {
         let sl_multiplier = req.sl_atr_multiplier.unwrap_or(1.0); // From backtest: 1.0
         let tp_multiplier = req.tp_atr_multiplier.unwrap_or(1.5); // From backtest: 1.5
 

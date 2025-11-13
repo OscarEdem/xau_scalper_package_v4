@@ -1,6 +1,7 @@
 // v4 XAU/USD scalper server
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     routing::get,
     routing::post,
     Json, Router,
@@ -15,15 +16,16 @@ use xau_scalper_server::{
     HistoryStats, TradeLog,
 };
 
-/// Application state to hold trade logs in memory
+/// Application state to hold trade logs and signal history in memory
 #[derive(Clone)]
 struct AppState {
     trade_logs: Arc<Mutex<Vec<TradeLog>>>,
+    signal_history: Arc<Mutex<Vec<EvalResponse>>>, // Changed from last_eval_response
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(eval_handler, log_trade_handler, get_logs_handler),
+    paths(eval_handler, log_trade_handler, get_logs_handler, get_latest_signal_handler, get_signals_handler),
     components(
         schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats)
     ),
@@ -39,12 +41,15 @@ async fn main() {
     // Initialize the shared state
     let shared_state = AppState {
         trade_logs: Arc::new(Mutex::new(Vec::new())),
+        signal_history: Arc::new(Mutex::new(Vec::new())), // Initialize with an empty Vec
     };
 
     let app = Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(|| async { "OK" }))
         .route("/eval", post(eval_handler))
+        .route("/latest-signal", get(get_latest_signal_handler))
+        .route("/signals", get(get_signals_handler)) // New endpoint for all signals
         // --- Add new routes for logging ---
         .route("/log_trade", post(log_trade_handler))
         // --- The history endpoint is now more powerful ---
@@ -65,7 +70,7 @@ async fn main() {
         (status = 200, description = "Returns a trade signal", body = EvalResponse)
     )
 )]
-async fn eval_handler(Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
+async fn eval_handler(State(state): State<AppState>, Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
     tracing::info!(
         symbol = %req.symbol,
         timeframe = %req.timeframe,
@@ -87,7 +92,44 @@ async fn eval_handler(Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
         "Sending evaluation response"
     );
 
+    // --- New logic to store signal history ---
+    let mut history = state.signal_history.lock().unwrap();
+    history.push(response.clone()); // Add the new signal
+    if history.len() > 60 {
+        history.remove(0); // Remove the oldest signal if we're over the limit
+    }
+    // --- End of new logic ---
+
     Json(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/latest-signal",
+    responses(
+        (status = 200, description = "Returns the last generated trade signal", body = Option<EvalResponse>),
+        (status = 404, description = "No signal available yet")
+    )
+)]
+/// Handler to return the last generated trade signal
+async fn get_latest_signal_handler(State(state): State<AppState>) -> Json<Option<EvalResponse>> {
+    let history = state.signal_history.lock().unwrap();
+    // Get the last signal from the history vector.
+    // .last() returns an Option<&T>, and we clone it to get Option<T>.
+    Json(history.last().cloned())
+}
+
+#[utoipa::path(
+    get,
+    path = "/signals",
+    responses(
+        (status = 200, description = "Returns the last 60 trade signals", body = Vec<EvalResponse>)
+    )
+)]
+/// Handler to return the last 60 generated trade signals
+async fn get_signals_handler(State(state): State<AppState>) -> Json<Vec<EvalResponse>> {
+    let history = state.signal_history.lock().unwrap();
+    Json(history.clone())
 }
 
 #[utoipa::path(
