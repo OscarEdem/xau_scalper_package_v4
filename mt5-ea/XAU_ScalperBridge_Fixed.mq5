@@ -92,9 +92,9 @@ void OnTick(){
   MqlRates rates[];
 
   // Run trailing stop on every tick
-  if(UseTrailingStop) {
-    ManageTrailingStops();
-  }
+  // if(UseTrailingStop) {
+  //   ManageTrailingStops();
+  // }
 
   // Only run the rest of the logic on a new bar
   if(CopyRates(_Symbol, PERIOD_M1, 0, 1, rates) < 1) return;
