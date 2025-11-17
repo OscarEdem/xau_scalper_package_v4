@@ -2,8 +2,6 @@ docker build -t xau-scalper-v4:latest .
 
 docker run --rm xau-scalper-v4:latest backtest --m1-file /app/m1_data_comma.csv --m5-file /app/m5_data_comma.csv
 
-todo:
-How can I deploy this Docker container to a cloud server so it can run 24/7?
 
 
 
