@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use structopt::StructOpt;
-use xau_scalper_server::{evaluate_signal, EvalRequest};
+use xau_scalper_server::{EvalRequest, TradingSession};
 
 #[derive(Debug, Deserialize, Clone)] // Deserialize by position
 pub struct Candle {
@@ -126,6 +126,15 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
     let mut max_drawdown: f64 = 0.0;
     let pip_size = 0.01;
 
+    // Create a single trading session for this backtest run.
+    let mut session = TradingSession::new("XAUUSD".to_string(), true);
+
+    // --- NEW: Safety check to prevent panics ---
+    if combined_candles.len() <= opt.history_size {
+        println!("Not enough candle data ({}) to meet history requirement ({}). Skipping this parameter set.", combined_candles.len(), opt.history_size);
+        return None;
+    }
+
     for i in opt.history_size..combined_candles.len() {
         let combined_candle = &combined_candles[i];
         let current_candle = &combined_candle.m1;
@@ -184,7 +193,12 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
             mode: "scalp".to_string(), // Hardcode to scalp for this backtest
             current_price: current_candle.close,
         };
-        let response = evaluate_signal(&req);
+
+        // Process the data through the session to generate signals.
+        session.on_data(&req);
+        // We are only interested in the scalp signal for this backtest.
+        let (scalp_signal, _swing_signal) = session.get_latest_signals();
+        let response = scalp_signal.unwrap_or_default();
 
         // --- Check if active trade should be closed ---
         if let Some(trade) = active_trade.take() {

@@ -28,26 +28,33 @@ impl ScalpEngine {
         let lows = &req.m5_lows;
         let n = closes.len();
 
-        if n < slow_ema_period.max(roc_period).max(atr_period + atr_collapse_window) {
+        // --- NEW: Consolidated and improved data validation ---
+        // Ensure we have enough data for all indicators before proceeding.
+        let required_bars = slow_ema_period.max(roc_period).max(atr_period + atr_collapse_window);
+        if n < required_bars {
             return EvalResponse {
-                reason: format!("Insufficient M5 data: need at least {} bars", slow_ema_period.max(roc_period).max(atr_period + atr_collapse_window)),
+                reason: format!("Insufficient M5 data: have {}, need {}", n, required_bars),
                 ..Default::default()
             };
         }
 
         // --- A. ENTRY CONDITIONS ---
 
-        // 1. Trend Filter: EMA Crossover
+        // 1. Trend & Momentum Filters
         let fast_emas = ema(closes, fast_ema_period);
         let slow_emas = ema(closes, slow_ema_period);
+        let rocs = roc(closes, roc_period); // Use M5 data
+
+        // --- Safety check for indicator results ---
+        if rocs.is_empty() || fast_emas.is_empty() || slow_emas.is_empty() {
+            return EvalResponse { reason: "Insufficient data for scalping indicators".to_string(), ..Default::default() };
+        }
+
         let last_fast_ema = fast_emas[n - 1];
         let last_slow_ema = slow_emas[n - 1];
-
         let is_buy_trend = last_fast_ema > last_slow_ema;
         let is_sell_trend = last_fast_ema < last_slow_ema;
 
-        // 2. Momentum Filter: ROC Breakout
-        let rocs = roc(closes, roc_period);
         let last_roc = rocs[n - 1];
         let is_buy_momentum = last_roc > roc_threshold;
         let is_sell_momentum = last_roc < -roc_threshold;

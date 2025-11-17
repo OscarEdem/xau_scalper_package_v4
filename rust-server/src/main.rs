@@ -1,6 +1,6 @@
 // v4 XAU/USD scalper server
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -11,25 +11,36 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::{SwaggerUi, Config};
+use utoipa_swagger_ui::SwaggerUi;
 use xau_scalper_server::{
-    ArrivalConfirmation, EvalRequest, EvalResponse,
+    ArrivalConfirmation, EvalRequest, EvalResponse, SessionManager,
     ExecutionConfirmation, HistoryParams, HistoryResponse, HistoryStats, TradeLog, PriceLevel, VwapBands
 };
 
-/// Application state to hold trade logs and signal history in memory
-#[derive(Clone)]
-struct AppState {
+
+/// A more flexible state for the whole application, including the new SessionManager.
+#[derive(Clone, Default)]
+struct ApplicationState {
+    session_manager: SessionManager,
     trade_logs: Arc<Mutex<VecDeque<TradeLog>>>,
-    signal_history: Arc<Mutex<VecDeque<EvalResponse>>>,
+    // The global signal history can be removed if signals are only retrieved per-session.
+    // We'll keep it for now to support the existing `/signals` endpoint.
+    global_signal_history: Arc<Mutex<VecDeque<EvalResponse>>>,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LatestSignalsResponse {
+    scalp_signal: Option<EvalResponse>,
+    swing_signal: Option<EvalResponse>,
 }
 
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
-    paths(eval_handler, log_trade_handler, get_logs_handler, get_latest_signal_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler),
+    paths(process_data_handler, log_trade_handler, get_logs_handler, get_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler),
     components(
-        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation)
+        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse)
     ),
     tags((name = "XAU Scalper API", description = "API for XAU/USD Scalping Strategy"))
 )]
@@ -41,15 +52,15 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Initialize the shared state
-    let shared_state = AppState {
-        trade_logs: Arc::new(Mutex::new(VecDeque::new())),
-        signal_history: Arc::new(Mutex::new(VecDeque::new())), // No capacity limit, will be cleared weekly
-    };
+    let shared_state = ApplicationState::default();
 
     // --- New: Spawn a background task for weekly signal history cleanup ---
     let cleanup_state = shared_state.clone();
     tokio::spawn(async move {
         let mut last_cleanup_week = 0;
+        // Wait a bit on startup before starting the cleanup loop.
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+
         loop {
             // Check every hour
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
@@ -59,7 +70,7 @@ async fn main() {
             // Cleanup window: Saturday 04:00 - 04:59 UTC (6 hours after Friday 22:00 market close)
             if now.weekday() == Weekday::Sat && now.hour() == 4 && last_cleanup_week != current_week {
                 tracing::info!("Performing weekly cleanup of signal history.");
-                if let Ok(mut history) = cleanup_state.signal_history.lock() {
+                if let Ok(mut history) = cleanup_state.global_signal_history.lock() {
                     history.clear();
                     last_cleanup_week = current_week;
                     tracing::info!("Signal history cleared for the week.");
@@ -69,12 +80,11 @@ async fn main() {
     });
 
     let app = Router::new()
-        .merge(SwaggerUi::new("/docs")
-            .config(Config::from("/api-docs/openapi.json")))
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(|| async { "OK" }))
-        .route("/eval", post(eval_handler))
-        .route("/latest-signal", get(get_latest_signal_handler))
-        .route("/signals", get(get_signals_handler)) // New endpoint for all signals
+        .route("/data", post(process_data_handler))
+        .route("/signals/:symbol", get(get_latest_signals_handler))
+        .route("/signals", get(get_signals_handler))
         // --- Add new routes for logging ---
         .route("/confirm_arrival", post(confirm_arrival_handler))
         .route("/confirm_execution", post(confirm_execution_handler))
@@ -101,77 +111,6 @@ async fn shutdown_signal() {
 }
 
 #[utoipa::path(
-    post,
-    path = "/eval",
-    request_body = EvalRequest,
-    responses(
-        (status = 200, description = "Returns a trade signal", body = EvalResponse)
-    )
-)]
-async fn eval_handler(State(state): State<AppState>, Json(req): Json<EvalRequest>) -> Json<EvalResponse> {
-    tracing::info!(
-        symbol = %req.symbol,
-        timeframe = %req.timeframe,
-        closes_count = req.closes.len(),
-        "Received evaluation request"
-    );
-
-    let response = xau_scalper_server::evaluate_signal(&req);
-
-    tracing::info!(
-        signal_id = %response.signal_id,
-        entry_type = %response.entry_type,
-        reason = %response.reason,
-        entry_price = response.entry_price,
-        sl_price = response.sl_price,
-        tp1_price = response.tp1_price,
-        "Sending evaluation response"
-    );
-
-    // --- New logic to store signal history ---
-    // Only store actionable new trade signals for the mobile app/history.
-    // Do not store position management actions like "hold" or "close".
-    match response.entry_type.as_str() {
-        "none" => {
-            // Optionally log 'none' signals for diagnostics, but for now we skip.
-        }
-        _ => { // "long", "short"
-            if let Ok(mut history) = state.signal_history.lock() {
-                history.push_back(response.clone());
-            } else {
-                tracing::error!("Signal history mutex was poisoned.");
-            }
-        }
-    }
-    // --- End of new logic ---
-
-    Json(response)
-}
-
-#[utoipa::path(
-    get,
-    path = "/latest-signal",
-    responses(
-        (status = 200, description = "Returns the last generated trade signal", body = Option<EvalResponse>),
-        (status = 404, description = "No signal available yet")
-    )
-)]
-/// Handler to return the last generated trade signal
-async fn get_latest_signal_handler(State(state): State<AppState>) -> Json<Option<EvalResponse>> {
-    if let Ok(history) = state.signal_history.lock() {
-        // Find the last signal that is not a position management action.
-        let latest_signal = history.iter().rev().find(|&res| res.entry_type != "none");
-        // Clone the found signal to return it.
-        Json(latest_signal.cloned())
-    } else {
-        tracing::error!(
-            "Signal history mutex was poisoned. A thread panicked while holding the lock."
-        );
-        Json(None)
-    }
-}
-
-#[utoipa::path(
     get,
     path = "/signals",
     responses(
@@ -179,14 +118,100 @@ async fn get_latest_signal_handler(State(state): State<AppState>) -> Json<Option
     )
 )]
 /// Handler to return the last 60 generated trade signals
-async fn get_signals_handler(State(state): State<AppState>) -> Json<Vec<EvalResponse>> {
-    if let Ok(history) = state.signal_history.lock() {
+async fn get_signals_handler(State(state): State<ApplicationState>) -> Json<Vec<EvalResponse>> {
+    if let Ok(history) = state.global_signal_history.lock() {
         Json(history.iter().cloned().collect())
     } else {
         tracing::error!(
             "Signal history mutex was poisoned. A thread panicked while holding the lock."
         );
         Json(vec![])
+    }
+}
+
+/// This handler now acts as the primary data ingress point.
+/// It finds or creates a session for the symbol in the request,
+/// and passes the data to the session for processing.
+#[utoipa::path(
+    post,
+    path = "/data",
+    request_body = EvalRequest,
+    responses(
+        (status = 200, description = "Data processed successfully")
+    )
+)]
+async fn process_data_handler(
+    State(state): State<ApplicationState>,
+    Json(req): Json<EvalRequest>,
+) -> (StatusCode, Json<&'static str>) {
+    tracing::info!(
+        symbol = %req.symbol,
+        timeframe = %req.timeframe,
+        closes_count = req.closes.len(),
+        "Received data processing request"
+    );
+
+    // For now, we assume a global config for filtering. This could also be part of the request.
+    let filter_scalp_by_swing = true;
+
+    // Lock the sessions map, get the specific session for the symbol, and process data.
+    // The `get_or_create_session` handles the logic of creating a new session if it's the first time
+    // we see this symbol. The lock is held for the duration of the data processing to ensure consistency.
+    let mut sessions = state
+        .session_manager
+        .get_or_create_session(&req.symbol, filter_scalp_by_swing);
+
+    if let Some(session) = sessions.get_mut(&req.symbol) {
+        session.on_data(&req);
+
+        // After processing, we can store the generated signals in the global history
+        // for the `/signals` endpoint.
+        let (scalp_sig, swing_sig) = session.get_latest_signals();
+        let mut history = state.global_signal_history.lock().unwrap();
+        if let Some(sig) = scalp_sig {
+            if sig.entry_type != "none" {
+                history.push_back(sig);
+            }
+        }
+        if let Some(sig) = swing_sig {
+            if sig.entry_type != "none" {
+                history.push_back(sig);
+            }
+        }
+    } else {
+        tracing::error!(symbol = %req.symbol, "Could not find or create session.");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json("Session error"));
+    }
+
+    (StatusCode::OK, Json("Data processed"))
+}
+
+#[utoipa::path(
+    get,
+    path = "/signals/{symbol}",
+    params(
+        ("symbol" = String, Path, description = "The trading symbol, e.g., XAUUSD")
+    ),
+    responses(
+        (status = 200, description = "Returns the latest scalp and swing signals for the symbol", body = LatestSignalsResponse),
+        (status = 404, description = "No session found for symbol")
+    )
+)]
+/// Handler to return the last generated signals for a specific symbol.
+async fn get_latest_signals_handler(
+    State(state): State<ApplicationState>,
+    Path(symbol): Path<String>,
+) -> Result<Json<LatestSignalsResponse>, StatusCode> {
+    let sessions = state.session_manager.sessions.lock().unwrap();
+    if let Some(session) = sessions.get(&symbol) {
+        let (scalp_signal, swing_signal) = session.get_latest_signals();
+        Ok(Json(LatestSignalsResponse {
+            scalp_signal,
+            swing_signal,
+        }))
+    } else {
+        tracing::warn!("No session found for symbol: {}", symbol);
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
@@ -240,7 +265,7 @@ async fn confirm_execution_handler(
 )]
 /// Handler to receive and store a trade log from the MQL5 EA
 async fn log_trade_handler(
-    State(state): State<AppState>,
+    State(state): State<ApplicationState>,
     Json(log): Json<TradeLog>,
 ) -> Json<&'static str> {
     if let Ok(mut logs) = state.trade_logs.lock() {
@@ -264,7 +289,7 @@ async fn log_trade_handler(
 )]
 /// Handler to return all stored trade logs
 async fn get_logs_handler(
-    State(state): State<AppState>,
+    State(state): State<ApplicationState>,
     Query(params): Query<HistoryParams>,
 ) -> Json<HistoryResponse> {
     let logs = match state.trade_logs.lock() {

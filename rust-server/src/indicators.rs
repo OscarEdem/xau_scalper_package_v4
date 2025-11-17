@@ -15,20 +15,20 @@ pub struct OpenPosition {
     pub mode: String, // "scalp" | "swing"
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalRequest {
     pub symbol: String,
     pub timeframe: String,
-    pub closes: Vec<f64>,
-    pub highs: Vec<f64>,
-    pub opens: Vec<f64>, // Added for wick imbalance
+    pub closes: Vec<f64>, // For a new candle, this might just contain one value
+    pub highs: Vec<f64>,  // For a new candle, this might just contain one value
+    pub opens: Vec<f64>,
     pub lows: Vec<f64>,
-    pub volumes: Vec<u64>, // Added for VWAP
-    pub m5_closes: Vec<f64>,
+    pub volumes: Vec<u64>,
+    pub m5_closes: Vec<f64>, // These can be sent as full buffers or as single new values
     pub m5_highs: Vec<f64>,
     pub m5_lows: Vec<f64>,
-    pub m30_closes: Vec<f64>, // for higher timeframe EMA
+    pub m30_closes: Vec<f64>,
     pub h1_closes: Option<Vec<f64>>,
     pub h1_highs: Option<Vec<f64>>,
     pub h1_lows: Option<Vec<f64>>,
@@ -172,7 +172,7 @@ pub struct ExecutionConfirmation {
     pub timestamp: String, // ISO
 }
 
-#[derive(Deserialize, IntoParams)]
+#[derive(Deserialize, ToSchema, IntoParams)]
 pub struct HistoryParams {
     /// Optional start date for filtering logs (format: YYYY-MM-DD)
     pub start_date: Option<String>,
