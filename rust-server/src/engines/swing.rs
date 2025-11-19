@@ -93,13 +93,13 @@ impl SwingEngine {
         let chandelier_mult = req.chandelier_atr_mult.unwrap_or(3.0);
 
         let (sl_price, tp1_price, tp2_price) = if entry_type == "long" {
-            let sl = chandelier_exit_high(&highs, &atr_vals, chandelier_period, chandelier_mult)
+            let sl = chandelier_exit_low(&lows, &atr_vals, chandelier_period, chandelier_mult)
                 .unwrap_or(req.current_price - last_atr * sl_atr_multiplier);
             let tp1 = req.current_price + last_atr * tp_atr_multiplier;
             let tp2 = req.current_price + last_atr * (tp_atr_multiplier * 2.0);
             (sl, tp1, tp2)
         } else { // Short
-            let sl = chandelier_exit_low(&lows, &atr_vals, chandelier_period, chandelier_mult)
+            let sl = chandelier_exit_high(&highs, &atr_vals, chandelier_period, chandelier_mult)
                 .unwrap_or(req.current_price + last_atr * sl_atr_multiplier);
             let tp1 = req.current_price - last_atr * tp_atr_multiplier;
             let tp2 = req.current_price - last_atr * (tp_atr_multiplier * 2.0);

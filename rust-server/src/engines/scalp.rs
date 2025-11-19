@@ -38,6 +38,14 @@ impl ScalpEngine {
             };
         }
 
+        // --- NEW: Ensure highs and lows are present for FVG/Sweep analysis ---
+        if highs.is_empty() || lows.is_empty() {
+            return EvalResponse {
+                reason: "M5 highs and lows data is required for FVG/Sweep analysis but was not provided.".to_string(),
+                ..Default::default()
+            };
+        }
+
         // --- A. ENTRY CONDITIONS ---
 
         // 1. Trend & Momentum Filters
@@ -96,10 +104,20 @@ impl ScalpEngine {
 
         // --- Combine Entry Signals ---
         let mut entry_type = "none".to_string();
+        let mut conviction_score = 0.0;
+
         if is_buy_trend && is_buy_momentum {
             entry_type = "long".to_string();
+            conviction_score += 60.0; // Base score for EMA/ROC alignment
+            if sweep_detected == "low_sweep" {
+                conviction_score += 25.0; // Bonus for sweeping liquidity before going long
+            }
         } else if is_sell_trend && is_sell_momentum {
             entry_type = "short".to_string();
+            conviction_score += 60.0; // Base score for EMA/ROC alignment
+            if sweep_detected == "high_sweep" {
+                conviction_score += 25.0; // Bonus for sweeping liquidity before going short
+            }
         }
 
         if entry_type == "none" {
@@ -137,7 +155,7 @@ impl ScalpEngine {
         } else { // Short
             let sl = req.current_price + sl_points;
             let tp1 = req.current_price - tp1_points;
-            let tp2 = req.current_price + tp2_points;
+            let tp2 = req.current_price - tp2_points;
             (sl, tp1, tp2)
         };
 
@@ -180,6 +198,7 @@ impl ScalpEngine {
             reason: format!("ema_crossover + roc_breakout (sweep: {})", sweep_detected),
             classification: "scalp".to_string(),
             sweep_detected,
+            conviction_score: Some(conviction_score),
             ..Default::default()
         }
     }

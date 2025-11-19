@@ -68,7 +68,6 @@ pub struct EvalRequest {
     pub chandelier_atr_mult: Option<f64>,
     pub max_hold_bars: Option<usize>,
     // Timestamp synchronization
-    #[serde(default)]
     pub last_m1_timestamp: i64,
     pub last_m5_timestamp: Option<i64>,
     pub last_m30_timestamp: Option<i64>,
@@ -113,6 +112,8 @@ pub struct EvalResponse {
     pub vwap_bands: Option<VwapBands>,
     pub reason: String,
     pub classification: String, // "scalp" or "swing"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conviction_score: Option<f64>,
 }
 
 impl Default for EvalResponse {
@@ -133,6 +134,7 @@ impl Default for EvalResponse {
             vwap_bands: None,
             reason: "No signal".to_string(),
             classification: "none".to_string(),
+            conviction_score: None,
         }
     }
 }
@@ -410,13 +412,13 @@ pub fn find_imbalance_zones(highs: &[f64], lows: &[f64], lookback: usize) -> Vec
     let start_index = highs.len().saturating_sub(lookback);
 
     for i in (start_index + 2)..highs.len() {
-        // Bullish FVG (gap below current price)
-        if lows[i-1] > highs[i-2] {
-             zones.push(PriceLevel { top: lows[i-1], bottom: highs[i-2] });
+        // Correct Bullish FVG: The low of the current candle is above the high of the candle two periods ago.
+        if lows[i] > highs[i-2] {
+             zones.push(PriceLevel { top: lows[i], bottom: highs[i-2] });
         }
-        // Bearish FVG (gap above current price)
-        if highs[i-1] < lows[i-2] {
-            zones.push(PriceLevel { top: lows[i-2], bottom: highs[i-1] });
+        // Correct Bearish FVG: The high of the current candle is below the low of the candle two periods ago.
+        if highs[i] < lows[i-2] {
+            zones.push(PriceLevel { top: lows[i-2], bottom: highs[i] });
         }
     }
     zones

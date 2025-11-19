@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use axum::routing::post;
-use chrono::{Datelike, NaiveDate, Timelike, Utc, Weekday};
+use chrono::{NaiveDate, Utc};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
@@ -17,15 +17,21 @@ use xau_scalper_server::{
     ExecutionConfirmation, HistoryParams, HistoryResponse, HistoryStats, TradeLog, PriceLevel, VwapBands
 };
 
+/// A wrapper to store a signal with its creation timestamp for historical logging.
+#[derive(serde::Serialize, utoipa::ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HistoricalSignal {
+    #[serde(flatten)]
+    signal: ActiveSignal,
+    created_at: i64, // Unix timestamp
+}
 
 /// A more flexible state for the whole application, including the new SessionManager.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ApplicationState {
     session_manager: SessionManager,
     trade_logs: Arc<Mutex<VecDeque<TradeLog>>>,
-    // The global signal history can be removed if signals are only retrieved per-session.
-    // We'll keep it for now to support the existing `/signals` endpoint.
-    global_signal_history: Arc<Mutex<VecDeque<EvalResponse>>>,
+    signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -35,12 +41,28 @@ struct LatestSignalsResponse {
     swing_signal: Option<EvalResponse>,
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct LatestSignalsForSymbol {
+    symbol: String,
+    scalp_signal: Option<EvalResponse>,
+    swing_signal: Option<EvalResponse>,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSignal {
+    symbol: String,
+    #[serde(flatten)]
+    signal: EvalResponse,
+}
+
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
-    paths(process_data_handler, log_trade_handler, get_logs_handler, get_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler),
+    paths(process_data_handler, log_trade_handler, get_logs_handler, clear_history_handler, get_latest_signals_handler, get_all_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler),
     components(
-        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse)
+        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal)
     ),
     tags((name = "XAU Scalper API", description = "API for XAU/USD Scalping Strategy"))
 )]
@@ -52,28 +74,52 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Initialize the shared state
-    let shared_state = ApplicationState::default();
+    let shared_state = ApplicationState {
+        session_manager: SessionManager::default(),
+        trade_logs: Arc::new(Mutex::new(VecDeque::new())),
+        signal_history: Arc::new(Mutex::new(VecDeque::new())),
+    };
 
-    // --- New: Spawn a background task for weekly signal history cleanup ---
+    // --- Background task for stale signal cleanup (invalidates signals in live sessions) ---
     let cleanup_state = shared_state.clone();
     tokio::spawn(async move {
-        let mut last_cleanup_week = 0;
-        // Wait a bit on startup before starting the cleanup loop.
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        loop {
+            // Check every minute
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            let now = Utc::now().timestamp();
+            const STALE_THRESHOLD_SECONDS: i64 = 300; // 5 minutes
 
+            if let Ok(mut sessions) = cleanup_state.session_manager.sessions.lock() {
+                let stale_symbols: Vec<String> = sessions.iter()
+                    .filter(|(_, session)| (now - session.get_last_eval_timestamp()) > STALE_THRESHOLD_SECONDS)
+                    .map(|(symbol, _)| symbol.clone())
+                    .collect();
+
+                for symbol in stale_symbols {
+                    if let Some(session) = sessions.get_mut(&symbol) {
+                        session.invalidate_signals();
+                        tracing::info!("Invalidated stale signals for symbol: {}", symbol);
+                    }
+                }
+            }
+        }
+    });
+
+    // --- NEW: Background task for 24-hour signal history cleanup ---
+    let history_cleanup_state = shared_state.clone();
+    tokio::spawn(async move {
         loop {
             // Check every hour
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            let now = Utc::now();
-            let current_week = now.iso_week().week();
+            let now = Utc::now().timestamp();
+            const ONE_DAY_IN_SECONDS: i64 = 24 * 60 * 60;
 
-            // Cleanup window: Saturday 04:00 - 04:59 UTC (6 hours after Friday 22:00 market close)
-            if now.weekday() == Weekday::Sat && now.hour() == 4 && last_cleanup_week != current_week {
-                tracing::info!("Performing weekly cleanup of signal history.");
-                if let Ok(mut history) = cleanup_state.global_signal_history.lock() {
-                    history.clear();
-                    last_cleanup_week = current_week;
-                    tracing::info!("Signal history cleared for the week.");
+            if let Ok(mut history) = history_cleanup_state.signal_history.lock() {
+                let original_len = history.len();
+                history.retain(|hs| (now - hs.created_at) < ONE_DAY_IN_SECONDS);
+                let removed_count = original_len - history.len();
+                if removed_count > 0 {
+                    tracing::info!("Removed {} signals from history older than 24 hours.", removed_count);
                 }
             }
         }
@@ -84,13 +130,14 @@ async fn main() {
         .route("/health", get(|| async { "OK" }))
         .route("/data", post(process_data_handler))
         .route("/signals/:symbol", get(get_latest_signals_handler))
+        .route("/signals/latest", get(get_all_latest_signals_handler))
         .route("/signals", get(get_signals_handler))
         // --- Add new routes for logging ---
         .route("/confirm_arrival", post(confirm_arrival_handler))
         .route("/confirm_execution", post(confirm_execution_handler))
         .route("/log_trade", post(log_trade_handler))
         // --- The history endpoint is now more powerful ---
-        .route("/history", get(get_logs_handler))
+        .route("/history", get(get_logs_handler).delete(clear_history_handler))
         // Provide the state to the handlers
         .with_state(shared_state);
 
@@ -114,19 +161,17 @@ async fn shutdown_signal() {
     get,
     path = "/signals",
     responses(
-        (status = 200, description = "Returns the last 60 trade signals", body = Vec<EvalResponse>)
+        (status = 200, description = "Returns a log of all signals generated in the last 24 hours", body = Vec<HistoricalSignal>)
     )
 )]
-/// Handler to return the last 60 generated trade signals
-async fn get_signals_handler(State(state): State<ApplicationState>) -> Json<Vec<EvalResponse>> {
-    if let Ok(history) = state.global_signal_history.lock() {
-        Json(history.iter().cloned().collect())
-    } else {
-        tracing::error!(
-            "Signal history mutex was poisoned. A thread panicked while holding the lock."
-        );
-        Json(vec![])
-    }
+/// Handler to return a log of all signals generated in the last 24 hours.
+async fn get_signals_handler(State(state): State<ApplicationState>) -> Json<Vec<HistoricalSignal>> {
+    let history = state.signal_history.lock().unwrap_or_else(|e| {
+        tracing::error!("Signal history mutex poisoned! Recovering. Error: {}", e);
+        e.into_inner()
+    });
+    // Return a clone of the current history
+    Json(history.iter().cloned().collect())
 }
 
 /// This handler now acts as the primary data ingress point.
@@ -158,25 +203,41 @@ async fn process_data_handler(
     // The `get_or_create_session` handles the logic of creating a new session if it's the first time
     // we see this symbol. The lock is held for the duration of the data processing to ensure consistency.
     let mut sessions = state
-        .session_manager
-        .get_or_create_session(&req.symbol, filter_scalp_by_swing);
+        .session_manager.sessions.lock().unwrap_or_else(|e| {
+            tracing::error!("Session manager mutex poisoned! Recovering. Error: {}", e);
+            e.into_inner()
+        });
+    
+    sessions.entry(req.symbol.clone()).or_insert_with(|| {
+        tracing::info!("Creating new trading session for symbol: {}", req.symbol);
+        xau_scalper_server::TradingSession::new(req.symbol.clone(), filter_scalp_by_swing)
+    });
 
     if let Some(session) = sessions.get_mut(&req.symbol) {
         session.on_data(&req);
 
-        // After processing, we can store the generated signals in the global history
-        // for the `/signals` endpoint.
-        let (scalp_sig, swing_sig) = session.get_latest_signals();
-        let mut history = state.global_signal_history.lock().unwrap();
-        if let Some(sig) = scalp_sig {
-            if sig.entry_type != "none" {
-                history.push_back(sig);
-            }
+        // --- NEW: Add latest signals to history ---
+        let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
+        let mut history = state.signal_history.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now().timestamp();
+
+        if let Some(swing_sig) = swing_sig_opt {
+            history.push_front(HistoricalSignal {
+                signal: ActiveSignal {
+                    symbol: req.symbol.clone(),
+                    signal: swing_sig,
+                },
+                created_at: now,
+            });
         }
-        if let Some(sig) = swing_sig {
-            if sig.entry_type != "none" {
-                history.push_back(sig);
-            }
+        if let Some(scalp_sig) = scalp_sig_opt {
+            history.push_front(HistoricalSignal {
+                signal: ActiveSignal {
+                    symbol: req.symbol.clone(),
+                    signal: scalp_sig,
+                },
+                created_at: now,
+            });
         }
     } else {
         tracing::error!(symbol = %req.symbol, "Could not find or create session.");
@@ -202,7 +263,11 @@ async fn get_latest_signals_handler(
     State(state): State<ApplicationState>,
     Path(symbol): Path<String>,
 ) -> Result<Json<LatestSignalsResponse>, StatusCode> {
-    let sessions = state.session_manager.sessions.lock().unwrap();
+    let sessions = state.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned in get_latest_signals_handler! Recovering. Error: {}", e);
+        e.into_inner()
+    });
+
     if let Some(session) = sessions.get(&symbol) {
         let (scalp_signal, swing_signal) = session.get_latest_signals();
         Ok(Json(LatestSignalsResponse {
@@ -214,6 +279,41 @@ async fn get_latest_signals_handler(
         Err(StatusCode::NOT_FOUND)
     }
 }
+
+#[utoipa::path(
+    get,
+    path = "/signals/latest",
+    responses(
+        (status = 200, description = "Returns the latest signals for all active symbols", body = Vec<LatestSignalsForSymbol>)
+    )
+)]
+/// Handler to return the latest signals for all active symbols.
+async fn get_all_latest_signals_handler(
+    State(state): State<ApplicationState>,
+) -> Json<Vec<LatestSignalsForSymbol>> {
+    let sessions = state.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned in get_all_latest_signals_handler! Recovering. Error: {}", e);
+        e.into_inner()
+    });
+
+    let mut all_signals = Vec::new();
+
+    for (symbol, session) in sessions.iter() {
+        let (scalp_signal, swing_signal) = session.get_latest_signals();
+        
+        // Only include symbols that have generated at least one signal
+        if scalp_signal.is_some() || swing_signal.is_some() {
+            all_signals.push(LatestSignalsForSymbol {
+                symbol: symbol.clone(),
+                scalp_signal,
+                swing_signal,
+            });
+        }
+    }
+
+    Json(all_signals)
+}
+
 
 #[utoipa::path(
     post,
@@ -354,4 +454,28 @@ async fn get_logs_handler(
         stats: HistoryStats { total_profit, total_trades, winning_trades, losing_trades, win_rate_percent, profit_factor },
         trades: filtered_trades,
     })
+}
+
+#[utoipa::path(
+    delete,
+    path = "/history",
+    responses(
+        (status = 200, description = "Trade history cleared successfully")
+    )
+)]
+/// Handler to clear all stored trade logs.
+async fn clear_history_handler(
+    State(state): State<ApplicationState>,
+) -> (StatusCode, Json<&'static str>) {
+    match state.trade_logs.lock() {
+        Ok(mut logs) => {
+            logs.clear();
+            tracing::info!("Trade history has been cleared manually.");
+            (StatusCode::OK, Json("Trade history cleared"))
+        }
+        Err(_) => {
+            tracing::error!("Trade logs mutex was poisoned. Could not clear history.");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json("Failed to acquire lock on trade history"))
+        }
+    }
 }

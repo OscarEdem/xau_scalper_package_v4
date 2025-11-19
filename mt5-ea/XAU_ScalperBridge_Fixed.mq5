@@ -6,10 +6,10 @@
 
 
 // --- EA Inputs ---
-input string ServerUrl = "http://127.0.0.1:3000/eval";
+input string ServerUrl = "http://127.0.0.1:3000"; // Base URL, endpoints will be appended
 input double RiskPercent = 0.5;
-input int    NumCloses = 250; // Increased to satisfy server's longest indicator (SMA 200)
-input double MaxSpreadPoints = 160;
+input int    NumCloses = 300; // Increased to satisfy server's longest indicator (SMA 200) and provide buffer
+input double MaxSpreadPoints = 220;
 input ulong  MagicNumber = 1337;
 
 // --- Strategy Parameters (from best backtest) ---
@@ -49,9 +49,10 @@ double g_low_since_entry = 0.0;  // Lowest low since the short trade was opened
 void ClosePositions(ENUM_POSITION_TYPE direction);
 void CreatePanel(const long chart_ID, const string name, const int x, const int y, const int width, const int height, const color bg_color, const color border_color);
 void CreateLabel(const long chart_ID, const string name, const int x, const int y, const string text, const color text_color);
-void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string sma, string stoch_k, string stoch_d, string conviction_score, string tp, string sl, double current_spread, double current_balance, double current_pl, double next_lot_size);
+void UpdateDashboard(string action, string reason, string tp, string sl, double current_spread, double current_balance, double current_pl, double next_lot_size);
 double CalculateLotSize(double stop_loss_pips, string symbol, double point_value, double risk_percentage_override);
 string GetJsonValue(string json, string key, bool is_string);
+string GetNestedJsonValue(string json, string object_key, string value_key, bool is_string);
 int CountOpenPositions(ENUM_POSITION_TYPE direction);
 void LogEvent(string event_type, ulong ticket, string symbol, string direction, double lot_size, double price, double sl, double tp, double profit, string comment);
 
@@ -120,7 +121,7 @@ void OnTick()
      {
       Print("Spread is too high: ", spread_pts, " points. Skipping.");
       // Still update dashboard to show high spread
-      UpdateDashboard("hold", "Spread too high", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, 0.0);
+      UpdateDashboard("hold", "Spread too high", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, 0.0);
       return;
      }
 
@@ -154,7 +155,8 @@ void OnTick()
      {
       if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
         {
-         if(open_pos_count > 0) open_positions_json += ",";
+         if(open_pos_count > 0)
+            open_positions_json += ",";
 
          ulong ticket = PositionGetTicket(i);
          string direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "buy" : "sell";
@@ -175,19 +177,21 @@ void OnTick()
    open_positions_json += "]";
 
 // Build the JSON payload
-   string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "";
+   string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
    string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "";
-   string m30_closes_str = "";
-   string h1_closes_str = "";
+   string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "";
 
    for(int i = 0; i < ArraySize(m1_rates); i++)
      {
+      // Use tick_volume as it's generally more available than real_volume
+      m1_volumes_str += IntegerToString(m1_rates[i].tick_volume);
       m1_opens_str += DoubleToString(m1_rates[i].open, _Digits);
       m1_closes_str += DoubleToString(m1_rates[i].close, _Digits);
       m1_highs_str += DoubleToString(m1_rates[i].high, _Digits);
       m1_lows_str += DoubleToString(m1_rates[i].low, _Digits);
       if(i < ArraySize(m1_rates) - 1)
         {
+         m1_volumes_str += ",";
          m1_opens_str += ",";
          m1_closes_str += ",";
          m1_highs_str += ",";
@@ -210,127 +214,146 @@ void OnTick()
    for(int i = 0; i < ArraySize(m30_rates); i++)
      {
       m30_closes_str += DoubleToString(m30_rates[i].close, _Digits);
-      if(i < ArraySize(m30_rates) - 1) m30_closes_str += ",";
+      if(i < ArraySize(m30_rates) - 1)
+         m30_closes_str += ",";
      }
    for(int i = 0; i < ArraySize(h1_rates); i++)
      {
       h1_closes_str += DoubleToString(h1_rates[i].close, _Digits);
-      if(i < ArraySize(h1_rates) - 1) h1_closes_str += ",";
+      h1_highs_str += DoubleToString(h1_rates[i].high, _Digits);
+      h1_lows_str += DoubleToString(h1_rates[i].low, _Digits);
+      if(i < ArraySize(h1_rates) - 1)
+        {
+         h1_closes_str += ",";
+         h1_highs_str += ",";
+         h1_lows_str += ",";
+        }
      }
+
+   long last_m1_timestamp = (long)m1_rates[ArraySize(m1_rates)-1].time;
 
    string json_payload = StringFormat(
                             "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
-                            "\"spreadPoints\":%.1f,\"priceDecimals\":%d,"
-                            "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s]," // M1 data
-                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s]," // M5 data
-                            "\"m30Closes\":[%s],\"h1Closes\":[%s]," // HTF data
+                            "\"currentPrice\":%.5f,\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
+                            "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s]," // M1 data
+                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],"
+                            "\"m30Closes\":[%s],\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s]," // HTF data
                             "\"openPositions\":%s," // Open positions data
                             "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d," // Existing params
                             "\"spreadLimitPoints\":%.1f," // Corrected to match Rust struct
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
                             "\"slAtrMultiplier\":%.1f,\"tpAtrMultiplier\":%.1f,"
-                            "\"adxPeriod\":14,\"chandelierPeriod\":22,\"chandelierAtrMult\":3.0}", // Swing params
+                            "\"mode\":\"scalp\",\"adxPeriod\":14,\"chandelierPeriod\":22,\"chandelierAtrMult\":3.0}", // Swing params
                             _Symbol,
-                            spread_pts, _Digits,
-                            m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str,
-                            m5_closes_str, m5_highs_str, m5_lows_str,
-                            m30_closes_str, h1_closes_str,
+                            ask, spread_pts, _Digits, last_m1_timestamp,
+                            m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
+                            m5_closes_str, m5_highs_str, m5_lows_str, m30_closes_str,
+                            h1_closes_str, h1_highs_str, h1_lows_str,
                             open_positions_json,
                             RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints, StochKPeriod, StochDPeriod, StochSlowing, SlAtrMultiplier, TpAtrMultiplier
                          );
 
-// --- Call the Rust server ---
+// --- 1. POST data to the Rust server ---
    ResetLastError();
    string result_headers;
    StringToCharArray(json_payload, post_data);
-   int res = WebRequest("POST", ServerUrl, "Content-Type: application/json", 5000, post_data, result, result_headers);
+   int res = WebRequest("POST", ServerUrl + "/data", "Content-Type: application/json", 5000, post_data, result, result_headers);
 
    string action = "hold";
-   string reason = "N/A";
-   string rsi_val = "-";
-   string ema_fast = "-";
-   string ema_slow = "-";
+   string reason = "No Signal";
+   string entry_type = "none";
    string tp_pips = "-";
    string sl_pips = "-";
-   string atr_val_str = "-";
-   string sma_val_str = "-";
-   string stoch_k_val_str = "-"; // New
-   string stoch_d_val_str = "-"; // New
-   string conviction_score_val_str = "-"; // New
-   string trailing_sl_price_str = "-";
-   string ticket_str = "0";
+   double sl_price = 0.0;
+   double tp1_price = 0.0;
+   ulong ticket_to_manage = 0;
+   double new_sl_price = 0.0;
 
 
    if(res == -1)
      {
       Print("WebRequest failed. Error code: ", GetLastError());
-      reason = "Request Failed";
+      reason = "POST /data Failed";
      }
    else
       if(res != 200)
         {
-         Print("Server returned non-200 status: ", res);
+         Print("Server /data returned non-200 status: ", res);
          Print("Server response: ", CharArrayToString(result));
          reason = "Server Error " + IntegerToString(res);
         }
       else
         {
-         // --- Process server response ---
-         string response_str = CharArrayToString(result);
-         action = GetJsonValue(response_str, "actionAdvice", true);
-         ticket_str = GetJsonValue(response_str, "ticket", false); // For close/update actions
-         reason = GetJsonValue(response_str, "reason", true);
-         rsi_val = GetJsonValue(response_str, "rsi", false);
-         ema_fast = GetJsonValue(response_str, "emaFastLast", false);
-         ema_slow = GetJsonValue(response_str, "emaSlowLast", false);
-         tp_pips = GetJsonValue(response_str, "tpPips", false);
-         sl_pips = GetJsonValue(response_str, "slPips", false);
-         atr_val_str = GetJsonValue(response_str, "atr", false);
-         sma_val_str = GetJsonValue(response_str, "smaLast", false);
-         stoch_k_val_str = GetJsonValue(response_str, "stochKLast", false); // New
-         stoch_d_val_str = GetJsonValue(response_str, "stochDLast", false); // New
-         trailing_sl_price_str = GetJsonValue(response_str, "trailingSlPrice", false);
-         conviction_score_val_str = GetJsonValue(response_str, "convictionScore", false); // New
+         // --- 2. GET signals from the server ---
+         Print("Data POST successful. Now GETting signals.");
+         char get_result[];
+         string get_headers;
+         int get_res = WebRequest("GET", ServerUrl + "/signals/" + _Symbol, NULL, 5000, post_data, get_result, get_headers);
 
-         PrintFormat("Server response: action=%s, reason=%s, rsi=%s, ema_fast=%s, ema_slow=%s, atr=%s, sma=%s, stoch_k=%s, stoch_d=%s, conviction=%s, tp_pips=%s, sl_pips=%s",
-                     action, reason, rsi_val, ema_fast, ema_slow, atr_val_str, sma_val_str, stoch_k_val_str, stoch_d_val_str, conviction_score_val_str, tp_pips, sl_pips);
+         if(get_res != 200)
+           {
+            Print("WebRequest to /signals failed. Status: ", get_res);
+            reason = "GET /signals Failed";
+           }
+         else
+           {
+            // --- Process server response ---
+            string response_str = CharArrayToString(get_result);
+            // We are interested in the scalp signal from the nested response
+            entry_type = GetNestedJsonValue(response_str, "scalpSignal", "entryType", true);
+            reason = GetNestedJsonValue(response_str, "scalpSignal", "reason", true);
+            sl_price = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "slPrice", false));
+            tp1_price = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "tp1Price", false));
+
+            // --- NEW: Process swingSignal for position management ---
+            action = GetNestedJsonValue(response_str, "swingSignal", "action", true);
+            ticket_to_manage = (ulong)StringToInteger(GetNestedJsonValue(response_str, "swingSignal", "ticketToManage", false));
+            new_sl_price = StringToDouble(GetNestedJsonValue(response_str, "swingSignal", "slPrice", false));
+
+            // For display purposes, convert prices to pips
+            if(entry_type == "long")
+              {
+               sl_pips = DoubleToString((ask - sl_price) / (point_val * 10.0), 1);
+               tp_pips = DoubleToString((tp1_price - ask) / (point_val * 10.0), 1);
+              }
+            else
+               if(entry_type == "short")
+                 {
+                  sl_pips = DoubleToString((sl_price - bid) / (point_val * 10.0), 1);
+                  tp_pips = DoubleToString((bid - tp1_price) / (point_val * 10.0), 1);
+                 }
+
+            PrintFormat("Server response: entryType=%s, reason=%s, sl=%.5f, tp1=%.5f", entry_type, reason, sl_price, tp1_price);
+           }
         }
 
-// --- Trade Execution ---
-   double sl = StringToDouble(sl_pips);
-   double tp = StringToDouble(tp_pips);
-   int conviction = StringToInteger(conviction_score_val_str);
-   ulong ticket_to_manage = (ulong)StringToInteger(ticket_str);
-   double new_sl_price = StringToDouble(trailing_sl_price_str);
-
-   // --- Position Management Actions (Highest Priority) ---
+// --- Position Management Actions (Highest Priority) ---
    if(action == "close" && ticket_to_manage > 0)
      {
       PrintFormat("Server advised to CLOSE position #%llu", ticket_to_manage);
       trade.PositionClose(ticket_to_manage);
-      return; // Action taken, end of tick processing
      }
-   if(action == "update_sl" && ticket_to_manage > 0 && new_sl_price > 0)
-     {
-      if(PositionSelectByTicket(ticket_to_manage))
+   else
+      if(action == "update_sl" && ticket_to_manage > 0 && new_sl_price > 0)
         {
-         PrintFormat("Server advised to UPDATE SL for position #%llu to %.5f", ticket_to_manage, new_sl_price);
-         // Modify the position with the new SL, keeping the existing TP
-         trade.PositionModify(ticket_to_manage, new_sl_price, PositionGetDouble(POSITION_TP));
+         if(PositionSelectByTicket(ticket_to_manage))
+           {
+            PrintFormat("Server advised to UPDATE SL for position #%llu to %.5f", ticket_to_manage, new_sl_price);
+            // Modify the position with the new SL, keeping the existing TP
+            trade.PositionModify(ticket_to_manage, new_sl_price, PositionGetDouble(POSITION_TP));
+           }
         }
-      return; // Action taken, end of tick processing
-     }
-   // --- End of Position Management ---
-   
-   // --- NEW: Calculate Lot Size based on Conviction Score ---
-   double lot_size = CalculateLotSizeConviction(conviction);
+// --- End of Position Management ---
 
-   // --- Display graphical dashboard on chart ---
-   UpdateDashboard(action, reason, rsi_val, ema_fast, ema_slow, atr_val_str, sma_val_str, stoch_k_val_str, stoch_d_val_str, conviction_score_val_str, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, lot_size);
+// --- NEW: Calculate Lot Size based on Conviction Score ---
+   double lot_size = 0.01; // Default to 0.01, will be replaced by server logic later
+
+// --- Display graphical dashboard on chart ---
+   UpdateDashboard(entry_type, reason, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, lot_size);
 
 
 // --- Trade Execution Logic ---
-   if(StringFind(action, "buy") != -1 && lot_size > 0.0)
+   if(entry_type == "long" && lot_size > 0.0 && action != "close" && action != "update_sl")
      {
       // Close any opposing positions before opening a new one
       ClosePositions(POSITION_TYPE_SELL);
@@ -356,20 +379,18 @@ void OnTick()
 
       if(open_buys == 0 || (can_pyramid && is_profitable_enough))
         {
-         double stop_loss_price = ask - sl * point_val * 10.0;
-         double take_profit_price = ask + tp * point_val * 10.0;
-         if(lot_size > 0 && trade.Buy(lot_size, _Symbol, ask, stop_loss_price, take_profit_price, "XAU Scalper Bridge BUY"))
+         if(lot_size > 0 && trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
            {
             ulong ticket = trade.ResultDeal();
             if(PositionSelectByTicket(ticket))
               {
-               LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), stop_loss_price, take_profit_price, 0.0, reason);
+               LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
               }
            }
         }
      }
    else
-      if((StringFind(action, "sell") != -1) && lot_size > 0.0)
+      if(entry_type == "short" && lot_size > 0.0 && action != "close" && action != "update_sl")
         {
          // Close any opposing positions
          ClosePositions(POSITION_TYPE_BUY);
@@ -393,14 +414,12 @@ void OnTick()
 
          if(open_sells == 0 || (can_pyramid && is_profitable_enough))
            {
-            double stop_loss_price = bid + sl * point_val * 10.0;
-            double take_profit_price = bid - tp * point_val * 10.0;
-            if(lot_size > 0 && trade.Sell(lot_size, _Symbol, bid, stop_loss_price, take_profit_price, "XAU Scalper Bridge SELL"))
+            if(lot_size > 0 && trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
               {
                ulong ticket = trade.ResultDeal();
                if(PositionSelectByTicket(ticket))
                  {
-                  LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), stop_loss_price, take_profit_price, 0.0, reason);
+                  LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
                  }
               }
            }
@@ -603,12 +622,12 @@ void CreateDashboardRow(long chart_ID, string key, string value, int x_key, int 
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
-void UpdateDashboard(string action, string reason, string rsi, string ema_fast, string ema_slow, string atr, string sma, string stoch_k, string stoch_d, string conviction_score, string tp, string sl, double current_spread, double current_balance, double current_pl, double next_lot_size)
+void UpdateDashboard(string action, string reason, string tp, string sl, double current_spread, double current_balance, double current_pl, double next_lot_size)
   {
    long chart_ID = ChartID();
    int x_pos = 15;
 // Adjusted y_pos and panel height for new indicators and conviction score
-   int y_pos = 321;
+   int y_pos = 200;
    int y_step = 17;
 
    color clr_panel_bg = C'33,33,33';
@@ -620,7 +639,7 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
    color clr_spread_bad = C'244,67,54';
    color clr_profit = C'0,230,118';
    color clr_loss = C'244,67,54';
-   CreatePanel(chart_ID, "XauBridge_Panel", 5, 5, 260, 308, clr_panel_bg, clr_panel_border); // Increased panel height
+   CreatePanel(chart_ID, "XauBridge_Panel", 5, 5, 260, 185, clr_panel_bg, clr_panel_border);
 
    string signal_text;
    color signal_color;
@@ -670,31 +689,12 @@ void UpdateDashboard(string action, string reason, string rsi, string ema_fast, 
    CreateDashboardRow(chart_ID, "Current P/L", pl_string, x_pos, x_val_pos, y_pos, clr_label, pl_color);
    y_pos -= y_step + 7;
 
-// Indicators
-   CreateDashboardRow(chart_ID, "RSI", rsi, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step;
-   CreateDashboardRow(chart_ID, "EMA Fast", ema_fast, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step;
-   CreateDashboardRow(chart_ID, "EMA Slow", ema_slow, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step;
-   CreateDashboardRow(chart_ID, "ATR", atr, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step + 7;
-   CreateDashboardRow(chart_ID, "SMA (Trend)", sma, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step;
-   CreateDashboardRow(chart_ID, "Stoch %K", stoch_k, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step; // New
-   CreateDashboardRow(chart_ID, "Stoch %D", stoch_d, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step + 7; // New
-
-   CreateDashboardRow(chart_ID, "Conviction Score", conviction_score, x_pos, x_val_pos, y_pos, clr_label, clr_value);
-   y_pos -= y_step + 7; // New
-
 // Trade Plan
    CreateDashboardRow(chart_ID, "Take Profit Pips", tp, x_pos, x_val_pos, y_pos, clr_label, clr_value);
    y_pos -= y_step;
    CreateDashboardRow(chart_ID, "Stop Loss Pips", sl, x_pos, x_val_pos, y_pos, clr_label, clr_value);
    y_pos -= y_step;
-   // --- NEW: Next Lot Size Row ---
+// --- NEW: Next Lot Size Row ---
    CreateDashboardRow(chart_ID, "Next Lot Size", DoubleToString(next_lot_size, 2), x_pos, x_val_pos, y_pos, clr_label, clr_value);
    y_pos -= y_step;
 
@@ -764,14 +764,14 @@ double CalculateLotSizeConviction(int conviction)
       return 0.0; // No trade if conviction is too low
      }
 
-   // Normalize conviction score to a 0.0-1.0 range
+// Normalize conviction score to a 0.0-1.0 range
    double conviction_percentage = (double)(conviction - min_conviction) / (double)(max_conviction - min_conviction);
    conviction_percentage = MathMax(0.0, MathMin(1.0, conviction_percentage)); // Clamp between 0 and 1
 
-   // Linearly scale lot size
+// Linearly scale lot size
    double lot_size = min_lot + (max_lot - min_lot) * conviction_percentage;
 
-   // --- Normalize to broker's volume rules ---
+// --- Normalize to broker's volume rules ---
    double min_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double max_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double vol_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -781,7 +781,7 @@ double CalculateLotSizeConviction(int conviction)
       lot_size = MathRound(lot_size / vol_step) * vol_step;
      }
 
-   // Ensure it's within broker limits
+// Ensure it's within broker limits
    if(lot_size < min_vol)
       lot_size = min_vol;
    if(max_vol > 0 && lot_size > max_vol)
@@ -839,5 +839,50 @@ string GetJsonValue(string json, string key, bool is_string)
       return "";
 
    return StringSubstr(json, start_pos, end_pos - start_pos);
+  }
+
+//+------------------------------------------------------------------+
+//| Get a value from a nested JSON object.                           |
+//| e.g., GetNestedJsonValue(json, "scalpSignal", "entryType", true) |
+//+------------------------------------------------------------------+
+string GetNestedJsonValue(string json, string object_key, string value_key, bool is_string)
+  {
+// 1. Find the start of the nested object
+   string search_object_key = "\"" + object_key + "\":{";
+   int object_start_pos = StringFind(json, search_object_key);
+   if(object_start_pos < 0)
+     {
+      // Check if the object is null
+      search_object_key = "\"" + object_key + "\":null";
+      if(StringFind(json, search_object_key) >= 0)
+        {
+         return is_string ? "none" : "0.0"; // Return default values if object is null
+        }
+      return ""; // Object not found
+     }
+
+   object_start_pos += StringLen(search_object_key);
+
+// 2. Find the end of the nested object by matching braces
+   int brace_count = 1;
+   int object_end_pos = -1;
+   for(int i = object_start_pos; i < StringLen(json); i++)
+     {
+      if(StringGetCharacter(json, i) == '{')
+         brace_count++;
+      if(StringGetCharacter(json, i) == '}')
+         brace_count--;
+      if(brace_count == 0)
+        {
+         object_end_pos = i;
+         break;
+        }
+     }
+   if(object_end_pos < 0)
+      return ""; // Malformed JSON
+
+// 3. Extract the nested object and get the value from it
+   string nested_json = StringSubstr(json, object_start_pos - 1, object_end_pos - (object_start_pos - 1));
+   return GetJsonValue("{" + nested_json, value_key, is_string);
   }
 //+------------------------------------------------------------------+

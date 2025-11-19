@@ -44,6 +44,8 @@ pub struct TradingSession {
     // Using VecDeque for efficient push_front/pop_back operations.
     m1_closes: VecDeque<f64>,
     m5_closes: VecDeque<f64>,
+    m5_highs: VecDeque<f64>,
+    m5_lows: VecDeque<f64>,
     m30_closes: VecDeque<f64>,
     h1_closes: VecDeque<f64>,
     h1_highs: VecDeque<f64>,
@@ -65,6 +67,8 @@ impl TradingSession {
             swing_trend: TrendDirection::Sideways,
             m1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             m5_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            m5_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            m5_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             m30_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
@@ -86,6 +90,8 @@ impl TradingSession {
         // Here, we're just replacing the buffers for simplicity.
         self.m1_closes = req.closes.iter().cloned().collect();
         self.m5_closes = req.m5_closes.iter().cloned().collect();
+        self.m5_highs = req.m5_highs.iter().cloned().collect();
+        self.m5_lows = req.m5_lows.iter().cloned().collect();
         self.m30_closes = req.m30_closes.iter().cloned().collect();
         self.h1_closes = req.h1_closes.clone().unwrap_or_default().into();
         self.h1_highs = req.h1_highs.clone().unwrap_or_default().into();
@@ -102,7 +108,7 @@ impl TradingSession {
         self.latest_swing_signal = Some(swing_signal);
 
         // 3. Run the Scalp Engine.
-        let scalp_req = self.build_engine_request("scalp");
+        let scalp_req = self.build_engine_request_with_params("scalp", req);
         let mut scalp_signal = ScalpEngine::evaluate(&scalp_req);
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
@@ -144,18 +150,28 @@ impl TradingSession {
             lows: vec![],  // Populate with real data if needed by engines
             volumes: vec![], // Populate with real data if needed by engines
             m5_closes: self.m5_closes.iter().cloned().collect(),
-            m5_highs: vec![],
-            m5_lows: vec![],
+            m5_highs: self.m5_highs.iter().cloned().collect(),
+            m5_lows: self.m5_lows.iter().cloned().collect(),
             m30_closes: self.m30_closes.iter().cloned().collect(),
             h1_closes: Some(self.h1_closes.iter().cloned().collect()),
             h1_highs: Some(self.h1_highs.iter().cloned().collect()),
             h1_lows: Some(self.h1_lows.iter().cloned().collect()),
             open_positions: Some(if mode == "scalp" { self.open_scalp_positions.clone() } else { self.open_swing_positions.clone() }),
             mode: mode.to_string(),
-            current_price: *self.m1_closes.back().unwrap_or(&0.0),
+            current_price: *self.m1_closes.back().unwrap_or(&0.0), // Safely get the last price or default to 0.0
             last_m1_timestamp: self.last_evaluation_timestamp,
             ..Default::default() // Fills in optional params
         }
+    }
+
+    /// Builds an `EvalRequest` for a specific engine, propagating optional parameters from the original request.
+    fn build_engine_request_with_params(&self, mode: &str, original_req: &EvalRequest) -> EvalRequest {
+        let mut engine_req = self.build_engine_request(mode);
+        // Propagate all optional parameters from the original request
+        engine_req.spread_limit_points = original_req.spread_limit_points;
+        engine_req.spread_points = original_req.spread_points;
+        // ... propagate other optional params as needed ...
+        engine_req
     }
 
     /// Placeholder for logic to manage open trades (e.g., trailing stops).
@@ -167,6 +183,17 @@ impl TradingSession {
 
     pub fn get_latest_signals(&self) -> (Option<EvalResponse>, Option<EvalResponse>) {
         (self.latest_scalp_signal.clone(), self.latest_swing_signal.clone())
+    }
+
+    /// Returns the timestamp of the last evaluation.
+    pub fn get_last_eval_timestamp(&self) -> i64 {
+        self.last_evaluation_timestamp
+    }
+
+    /// Sets the signals to None, used by the cleanup task.
+    pub fn invalidate_signals(&mut self) {
+        self.latest_scalp_signal = None;
+        self.latest_swing_signal = None;
     }
 }
 
