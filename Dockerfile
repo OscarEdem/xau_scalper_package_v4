@@ -21,8 +21,8 @@ RUN touch src/main.rs && cargo build --release
 # Stage 2: Create the final, minimal production image
 FROM debian:bookworm-slim
 
-# Install utilities needed for data conversion
-RUN apt-get update && apt-get install -y --no-install-recommends dos2unix gawk libssl3 && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies: SSL certificates for HTTPS requests, and utilities for data conversion.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl dos2unix gawk libssl3 && rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau-scalper-server
