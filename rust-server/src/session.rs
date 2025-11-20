@@ -185,6 +185,16 @@ impl TradingSession {
         (self.latest_scalp_signal.clone(), self.latest_swing_signal.clone())
     }
 
+    /// Gets the signal ID of the latest scalp signal, if any.
+    pub fn get_latest_scalp_signal_id(&self) -> Option<String> {
+        self.latest_scalp_signal.as_ref().map(|s| s.signal_id.clone())
+    }
+
+    /// Gets the signal ID of the latest swing signal, if any.
+    pub fn get_latest_swing_signal_id(&self) -> Option<String> {
+        self.latest_swing_signal.as_ref().map(|s| s.signal_id.clone())
+    }
+
     /// Returns the timestamp of the last evaluation.
     pub fn get_last_eval_timestamp(&self) -> i64 {
         self.last_evaluation_timestamp

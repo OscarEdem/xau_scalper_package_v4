@@ -1,1 +1,58 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.80s
+   1.013653800s  INFO prepare_target{force=false package_id=xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server) target="xau-scalper-server"}: cargo::core::compiler::fingerprint: fingerprint error for xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server)/Check { test: false }/TargetInner { name: "xau-scalper-server", doc: true, ..: with_path("C:\\Users\\USER\\Desktop\\TestV1\\xau_scalper_package_v4-main\\rust-server\\src\\main.rs", Edition2021) }
+   1.014093800s  INFO prepare_target{force=false package_id=xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server) target="xau-scalper-server"}: cargo::core::compiler::fingerprint:     err: failed to read `C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server\target\debug\.fingerprint\xau-scalper-server-7967c0f2dc81c39a\bin-xau-scalper-server`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   1.037213200s  INFO prepare_target{force=false package_id=xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server) target="xau-scalper-server"}: cargo::core::compiler::fingerprint: fingerprint error for xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server)/Check { test: true }/TargetInner { name: "xau-scalper-server", doc: true, ..: with_path("C:\\Users\\USER\\Desktop\\TestV1\\xau_scalper_package_v4-main\\rust-server\\src\\main.rs", Edition2021) }
+   1.037277100s  INFO prepare_target{force=false package_id=xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server) target="xau-scalper-server"}: cargo::core::compiler::fingerprint:     err: failed to read `C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server\target\debug\.fingerprint\xau-scalper-server-623405b8d25225c4\test-bin-xau-scalper-server`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+    Checking xau-scalper-server v0.2.0 (C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.10s

@@ -1,6 +1,9 @@
 # Stage 1: Build the application in a full Rust environment
 FROM rust:1-slim-bookworm AS builder
 
+# Install build dependencies required by crates like `openssl-sys`
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+
 # Use /app as the working directory
 WORKDIR /app
 
@@ -19,7 +22,7 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim
 
 # Install utilities needed for data conversion
-RUN apt-get update && apt-get install -y --no-install-recommends dos2unix gawk && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends dos2unix gawk libssl3 && rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau-scalper-server

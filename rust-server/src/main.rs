@@ -7,12 +7,13 @@ use axum::{
 };
 use axum::routing::post;
 use chrono::{NaiveDate, Utc};
-use std::collections::VecDeque;
+use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
+use std::collections::{VecDeque, BTreeSet};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use xau_scalper_server::{
+pub use xau_scalper_server::{
     ArrivalConfirmation, EvalRequest, EvalResponse, SessionManager,
     ExecutionConfirmation, HistoryParams, HistoryResponse, HistoryStats, TradeLog, PriceLevel, VwapBands
 };
@@ -32,6 +33,7 @@ struct ApplicationState {
     session_manager: SessionManager,
     trade_logs: Arc<Mutex<VecDeque<TradeLog>>>,
     signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
+    push_tokens: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -57,12 +59,20 @@ struct ActiveSignal {
     signal: EvalResponse,
 }
 
+/// Request body for saving a push notification token.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SavePushTokenRequest {
+    token: String,
+}
+
+
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
-    paths(process_data_handler, log_trade_handler, get_logs_handler, clear_history_handler, get_latest_signals_handler, get_all_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler),
+    paths(process_data_handler, log_trade_handler, get_logs_handler, clear_history_handler, get_latest_signals_handler, get_all_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler, save_push_token_handler),
     components(
-        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal)
+        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest)
     ),
     tags((name = "XAU Scalper API", description = "API for XAU/USD Scalping Strategy"))
 )]
@@ -78,6 +88,7 @@ async fn main() {
         session_manager: SessionManager::default(),
         trade_logs: Arc::new(Mutex::new(VecDeque::new())),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
+        push_tokens: Arc::new(Mutex::new(BTreeSet::new())),
     };
 
     // --- Background task for stale signal cleanup (invalidates signals in live sessions) ---
@@ -135,6 +146,7 @@ async fn main() {
         // --- Add new routes for logging ---
         .route("/confirm_arrival", post(confirm_arrival_handler))
         .route("/confirm_execution", post(confirm_execution_handler))
+        .route("/save-push-token", post(save_push_token_handler))
         .route("/log_trade", post(log_trade_handler))
         // --- The history endpoint is now more powerful ---
         .route("/history", get(get_logs_handler).delete(clear_history_handler))
@@ -155,6 +167,31 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install CTRL+C signal handler");
     tracing::info!("Received shutdown signal, shutting down gracefully.");
+}
+
+#[utoipa::path(
+    post,
+    path = "/save-push-token",
+    request_body = SavePushTokenRequest,
+    responses(
+        (status = 200, description = "Token saved successfully"),
+        (status = 400, description = "Invalid token provided")
+    )
+)]
+/// Handler to receive and store a push notification token from a client app.
+async fn save_push_token_handler(
+    State(state): State<ApplicationState>,
+    Json(body): Json<SavePushTokenRequest>,
+) -> (StatusCode, Json<&'static str>) {
+    if body.token.is_empty() || !body.token.starts_with("ExponentPushToken[") {
+        return (StatusCode::BAD_REQUEST, Json("Invalid push token format"));
+    }
+
+    let mut tokens = state.push_tokens.lock().unwrap();
+    tokens.insert(body.token);
+    tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
+
+    (StatusCode::OK, Json("Token saved"))
 }
 
 #[utoipa::path(
@@ -199,29 +236,44 @@ async fn process_data_handler(
     // For now, we assume a global config for filtering. This could also be part of the request.
     let filter_scalp_by_swing = true;
 
-    // Lock the sessions map, get the specific session for the symbol, and process data.
-    // The `get_or_create_session` handles the logic of creating a new session if it's the first time
-    // we see this symbol. The lock is held for the duration of the data processing to ensure consistency.
-    let mut sessions = state
-        .session_manager.sessions.lock().unwrap_or_else(|e| {
-            tracing::error!("Session manager mutex poisoned! Recovering. Error: {}", e);
-            e.into_inner()
-        });
-    
-    sessions.entry(req.symbol.clone()).or_insert_with(|| {
-        tracing::info!("Creating new trading session for symbol: {}", req.symbol);
-        xau_scalper_server::TradingSession::new(req.symbol.clone(), filter_scalp_by_swing)
-    });
+    // --- NEW: Define signals to send outside the lock scope ---
+    let mut signals_to_send = Vec::new();
 
-    if let Some(session) = sessions.get_mut(&req.symbol) {
+    // Scope the mutex lock to release it before the .await call
+    {
+        // Lock the sessions map, get the specific session for the symbol, and process data.
+        // The `get_or_create_session` handles the logic of creating a new session if it's the first time
+        // we see this symbol. The lock is held for the duration of the data processing to ensure consistency.
+        let mut sessions = state
+            .session_manager.sessions.lock().unwrap_or_else(|e| {
+                tracing::error!("Session manager mutex poisoned! Recovering. Error: {}", e);
+                e.into_inner()
+            });
+        
+        let session = sessions.entry(req.symbol.clone()).or_insert_with(|| {
+            tracing::info!("Creating new trading session for symbol: {}", req.symbol);
+            xau_scalper_server::TradingSession::new(req.symbol.clone(), filter_scalp_by_swing)
+        });
+
+        // --- Get old signal IDs BEFORE processing new data ---
+        let old_scalp_id = session.get_latest_scalp_signal_id();
+        let old_swing_id = session.get_latest_swing_signal_id();
+
+        // Process data, which updates the signals within the session
         session.on_data(&req);
 
-        // --- NEW: Add latest signals to history ---
+        // Now, get the new signals and add them to history
         let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
         let mut history = state.signal_history.lock().unwrap_or_else(|e| e.into_inner());
+
         let now = Utc::now().timestamp();
 
         if let Some(swing_sig) = swing_sig_opt {
+            // Check if it's a new, actionable signal
+            if swing_sig.entry_type != "none" && Some(&swing_sig.signal_id) != old_swing_id.as_ref() {
+                signals_to_send.push((swing_sig.clone(), req.symbol.clone()));
+            }
+            // Store in history regardless
             history.push_front(HistoricalSignal {
                 signal: ActiveSignal {
                     symbol: req.symbol.clone(),
@@ -231,6 +283,11 @@ async fn process_data_handler(
             });
         }
         if let Some(scalp_sig) = scalp_sig_opt {
+            // Check if it's a new, actionable signal
+            if scalp_sig.entry_type != "none" && Some(&scalp_sig.signal_id) != old_scalp_id.as_ref() {
+                signals_to_send.push((scalp_sig.clone(), req.symbol.clone()));
+            }
+            // Store in history regardless
             history.push_front(HistoricalSignal {
                 signal: ActiveSignal {
                     symbol: req.symbol.clone(),
@@ -239,12 +296,47 @@ async fn process_data_handler(
                 created_at: now,
             });
         }
-    } else {
-        tracing::error!(symbol = %req.symbol, "Could not find or create session.");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json("Session error"));
+    } // --- The `sessions` lock is dropped here ---
+
+    // --- NEW: Send notifications AFTER releasing the lock ---
+    for (signal, symbol) in signals_to_send {
+        send_push_notification(state.push_tokens.clone(), &signal, &symbol).await;
     }
 
     (StatusCode::OK, Json("Data processed"))
+}
+
+/// Sends a push notification for a new signal to all registered devices.
+async fn send_push_notification(
+    tokens_arc: Arc<Mutex<BTreeSet<String>>>,
+    signal: &EvalResponse,
+    symbol: &str,
+) {
+    let tokens = tokens_arc.lock().unwrap().clone();
+    if tokens.is_empty() {
+        return;
+    }
+
+    tracing::info!("Sending push notification for signal ID: {}", signal.signal_id);
+
+    let messages: Vec<ExpoPushMessage> = tokens
+        .into_iter()
+        .map(|token| {
+            let data = serde_json::json!({ "signalId": signal.signal_id, "symbol": symbol });
+            ExpoPushMessage::builder(vec![token])
+                .title(format!("New {} Signal: {} {}", symbol, signal.classification.to_uppercase(), signal.entry_type.to_uppercase()))
+                .body(format!("Entry: {:.5}, SL: {:.5}, TP1: {:.5}", signal.entry_price, signal.sl_price, signal.tp1_price))
+                .data(&data)
+                .and_then(|builder| builder.build())
+        })
+        .filter_map(Result::ok) // Filter out any messages that failed to build
+        .collect();
+
+    let client = Expo::new(ExpoClientOptions::default());
+    match client.send_push_notifications(messages).await {
+        Ok(receipts) => tracing::info!("Push notifications sent successfully: {:?}", receipts),
+        Err(e) => tracing::error!("Failed to send push notifications: {:?}", e),
+    }
 }
 
 #[utoipa::path(

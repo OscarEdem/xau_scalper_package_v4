@@ -1,18 +1,20 @@
 [package]
 name = "xau-scalper-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7.9", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "4", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }
+expo_push_notification_client = "0.2.0"
+reqwest = { version = "0.12.5", features = ["json"] }
 serde_qs = "0.12"
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
 
