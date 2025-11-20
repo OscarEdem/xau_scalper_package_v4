@@ -255,9 +255,8 @@ async fn process_data_handler(
             xau_scalper_server::TradingSession::new(req.symbol.clone(), filter_scalp_by_swing)
         });
 
-        // --- Get old signal IDs BEFORE processing new data ---
-        let old_scalp_id = session.get_latest_scalp_signal_id();
-        let old_swing_id = session.get_latest_swing_signal_id();
+        // --- Get old signals BEFORE processing new data ---
+        let (old_scalp_sig, old_swing_sig) = session.get_latest_signals();
 
         // Process data, which updates the signals within the session
         session.on_data(&req);
@@ -270,7 +269,7 @@ async fn process_data_handler(
 
         if let Some(swing_sig) = swing_sig_opt {
             // Check if it's a new, actionable signal
-            if swing_sig.entry_type != "none" && Some(&swing_sig.signal_id) != old_swing_id.as_ref() {
+            if swing_sig.entry_type != "none" && old_swing_sig.as_ref().map_or(true, |old| old.signal_id != swing_sig.signal_id) {
                 signals_to_send.push((swing_sig.clone(), req.symbol.clone()));
             }
             // Store in history regardless
@@ -284,7 +283,7 @@ async fn process_data_handler(
         }
         if let Some(scalp_sig) = scalp_sig_opt {
             // Check if it's a new, actionable signal
-            if scalp_sig.entry_type != "none" && Some(&scalp_sig.signal_id) != old_scalp_id.as_ref() {
+            if scalp_sig.entry_type != "none" && old_scalp_sig.as_ref().map_or(true, |old| old.signal_id != scalp_sig.signal_id) {
                 signals_to_send.push((scalp_sig.clone(), req.symbol.clone()));
             }
             // Store in history regardless
