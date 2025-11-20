@@ -6,7 +6,7 @@
 
 
 // --- EA Inputs ---
-input string ServerUrl = "http://127.0.0.1:3000"; // Base URL, endpoints will be appended
+input string ServerUrl = "https://major-scalper-v4.onrender.com"; // Base URL, endpoints will be appended
 input double RiskPercent = 0.5;
 input int    NumCloses = 300; // Increased to satisfy server's longest indicator (SMA 200) and provide buffer
 input double MaxSpreadPoints = 220;
