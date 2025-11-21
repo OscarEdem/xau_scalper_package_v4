@@ -1,7 +1,6 @@
-use crate::{
-    atr, ema, find_imbalance_zones, find_swing_points, roc, EvalRequest, EvalResponse,
-};
+use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
+use crate::{atr, ema, find_imbalance_zones, find_swing_points, get_fvg_limit_price, get_trend_bias, roc};
 
 pub struct ScalpEngine;
 
@@ -38,13 +37,13 @@ impl ScalpEngine {
             };
         }
 
-        // --- NEW: Ensure highs and lows are present for FVG/Sweep analysis ---
-        if highs.is_empty() || lows.is_empty() {
-            return EvalResponse {
-                reason: "M5 highs and lows data is required for FVG/Sweep analysis but was not provided.".to_string(),
-                ..Default::default()
-            };
-        }
+        // --- NEW: H1 Context for Scalping ---
+        // For M5 scalps, H1 is the "God" timeframe.
+        let h1_bias = if let Some(h1_closes) = &req.h1_closes {
+            get_trend_bias(h1_closes, 20) // Use a faster EMA (20) for H1 immediate momentum
+        } else {
+            0 // Proceed with caution if missing
+        };
 
         // --- A. ENTRY CONDITIONS ---
 
@@ -58,10 +57,34 @@ impl ScalpEngine {
             return EvalResponse { reason: "Insufficient data for scalping indicators".to_string(), ..Default::default() };
         }
 
+        // --- NEW: Ensure highs and lows are present for FVG/Sweep analysis ---
+        if highs.is_empty() || lows.is_empty() {
+            return EvalResponse {
+                reason: "M5 highs and lows data is required for FVG/Sweep analysis but was not provided.".to_string(),
+                ..Default::default()
+            };
+        }
+
         let last_fast_ema = fast_emas[n - 1];
         let last_slow_ema = slow_emas[n - 1];
         let is_buy_trend = last_fast_ema > last_slow_ema;
         let is_sell_trend = last_fast_ema < last_slow_ema;
+
+        // --- STRICT FILTER ---
+        // If M5 says Buy, but H1 says Sell -> REJECT.
+        if is_buy_trend && h1_bias == -1 {
+            return EvalResponse {
+                reason: "Scalp Rejected: Counter to H1 Momentum".to_string(),
+                ..Default::default()
+            };
+        }
+        // If M5 says Sell, but H1 says Buy -> REJECT.
+        if is_sell_trend && h1_bias == 1 {
+            return EvalResponse {
+                reason: "Scalp Rejected: Counter to H1 Momentum".to_string(),
+                ..Default::default()
+            };
+        }
 
         let last_roc = rocs[n - 1];
         let is_buy_momentum = last_roc > roc_threshold;
@@ -143,19 +166,33 @@ impl ScalpEngine {
         let tp1_points = if let Some(pips) = req.tp1_pips {
             pips * point_value
         } else {
-            tp_atr_mult * last_atr
+            (tp_atr_mult * last_atr).max(5.0 * point_value) // Ensure a minimum TP
         };
         let tp2_points = if let Some(pips) = tp2_pips { pips * point_value } else { tp1_points * 2.0 };
 
+        // --- NEW: FVG Limit Order Logic ---
+        let mut recommended_order_type = "market".to_string();
+        let mut limit_order_price = req.current_price;
+        let mut expiration_seconds = None;
+
+        if entry_type != "none" {
+            if let Some(fvg_limit) = get_fvg_limit_price(&imbalance_zones, req.current_price, &entry_type, "optimal") {
+                recommended_order_type = format!("limit_{}", entry_type);
+                limit_order_price = fvg_limit;
+                expiration_seconds = Some(300); // Cancel if not filled in 5 mins
+            }
+        }
+
+        // SL/TP is calculated based on the entry price (which could be a limit price)
         let (sl_price, mut tp1_price, tp2_price) = if entry_type == "long" {
-            let sl = req.current_price - sl_points;
-            let tp1 = req.current_price + tp1_points;
-            let tp2 = req.current_price + tp2_points;
+            let sl = limit_order_price - sl_points;
+            let tp1 = limit_order_price + tp1_points;
+            let tp2 = limit_order_price + tp2_points;
             (sl, tp1, tp2)
         } else { // Short
-            let sl = req.current_price + sl_points;
-            let tp1 = req.current_price - tp1_points;
-            let tp2 = req.current_price - tp2_points;
+            let sl = limit_order_price + sl_points;
+            let tp1 = limit_order_price - tp1_points;
+            let tp2 = limit_order_price - tp2_points;
             (sl, tp1, tp2)
         };
 
@@ -163,8 +200,8 @@ impl ScalpEngine {
         if imbalance_mitigation {
             if entry_type == "long" {
                 // Find the closest FVG bottom above the entry that offers at least 0.5R
-                if let Some(fvg_target) = imbalance_zones.iter() // find the nearest FVG to fill
-                    .filter(|z| z.bottom > req.current_price && (z.bottom - req.current_price) > (req.current_price - sl_price) * 0.5)
+                if let Some(fvg_target) = imbalance_zones.iter()
+                    .filter(|z| z.bottom > limit_order_price && (z.bottom - limit_order_price) > (limit_order_price - sl_price) * 0.5)
                     .map(|z| z.bottom)
                     .min_by(|a, b| a.partial_cmp(b).unwrap())
                 {
@@ -172,8 +209,8 @@ impl ScalpEngine {
                 }
             } else {
                 // Find the closest FVG top below the entry that offers at least 0.5R
-                if let Some(fvg_target) = imbalance_zones.iter() // find the nearest FVG to fill
-                    .filter(|z| z.top < req.current_price && (req.current_price - z.top) > (sl_price - req.current_price) * 0.5)
+                if let Some(fvg_target) = imbalance_zones.iter()
+                    .filter(|z| z.top < limit_order_price && (limit_order_price - z.top) > (sl_price - limit_order_price) * 0.5)
                     .map(|z| z.top)
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                 {
@@ -190,7 +227,7 @@ impl ScalpEngine {
         EvalResponse {
             signal_id: Uuid::new_v4().to_string(),
             entry_type,
-            entry_price: req.current_price,
+            entry_price: limit_order_price, // This is now the effective entry price
             sl_price,
             tp1_price,
             tp2_price: if tp2_price > 0.0 { tp2_price } else { 0.0 },
@@ -199,6 +236,9 @@ impl ScalpEngine {
             classification: "scalp".to_string(),
             sweep_detected,
             conviction_score: Some(conviction_score),
+            recommended_order_type,
+            limit_order_price,
+            expiration_seconds,
             ..Default::default()
         }
     }

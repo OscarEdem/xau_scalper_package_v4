@@ -32,6 +32,12 @@ pub struct EvalRequest {
     pub h1_closes: Option<Vec<f64>>,
     pub h1_highs: Option<Vec<f64>>,
     pub h1_lows: Option<Vec<f64>>,
+    // Add these Higher Time Frames
+    pub h4_closes: Option<Vec<f64>>,
+    pub h4_highs: Option<Vec<f64>>, // Optional, for structure checks
+    pub h4_lows: Option<Vec<f64>>,  // Optional, for structure checks
+    pub d1_opens: Option<Vec<f64>>,
+    pub d1_closes: Option<Vec<f64>>,
     pub open_positions: Option<Vec<OpenPosition>>, // current live trades
     // Optional base parameters
     pub rsi_period: Option<usize>,
@@ -114,6 +120,10 @@ pub struct EvalResponse {
     pub classification: String, // "scalp" or "swing"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conviction_score: Option<f64>,
+    // --- NEW: Fields for Limit Order Execution ---
+    pub recommended_order_type: String, // "market", "limit_buy", "limit_sell"
+    pub limit_order_price: f64,         // The exact price to place the limit
+    pub expiration_seconds: Option<u64>, // Cancel limit if not filled in X seconds
 }
 
 impl Default for EvalResponse {
@@ -135,6 +145,9 @@ impl Default for EvalResponse {
             reason: "No signal".to_string(),
             classification: "none".to_string(),
             conviction_score: None,
+            recommended_order_type: "none".to_string(),
+            limit_order_price: 0.0,
+            expiration_seconds: None,
         }
     }
 }
@@ -176,6 +189,8 @@ pub struct ExecutionConfirmation {
 
 #[derive(Deserialize, ToSchema, IntoParams)]
 pub struct HistoryParams {
+    /// Optional start date for filtering logs (format: YYYY-MM-DD)
+    pub symbol: Option<String>,
     /// Optional start date for filtering logs (format: YYYY-MM-DD)
     pub start_date: Option<String>,
     /// Optional end date for filtering logs (format: YYYY-MM-DD)
@@ -459,6 +474,161 @@ pub fn atr_pulse(atr_vals: &Vec<f64>, lookback: usize, factor: f64) -> bool {
     let median = sorted[sorted.len() / 2];
 
     atr_vals[n - 1] > median * factor
+}
+
+/// Determines the trend bias based on an EMA.
+/// Returns 1 for bullish, -1 for bearish, 0 for neutral/insufficient data.
+pub fn get_trend_bias(closes: &Vec<f64>, period: usize) -> i8 {
+    let n = closes.len();
+    if n < period + 2 {
+        return 0; // Not enough data
+    }
+    let emas = ema(closes, period);
+    let last = n - 1;
+
+    // Logic: Price > EMA AND EMA is sloping up
+    if closes[last] > emas[last] && emas[last] > emas[last - 1] {
+        return 1;
+    }
+    // Logic: Price < EMA AND EMA is sloping down
+    if closes[last] < emas[last] && emas[last] < emas[last - 1] {
+        return -1;
+    }
+
+    0 // Choppy/Consolidation
+}
+
+/// Determines the daily bias based on the previous day's candle.
+/// Returns "bullish", "bearish", or "neutral".
+pub fn get_daily_bias(opens: &Vec<f64>, closes: &Vec<f64>) -> String {
+    if opens.is_empty() || closes.is_empty() {
+        return "neutral".to_string();
+    }
+    let last = closes.len() - 1;
+    // Assuming the last element is the current incomplete day, we look at last-1
+    if last < 1 {
+        return "neutral".to_string();
+    }
+
+    let prev_open = opens[last - 1];
+    let prev_close = closes[last - 1];
+
+    if prev_close > prev_open {
+        "bullish".to_string()
+    } else {
+        "bearish".to_string()
+    }
+}
+
+/// Detects regular bullish or bearish divergence on the RSI.
+/// Returns "bullish", "bearish", or "none".
+pub fn detect_rsi_divergence(lows: &[f64], highs: &[f64], closes: &[f64], rsi_period: usize, lookback: usize) -> String {
+    let n = closes.len();
+    if n < lookback || n < rsi_period {
+        return "none".to_string();
+    }
+
+    let rsi_values = rsi(&closes.to_vec(), rsi_period);
+    let curr_idx = n - 1;
+    let curr_low = lows[curr_idx];
+    let curr_high = highs[curr_idx];
+    let curr_rsi = rsi_values[curr_idx];
+
+    // Bullish Divergence Check
+    let (prev_low_idx, prev_low_val) = lows[n - lookback..n - 1].iter().enumerate()
+        .fold((0, f64::INFINITY), |(min_idx, min_val), (i, &val)| if val < min_val { (i, val) } else { (min_idx, min_val) });
+    let global_prev_low_idx = (n - lookback) + prev_low_idx;
+    let prev_low_rsi = rsi_values[global_prev_low_idx];
+    if curr_low < prev_low_val && curr_rsi > prev_low_rsi && prev_low_rsi < 35.0 {
+        return "bullish".to_string();
+    }
+
+    // Bearish Divergence Check
+    let (prev_high_idx, prev_high_val) = highs[n - lookback..n - 1].iter().enumerate()
+        .fold((0, f64::NEG_INFINITY), |(max_idx, max_val), (i, &val)| if val > max_val { (i, val) } else { (max_idx, max_val) });
+    let global_prev_high_idx = (n - lookback) + prev_high_idx;
+    let prev_high_rsi = rsi_values[global_prev_high_idx];
+    if curr_high > prev_high_val && curr_rsi < prev_high_rsi && prev_high_rsi > 65.0 {
+        return "bearish".to_string();
+    }
+
+    "none".to_string()
+}
+
+/// Finds the best limit entry price inside an FVG.
+/// Strategy: 'aggressive' = Start of FVG, 'optimal' = 50% of FVG (Equilibrium)
+pub fn get_fvg_limit_price(
+    zones: &Vec<PriceLevel>,
+    current_price: f64,
+    direction: &str,
+    strategy: &str, // "optimal" or "aggressive"
+) -> Option<f64> {
+    if zones.is_empty() {
+        return None;
+    }
+
+    if direction == "long" {
+        // Find closest FVG below current price
+        if let Some(zone) = zones
+            .iter()
+            .filter(|z| z.top < current_price)
+            .max_by(|a, b| a.top.partial_cmp(&b.top).unwrap())
+        {
+            return if strategy == "optimal" {
+                Some(zone.top - (zone.top - zone.bottom) * 0.5) // 50% Retrace
+            } else {
+                Some(zone.top) // Aggressive: Enter at top of FVG
+            };
+        }
+    } else {
+        // Short
+        // Find closest FVG above current price
+        if let Some(zone) = zones
+            .iter()
+            .filter(|z| z.bottom > current_price)
+            .min_by(|a, b| a.bottom.partial_cmp(&b.bottom).unwrap())
+        {
+            return if strategy == "optimal" {
+                Some(zone.bottom + (zone.top - zone.bottom) * 0.5) // 50% Retrace
+            } else {
+                Some(zone.bottom) // Aggressive: Enter at bottom of FVG
+            };
+        }
+    }
+    None
+}
+
+/// Detects divergence using the current forming candle's data for zero-lag signals.
+pub fn detect_realtime_divergence(
+    lows: &Vec<f64>,
+    highs: &Vec<f64>,
+    rsi_vals: &Vec<f64>,
+    lookback: usize,
+) -> String {
+    let n = lows.len();
+    if n <= lookback { return "none".to_string(); }
+
+    let current_low = lows[n - 1];
+    let current_high = highs[n - 1];
+    let current_rsi = rsi_vals[n - 1];
+
+    let (prev_low_idx, &prev_low_val) = lows[n - lookback..n - 1].iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    let prev_low_rsi = rsi_vals[(n - lookback) + prev_low_idx];
+
+    // Aggressive Bullish Check: Price is CURRENTLY breaking the low, but RSI is curling up/higher
+    if current_low < prev_low_val && current_rsi > prev_low_rsi + 3.0 { // +3.0 buffer to avoid noise
+        return "bullish_realtime".to_string();
+    }
+
+    let (prev_high_idx, &prev_high_val) = highs[n - lookback..n - 1].iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    let prev_high_rsi = rsi_vals[(n - lookback) + prev_high_idx];
+
+    // Aggressive Bearish Check: Price is CURRENTLY breaking the high, but RSI is curling down/lower
+    if current_high > prev_high_val && current_rsi < prev_high_rsi - 3.0 { // -3.0 buffer to avoid noise
+        return "bearish_realtime".to_string();
+    }
+
+    "none".to_string()
 }
 
 // --- New Swing Functions ---

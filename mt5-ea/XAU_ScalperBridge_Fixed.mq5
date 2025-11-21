@@ -9,7 +9,7 @@
 input string ServerUrl = "https://major-scalper-v4.onrender.com"; // Base URL, endpoints will be appended
 input double RiskPercent = 0.5;
 input int    NumCloses = 300; // Increased to satisfy server's longest indicator (SMA 200) and provide buffer
-input double MaxSpreadPoints = 220;
+input double MaxSpreadPoints = 165;
 input ulong  MagicNumber = 1337;
 
 // --- Strategy Parameters (from best backtest) ---
@@ -18,6 +18,12 @@ input int    EmaFastPeriod = 5;
 input int    EmaSlowPeriod = 50;
 input int    AtrPeriod = 14;
 input int    SmaPeriod = 200;
+input int    AdxPeriod = 14;                // New: ADX Period for Swing
+input double AdxThreshold = 25.0;             // New: ADX Threshold for Swing
+input int    ChandelierPeriod = 22;         // New: Chandelier Exit Period
+input double ChandelierAtrMult = 3.0;         // New: Chandelier ATR Multiplier
+input int    MaxHoldBars = 12;              // New: Max hold bars for scalp time stop
+
 input int    StochKPeriod = 14; // New: Stochastic K Period
 input int    StochDPeriod = 3;  // New: Stochastic D Period
 input int    StochSlowing = 3;  // New: Stochastic Slowing Period
@@ -126,7 +132,7 @@ void OnTick()
      }
 
 // --- Prepare price data for server ---
-   MqlRates m1_rates[], m5_rates[], m30_rates[], h1_rates[];
+   MqlRates m1_rates[], m5_rates[], m30_rates[], h1_rates[], h4_rates[], d1_rates[];
    if(CopyRates(_Symbol, PERIOD_M1, 0, NumCloses, m1_rates) < NumCloses)
      {
       Print("Could not get enough M1 bar data. Need ", NumCloses, " bars.");
@@ -145,6 +151,16 @@ void OnTick()
    if(CopyRates(_Symbol, PERIOD_H1, 0, NumCloses, h1_rates) < NumCloses)
      {
       Print("Could not get enough H1 bar data. Need ", NumCloses, " bars.");
+      return;
+     }
+   if(CopyRates(_Symbol, PERIOD_H4, 0, NumCloses, h4_rates) < NumCloses)
+     {
+      Print("Could not get enough H4 bar data. Need ", NumCloses, " bars.");
+      return;
+     }
+   if(CopyRates(_Symbol, PERIOD_D1, 0, NumCloses, d1_rates) < NumCloses)
+     {
+      Print("Could not get enough D1 bar data. Need ", NumCloses, " bars.");
       return;
      }
 
@@ -179,7 +195,8 @@ void OnTick()
 // Build the JSON payload
    string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
    string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "";
-   string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "";
+   string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "", h4_closes_str = "", h4_highs_str = "", h4_lows_str = "";
+   string d1_opens_str = "", d1_closes_str = "";
 
    for(int i = 0; i < ArraySize(m1_rates); i++)
      {
@@ -229,28 +246,61 @@ void OnTick()
          h1_lows_str += ",";
         }
      }
+   for(int i = 0; i < ArraySize(h4_rates); i++)
+     {
+      h4_closes_str += DoubleToString(h4_rates[i].close, _Digits);
+      h4_highs_str += DoubleToString(h4_rates[i].high, _Digits);
+      h4_lows_str += DoubleToString(h4_rates[i].low, _Digits);
+      if(i < ArraySize(h4_rates) - 1)
+        {
+         h4_closes_str += ",";
+         h4_highs_str += ",";
+         h4_lows_str += ",";
+        }
+     }
+   for(int i = 0; i < ArraySize(d1_rates); i++)
+     {
+      d1_opens_str += DoubleToString(d1_rates[i].open, _Digits);
+      d1_closes_str += DoubleToString(d1_rates[i].close, _Digits);
+      if(i < ArraySize(d1_rates) - 1)
+        {
+         d1_opens_str += ",";
+         d1_closes_str += ",";
+        }
+     }
 
    long last_m1_timestamp = (long)m1_rates[ArraySize(m1_rates)-1].time;
 
    string json_payload = StringFormat(
                             "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
                             "\"currentPrice\":%.5f,\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
-                            "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s]," // M1 data
+                            "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
                             "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],"
-                            "\"m30Closes\":[%s],\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s]," // HTF data
-                            "\"openPositions\":%s," // Open positions data
-                            "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d," // Existing params
-                            "\"spreadLimitPoints\":%.1f," // Corrected to match Rust struct
+                            "\"m30Closes\":[%s],"
+                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],"
+                            "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],"
+                            "\"d1Opens\":[%s],\"d1Closes\":[%s],"
+                            "\"openPositions\":%s,"
+                            "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
+                            "\"spreadLimitPoints\":%.1f,"
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
-                            "\"slAtrMultiplier\":%.1f,\"tpAtrMultiplier\":%.1f,"
-                            "\"mode\":\"scalp\",\"adxPeriod\":14,\"chandelierPeriod\":22,\"chandelierAtrMult\":3.0}", // Swing params
+                            "\"slAtrMultiplier\":%.2f,\"tpAtrMultiplier\":%.2f,"
+                            "\"adxPeriod\":%d,\"adxThreshold\":%.1f,"
+                            "\"chandelierPeriod\":%d,\"chandelierAtrMult\":%.1f,"
+                            "\"maxHoldBars\":%d,"
+                            "\"mode\":\"scalp\"}",
                             _Symbol,
                             ask, spread_pts, _Digits, last_m1_timestamp,
                             m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
                             m5_closes_str, m5_highs_str, m5_lows_str, m30_closes_str,
                             h1_closes_str, h1_highs_str, h1_lows_str,
+                            h4_closes_str, h4_highs_str, h4_lows_str,
+                            d1_opens_str, d1_closes_str,
                             open_positions_json,
-                            RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints, StochKPeriod, StochDPeriod, StochSlowing, SlAtrMultiplier, TpAtrMultiplier
+                            RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
+                            StochKPeriod, StochDPeriod, StochSlowing,
+                            SlAtrMultiplier, TpAtrMultiplier,
+                            AdxPeriod, AdxThreshold, ChandelierPeriod, ChandelierAtrMult, MaxHoldBars
                          );
 
 // --- 1. POST data to the Rust server ---
@@ -265,6 +315,10 @@ void OnTick()
    string tp_pips = "-";
    string sl_pips = "-";
    double sl_price = 0.0;
+   double limit_price = 0.0;
+   string recommended_order_type = "none";
+   long expiration_seconds = 0;
+
    double tp1_price = 0.0;
    ulong ticket_to_manage = 0;
    double new_sl_price = 0.0;
@@ -304,6 +358,9 @@ void OnTick()
             reason = GetNestedJsonValue(response_str, "scalpSignal", "reason", true);
             sl_price = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "slPrice", false));
             tp1_price = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "tp1Price", false));
+            recommended_order_type = GetNestedJsonValue(response_str, "scalpSignal", "recommendedOrderType", true);
+            limit_price = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "limitOrderPrice", false));
+            expiration_seconds = (long)StringToInteger(GetNestedJsonValue(response_str, "scalpSignal", "expirationSeconds", false));
 
             // --- NEW: Process swingSignal for position management ---
             action = GetNestedJsonValue(response_str, "swingSignal", "action", true);
@@ -353,7 +410,7 @@ void OnTick()
 
 
 // --- Trade Execution Logic ---
-   if(entry_type == "long" && lot_size > 0.0 && action != "close" && action != "update_sl")
+   if(StringFind(recommended_order_type, "long") >= 0 && lot_size > 0.0 && action != "close" && action != "update_sl")
      {
       // Close any opposing positions before opening a new one
       ClosePositions(POSITION_TYPE_SELL);
@@ -379,18 +436,32 @@ void OnTick()
 
       if(open_buys == 0 || (can_pyramid && is_profitable_enough))
         {
-         if(lot_size > 0 && trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
+         if(lot_size > 0)
            {
-            ulong ticket = trade.ResultDeal();
-            if(PositionSelectByTicket(ticket))
-              {
-               LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-              }
+            if(recommended_order_type == "limit_buy")
+            {
+               datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
+               if(trade.BuyLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit BUY"))
+               {
+                  // Log pending order placement
+                  LogEvent("Pending", trade.ResultOrder(), _Symbol, "Buy Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
+               }
+            }
+            else // Market order
+            {
+               if(trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
+               {
+                  ulong ticket = trade.ResultDeal();
+                  if(PositionSelectByTicket(ticket))
+                  {
+                     LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
+                  }
+               }
+            }
            }
         }
      }
-   else
-      if(entry_type == "short" && lot_size > 0.0 && action != "close" && action != "update_sl")
+   else if(StringFind(recommended_order_type, "short") >= 0 && lot_size > 0.0 && action != "close" && action != "update_sl")
         {
          // Close any opposing positions
          ClosePositions(POSITION_TYPE_BUY);
@@ -414,14 +485,28 @@ void OnTick()
 
          if(open_sells == 0 || (can_pyramid && is_profitable_enough))
            {
-            if(lot_size > 0 && trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
-              {
-               ulong ticket = trade.ResultDeal();
-               if(PositionSelectByTicket(ticket))
-                 {
-                  LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-                 }
-              }
+            if(lot_size > 0)
+            {
+               if(recommended_order_type == "limit_sell")
+               {
+                  datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
+                  if(trade.SellLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit SELL"))
+                  {
+                     LogEvent("Pending", trade.ResultOrder(), _Symbol, "Sell Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
+                  }
+               }
+               else // Market order
+               {
+                  if(trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
+                  {
+                     ulong ticket = trade.ResultDeal();
+                     if(PositionSelectByTicket(ticket))
+                     {
+                        LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
+                     }
+                  }
+               }
+            }
            }
         }
   }
@@ -530,8 +615,8 @@ void LogEvent(string event_type, ulong ticket, string symbol, string direction, 
    char log_post_data[];
    char log_result[];
    string log_result_headers;
-   StringToCharArray(log_payload, log_post_data);
-   WebRequest("POST", "http://127.0.0.1:3000/log_trade", "Content-Type: application/json", 1000, log_post_data, log_result, log_result_headers);
+   StringToCharArray(log_payload, log_post_data); // Corrected function call
+   WebRequest("POST", ServerUrl + "/log_trade", "Content-Type: application/json", 1000, log_post_data, log_result, log_result_headers);
   }
 
 //+------------------------------------------------------------------+

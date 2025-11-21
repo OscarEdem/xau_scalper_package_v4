@@ -31,7 +31,6 @@ struct HistoricalSignal {
 #[derive(Clone)]
 struct ApplicationState {
     session_manager: SessionManager,
-    trade_logs: Arc<Mutex<VecDeque<TradeLog>>>,
     signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
     push_tokens: Arc<Mutex<BTreeSet<String>>>,
 }
@@ -86,7 +85,6 @@ async fn main() {
     // Initialize the shared state
     let shared_state = ApplicationState {
         session_manager: SessionManager::default(),
-        trade_logs: Arc::new(Mutex::new(VecDeque::new())),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(BTreeSet::new())),
     };
@@ -313,6 +311,7 @@ async fn send_push_notification(
 ) {
     let tokens = tokens_arc.lock().unwrap().clone();
     if tokens.is_empty() {
+        tracing::warn!("Skipping push notification for signal ID: {}. No push tokens are registered.", signal.signal_id);
         return;
     }
 
@@ -459,15 +458,22 @@ async fn log_trade_handler(
     State(state): State<ApplicationState>,
     Json(log): Json<TradeLog>,
 ) -> Json<&'static str> {
-    if let Ok(mut logs) = state.trade_logs.lock() {
-        // Insert new logs at the beginning to keep them sorted by most recent
-        logs.push_front(log);
-        tracing::info!("Logged new trade event. Total logs: {}", logs.len());
+    let mut sessions = state.session_manager.sessions.lock().unwrap();
+    if let Some(session) = sessions.get_mut(&log.symbol) {
+        session.add_trade_log(log);
+        tracing::info!(
+            symbol = %session.symbol,
+            "Logged new trade event. Total logs for symbol: {}",
+            session.get_trade_logs().len()
+        );
+        Json("Log received and associated with session")
     } else {
-        tracing::error!("Trade logs mutex was poisoned. A thread panicked while holding the lock.");
-        // Potentially return an error status code here in a real scenario
+        tracing::warn!(
+            symbol = %log.symbol,
+            "Received trade log for a symbol with no active session. Log was not stored."
+        );
+        Json("Log received but no active session found for symbol")
     }
-    Json("Log received")
 }
 
 #[utoipa::path(
@@ -481,22 +487,26 @@ async fn log_trade_handler(
 /// Handler to return all stored trade logs
 async fn get_logs_handler(
     State(state): State<ApplicationState>,
-    Query(params): Query<HistoryParams>,
+    Query(mut params): Query<HistoryParams>,
 ) -> Json<HistoryResponse> {
-    let logs = match state.trade_logs.lock() {
-        Ok(logs) => logs,
-        Err(_) => {
-            tracing::error!("Trade logs mutex was poisoned. Returning empty history.");
-            return Json(HistoryResponse::default());
-        }
+    // If a symbol is provided, get logs for that symbol. Otherwise, get all logs.
+    let symbol_filter = params.symbol.take();
+    let sessions = state.session_manager.sessions.lock().unwrap();
+
+    let logs: Vec<TradeLog> = if let Some(symbol) = symbol_filter {
+        sessions.get(&symbol).map_or(vec![], |s| s.get_trade_logs().into())
+    } else {
+        sessions.values().flat_map(|s| s.get_trade_logs()).collect()
     };
 
     let start_date = params
         .start_date
-        .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| tracing::warn!("Failed to parse start_date '{}': {}", s, e)).ok());
+        .as_deref()
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
     let end_date = params
         .end_date
-        .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| tracing::warn!("Failed to parse end_date '{}': {}", s, e)).ok());
+        .as_deref()
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
     let filtered_trades: Vec<TradeLog> = logs
         .iter()
@@ -510,8 +520,8 @@ async fn get_logs_handler(
 
             match (log_date, start_date, end_date) {
                 (Some(ld), Some(sd), Some(ed)) => ld >= sd && ld <= ed,
-                (Some(ld), Some(sd), None) => ld >= sd,
-                (Some(ld), None, Some(ed)) => ld <= ed,
+                (Some(ld), Some(sd), _) => ld >= sd,
+                (Some(ld), _, Some(ed)) => ld <= ed,
                 _ => true, // No date filters, include all
             }
         })
@@ -558,15 +568,14 @@ async fn get_logs_handler(
 async fn clear_history_handler(
     State(state): State<ApplicationState>,
 ) -> (StatusCode, Json<&'static str>) {
-    match state.trade_logs.lock() {
-        Ok(mut logs) => {
-            logs.clear();
-            tracing::info!("Trade history has been cleared manually.");
-            (StatusCode::OK, Json("Trade history cleared"))
-        }
-        Err(_) => {
-            tracing::error!("Trade logs mutex was poisoned. Could not clear history.");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json("Failed to acquire lock on trade history"))
+    let mut sessions = state.session_manager.sessions.lock().unwrap();
+    let mut cleared_count = 0;
+    for session in sessions.values_mut() {
+        if !session.get_trade_logs().is_empty() {
+            session.invalidate_signals(); // Also clear logs from session, assuming this is desired
+            cleared_count += 1;
         }
     }
+    tracing::info!("Trade history cleared manually for {} sessions.", cleared_count);
+    (StatusCode::OK, Json("Trade history cleared for all sessions"))
 }

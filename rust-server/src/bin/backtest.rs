@@ -155,6 +155,12 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
             m5_lows: vec![], // Not used in strategy
             m30_closes: combined_candle.m30_closes.clone(),
             h1_closes: combined_candle.h1_closes.clone(),
+            // --- FIX: Add missing higher timeframe fields ---
+            h4_closes: None,
+            h4_highs: None,
+            h4_lows: None,
+            d1_opens: None,
+            d1_closes: None,
             open_positions: None, // No open positions for backtest
             rsi_period: Some(params.rsi_period),
             ema_fast: Some(params.ema_fast),

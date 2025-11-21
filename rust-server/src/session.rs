@@ -1,6 +1,6 @@
 use crate::{
     engines::{scalp::ScalpEngine, swing::SwingEngine},
-    EvalRequest, EvalResponse, OpenPosition,
+    EvalRequest, EvalResponse, OpenPosition, TradeLog,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -50,12 +50,18 @@ pub struct TradingSession {
     h1_closes: VecDeque<f64>,
     h1_highs: VecDeque<f64>,
     h1_lows: VecDeque<f64>,
+    h4_closes: VecDeque<f64>,
+    h4_highs: VecDeque<f64>,
+    h4_lows: VecDeque<f64>,
+    d1_opens: VecDeque<f64>,
+    d1_closes: VecDeque<f64>,
 
     // --- Engine Outputs & Positions ---
     open_scalp_positions: Vec<OpenPosition>,
     open_swing_positions: Vec<OpenPosition>,
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
+    trade_logs: VecDeque<TradeLog>,
 }
 
 impl TradingSession {
@@ -73,10 +79,16 @@ impl TradingSession {
             h1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            h4_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            h4_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            h4_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            d1_opens: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            d1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             open_scalp_positions: Vec::new(),
             open_swing_positions: Vec::new(),
             latest_scalp_signal: None,
             latest_swing_signal: None,
+            trade_logs: VecDeque::with_capacity(500), // Store last 500 trades per symbol
         }
     }
 
@@ -96,6 +108,11 @@ impl TradingSession {
         self.h1_closes = req.h1_closes.clone().unwrap_or_default().into();
         self.h1_highs = req.h1_highs.clone().unwrap_or_default().into();
         self.h1_lows = req.h1_lows.clone().unwrap_or_default().into();
+        self.h4_closes = req.h4_closes.clone().unwrap_or_default().into();
+        self.h4_highs = req.h4_highs.clone().unwrap_or_default().into();
+        self.h4_lows = req.h4_lows.clone().unwrap_or_default().into();
+        self.d1_opens = req.d1_opens.clone().unwrap_or_default().into();
+        self.d1_closes = req.d1_closes.clone().unwrap_or_default().into();
         self.last_evaluation_timestamp = req.last_m1_timestamp;
 
         // 2. Run the Swing Engine first to establish the higher-timeframe context.
@@ -156,6 +173,11 @@ impl TradingSession {
             h1_closes: Some(self.h1_closes.iter().cloned().collect()),
             h1_highs: Some(self.h1_highs.iter().cloned().collect()),
             h1_lows: Some(self.h1_lows.iter().cloned().collect()),
+            h4_closes: Some(self.h4_closes.iter().cloned().collect()),
+            h4_highs: Some(self.h4_highs.iter().cloned().collect()),
+            h4_lows: Some(self.h4_lows.iter().cloned().collect()),
+            d1_opens: Some(self.d1_opens.iter().cloned().collect()),
+            d1_closes: Some(self.d1_closes.iter().cloned().collect()),
             open_positions: Some(if mode == "scalp" { self.open_scalp_positions.clone() } else { self.open_swing_positions.clone() }),
             mode: mode.to_string(),
             current_price: *self.m1_closes.back().unwrap_or(&0.0), // Safely get the last price or default to 0.0
@@ -204,6 +226,16 @@ impl TradingSession {
     pub fn invalidate_signals(&mut self) {
         self.latest_scalp_signal = None;
         self.latest_swing_signal = None;
+    }
+
+    /// Adds a new trade log to this session.
+    pub fn add_trade_log(&mut self, log: TradeLog) {
+        self.trade_logs.push_front(log);
+    }
+
+    /// Returns a clone of the trade logs for this session.
+    pub fn get_trade_logs(&self) -> VecDeque<TradeLog> {
+        self.trade_logs.clone()
     }
 }
 
