@@ -9,7 +9,7 @@
 input string ServerUrl = "https://major-scalper-v4.onrender.com"; // Base URL, endpoints will be appended
 input double RiskPercent = 0.5;
 input int    NumCloses = 300; // Increased to satisfy server's longest indicator (SMA 200) and provide buffer
-input double MaxSpreadPoints = 165;
+input double MaxSpreadPoints = 162;
 input ulong  MagicNumber = 1337;
 
 // --- Strategy Parameters (from best backtest) ---
@@ -30,6 +30,11 @@ input int    StochSlowing = 3;  // New: Stochastic Slowing Period
 input double SlAtrMultiplier = 1.0;
 input double TpAtrMultiplier = 1.5;
 
+// --- NEW: Kalman Filter Parameters ---
+input double KfProcessNoise = 0.01; // q: Process noise for Kalman Filter
+input double KfMeasurementNoise = 0.1;  // r: Measurement noise for Kalman Filter
+
+
 // --- Pyramiding Inputs ---
 input bool   EnablePyramiding = true;         // Enable adding to winning positions
 input int    MaxPyramidEntries = 3;           // Maximum number of simultaneous entries
@@ -39,16 +44,13 @@ input double PyramidRiskScale = 0.5;          // Scale risk for next entry (e.g.
 // --- Logging Inputs ---
 input bool   EnableServerLogging = true;
 
+// --- NEW: Real-time Tick Bridge Inputs ---
+input bool   EnableTickBridge = true;             // Enable sending real-time ticks via HTTP
+
 // --- Global Variables ---
 CTrade trade;
 char post_data[];
 char result[];
-
-
-// --- NEW: Global variables for backtester-style trailing stop ---
-long   g_trade_ticket = 0;       // Ticket of the currently managed trade
-double g_high_since_entry = 0.0; // Highest high since the long trade was opened
-double g_low_since_entry = 0.0;  // Lowest low since the short trade was opened
 
 
 // --- Function Prototypes ---
@@ -90,6 +92,29 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   // --- Real-time Tick Bridge Logic ---
+   if(EnableTickBridge)
+     {
+      MqlTick last_tick;
+      if(SymbolInfoTick(_Symbol, last_tick))
+        {
+         // Format tick data as a JSON string
+         string tick_json = StringFormat(
+                               "{\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,\"time_msc\":%llu}",
+                               _Symbol,
+                               last_tick.bid,
+                               last_tick.ask,
+                               last_tick.time_msc
+                            );
+         // Send the tick via a non-blocking HTTP POST request
+         char tick_post_data[];
+         char tick_result[];
+         string tick_headers;
+         StringToCharArray(tick_json, tick_post_data);
+         WebRequest("POST", ServerUrl + "/ticks", "Content-Type: application/json", 500, tick_post_data, tick_result, tick_headers);
+        }
+     }
+   // --- Original OnTick Logic (runs on new bar) ---
    static datetime last_bar=0;
    MqlRates rates[];
 
@@ -102,6 +127,9 @@ void OnTick()
      }
    last_bar = rates[0].time;
 
+   // If the tick bridge is the only thing enabled, we can stop here.
+   if(!EnableServerLogging && !EnablePyramiding) return;
+
 // --- Pre-trade checks ---
    double ask=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid=SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -109,25 +137,13 @@ void OnTick()
    double spread_raw = ask - bid;
    double spread_pts = spread_raw / point_val;
 
-// --- Calculate current P/L for any open position ---
-   double current_pl = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-        {
-         current_pl = PositionGetDouble(POSITION_PROFIT);
-         // We found our position, no need to loop further
-         break;
-        }
-     }
-
    PrintFormat("Spread Check: Raw Spread=%.5f, Point=%.5f, Spread Points=%.2f", spread_raw, point_val, spread_pts);
 
    if(spread_pts > MaxSpreadPoints)
      {
       Print("Spread is too high: ", spread_pts, " points. Skipping.");
       // Still update dashboard to show high spread
-      UpdateDashboard("hold", "Spread too high", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, 0.0);
+      UpdateDashboard("hold", "Spread too high", "-", "-", spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), 0.0, 0.0);
       return;
      }
 
@@ -194,7 +210,7 @@ void OnTick()
 
 // Build the JSON payload
    string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
-   string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "";
+   string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "", h1_opens_str = "";
    string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "", h4_closes_str = "", h4_highs_str = "", h4_lows_str = "";
    string d1_opens_str = "", d1_closes_str = "";
 
@@ -239,11 +255,13 @@ void OnTick()
       h1_closes_str += DoubleToString(h1_rates[i].close, _Digits);
       h1_highs_str += DoubleToString(h1_rates[i].high, _Digits);
       h1_lows_str += DoubleToString(h1_rates[i].low, _Digits);
+      h1_opens_str += DoubleToString(h1_rates[i].open, _Digits);
       if(i < ArraySize(h1_rates) - 1)
         {
          h1_closes_str += ",";
          h1_highs_str += ",";
          h1_lows_str += ",";
+         h1_opens_str += ",";
         }
      }
    for(int i = 0; i < ArraySize(h4_rates); i++)
@@ -277,14 +295,15 @@ void OnTick()
                             "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
                             "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],"
                             "\"m30Closes\":[%s],"
-                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],"
+                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],"
                             "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],"
                             "\"d1Opens\":[%s],\"d1Closes\":[%s],"
-                            "\"openPositions\":%s,"
+                            "\"openPositions\":%s,\"upcomingEvents\":[],"
                             "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
                             "\"spreadLimitPoints\":%.1f,"
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
                             "\"slAtrMultiplier\":%.2f,\"tpAtrMultiplier\":%.2f,"
+                            "\"kfProcessNoise\":%.4f,\"kfMeasurementNoise\":%.4f,"
                             "\"adxPeriod\":%d,\"adxThreshold\":%.1f,"
                             "\"chandelierPeriod\":%d,\"chandelierAtrMult\":%.1f,"
                             "\"maxHoldBars\":%d,"
@@ -293,13 +312,14 @@ void OnTick()
                             ask, spread_pts, _Digits, last_m1_timestamp,
                             m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
                             m5_closes_str, m5_highs_str, m5_lows_str, m30_closes_str,
-                            h1_closes_str, h1_highs_str, h1_lows_str,
+                            h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str,
                             h4_closes_str, h4_highs_str, h4_lows_str,
                             d1_opens_str, d1_closes_str,
                             open_positions_json,
                             RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
                             StochKPeriod, StochDPeriod, StochSlowing,
                             SlAtrMultiplier, TpAtrMultiplier,
+                            KfProcessNoise, KfMeasurementNoise,
                             AdxPeriod, AdxThreshold, ChandelierPeriod, ChandelierAtrMult, MaxHoldBars
                          );
 
@@ -368,13 +388,12 @@ void OnTick()
             new_sl_price = StringToDouble(GetNestedJsonValue(response_str, "swingSignal", "slPrice", false));
 
             // For display purposes, convert prices to pips
-            if(entry_type == "long")
+            if(StringFind(entry_type, "long") >= 0)
               {
                sl_pips = DoubleToString((ask - sl_price) / (point_val * 10.0), 1);
                tp_pips = DoubleToString((tp1_price - ask) / (point_val * 10.0), 1);
               }
-            else
-               if(entry_type == "short")
+            else if(StringFind(entry_type, "short") >= 0)
                  {
                   sl_pips = DoubleToString((sl_price - bid) / (point_val * 10.0), 1);
                   tp_pips = DoubleToString((bid - tp1_price) / (point_val * 10.0), 1);
@@ -403,71 +422,32 @@ void OnTick()
 // --- End of Position Management ---
 
 // --- NEW: Calculate Lot Size based on Conviction Score ---
-   double lot_size = 0.01; // Default to 0.01, will be replaced by server logic later
+   double lot_size = 0.0; // Default to 0.0, will be replaced by server logic later
+
+   // --- Calculate current P/L for any open position ---
+   double current_pl = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+         current_pl += PositionGetDouble(POSITION_PROFIT);
+        }
+     }
 
 // --- Display graphical dashboard on chart ---
    UpdateDashboard(entry_type, reason, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, lot_size);
 
 
 // --- Trade Execution Logic ---
-   if(StringFind(recommended_order_type, "long") >= 0 && lot_size > 0.0 && action != "close" && action != "update_sl")
+   if(lot_size > 0.0 && action != "close" && action != "update_sl")
      {
-      // Close any opposing positions before opening a new one
-      ClosePositions(POSITION_TYPE_SELL);
-
-      int open_buys = CountOpenPositions(POSITION_TYPE_BUY);
-      bool can_pyramid = EnablePyramiding && open_buys > 0 && open_buys < MaxPyramidEntries;
-      bool is_profitable_enough = false;
-
-      if(can_pyramid)
+      if(recommended_order_type == "limit_long" || recommended_order_type == "market_long")
         {
-         double total_profit = 0;
-         for(int i = PositionsTotal() - 1; i >= 0; i--)
-           {
-            if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-              {
-               total_profit += PositionGetDouble(POSITION_PROFIT);
-              }
-           }
-         is_profitable_enough = (total_profit / (point_val * 10.0)) > PyramidProfitPips;
-         // Note: Pyramiding with fixed lot sizes might need a different logic if desired.
-         // For now, it will use the same conviction-based lot size for the new entry.
-        }
+         // Close any opposing positions before opening a new one
+         ClosePositions(POSITION_TYPE_SELL);
 
-      if(open_buys == 0 || (can_pyramid && is_profitable_enough))
-        {
-         if(lot_size > 0)
-           {
-            if(recommended_order_type == "limit_buy")
-            {
-               datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
-               if(trade.BuyLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit BUY"))
-               {
-                  // Log pending order placement
-                  LogEvent("Pending", trade.ResultOrder(), _Symbol, "Buy Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
-               }
-            }
-            else // Market order
-            {
-               if(trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
-               {
-                  ulong ticket = trade.ResultDeal();
-                  if(PositionSelectByTicket(ticket))
-                  {
-                     LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-                  }
-               }
-            }
-           }
-        }
-     }
-   else if(StringFind(recommended_order_type, "short") >= 0 && lot_size > 0.0 && action != "close" && action != "update_sl")
-        {
-         // Close any opposing positions
-         ClosePositions(POSITION_TYPE_BUY);
-
-         int open_sells = CountOpenPositions(POSITION_TYPE_SELL);
-         bool can_pyramid = EnablePyramiding && open_sells > 0 && open_sells < MaxPyramidEntries;
+         int open_buys = CountOpenPositions(POSITION_TYPE_BUY);
+         bool can_pyramid = EnablePyramiding && open_buys > 0 && open_buys < MaxPyramidEntries;
          bool is_profitable_enough = false;
 
          if(can_pyramid)
@@ -475,7 +455,7 @@ void OnTick()
             double total_profit = 0;
             for(int i = PositionsTotal() - 1; i >= 0; i--)
               {
-               if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+               if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                  {
                   total_profit += PositionGetDouble(POSITION_PROFIT);
                  }
@@ -483,32 +463,77 @@ void OnTick()
             is_profitable_enough = (total_profit / (point_val * 10.0)) > PyramidProfitPips;
            }
 
-         if(open_sells == 0 || (can_pyramid && is_profitable_enough))
+         if(open_buys == 0 || (can_pyramid && is_profitable_enough))
            {
-            if(lot_size > 0)
-            {
-               if(recommended_order_type == "limit_sell")
-               {
-                  datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
-                  if(trade.SellLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit SELL"))
-                  {
-                     LogEvent("Pending", trade.ResultOrder(), _Symbol, "Sell Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
-                  }
-               }
-               else // Market order
-               {
-                  if(trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
-                  {
+            if(recommended_order_type == "limit_long" && limit_price > 0)
+              {
+               datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
+               if(trade.BuyLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit BUY"))
+                 {
+                  LogEvent("Pending", trade.ResultOrder(), _Symbol, "Buy Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
+                 }
+              }
+            else if(recommended_order_type == "market_long")
+                 {
+                  if(trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
+                    {
                      ulong ticket = trade.ResultDeal();
                      if(PositionSelectByTicket(ticket))
-                     {
-                        LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-                     }
-                  }
-               }
-            }
+                       {
+                        LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
+                       }
+                    }
+                 }
            }
         }
+      else
+         if(recommended_order_type == "limit_short" || recommended_order_type == "market_short")
+           {
+            // Close any opposing positions
+            ClosePositions(POSITION_TYPE_BUY);
+
+            int open_sells = CountOpenPositions(POSITION_TYPE_SELL);
+            bool can_pyramid = EnablePyramiding && open_sells > 0 && open_sells < MaxPyramidEntries;
+            bool is_profitable_enough = false;
+
+            if(can_pyramid)
+              {
+               double total_profit = 0;
+               for(int i = PositionsTotal() - 1; i >= 0; i--)
+                 {
+                  if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                    {
+                     total_profit += PositionGetDouble(POSITION_PROFIT);
+                    }
+                 }
+               is_profitable_enough = (total_profit / (point_val * 10.0)) > PyramidProfitPips;
+              }
+
+            if(open_sells == 0 || (can_pyramid && is_profitable_enough))
+              {
+               if(recommended_order_type == "limit_short" && limit_price > 0)
+                 {
+                  datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
+                  if(trade.SellLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit SELL"))
+                    {
+                     LogEvent("Pending", trade.ResultOrder(), _Symbol, "Sell Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
+                    }
+                 }
+               else
+                  if(recommended_order_type == "market_short")
+                    {
+                     if(trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
+                       {
+                        ulong ticket = trade.ResultDeal();
+                        if(PositionSelectByTicket(ticket))
+                          {
+                           LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
+                          }
+                       }
+                    }
+              }
+           }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -728,13 +753,12 @@ void UpdateDashboard(string action, string reason, string tp, string sl, double 
 
    string signal_text;
    color signal_color;
-   if(action == "buy")
+   if(StringFind(action, "long") >= 0 || StringFind(action, "buy") >= 0)
      {
       signal_text = "ACTION: 📈 BUY";
       signal_color = C'0,230,118';
      }
-   else
-      if(action == "sell")
+   else if(StringFind(action, "short") >= 0 || StringFind(action, "sell") >= 0)
         {
          signal_text = "ACTION: 📉 SELL";
          signal_color = C'244,67,54';
@@ -970,4 +994,3 @@ string GetNestedJsonValue(string json, string object_key, string value_key, bool
    string nested_json = StringSubstr(json, object_start_pos - 1, object_end_pos - (object_start_pos - 1));
    return GetJsonValue("{" + nested_json, value_key, is_string);
   }
-//+------------------------------------------------------------------+

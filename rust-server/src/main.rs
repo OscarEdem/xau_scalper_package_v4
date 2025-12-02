@@ -1,6 +1,9 @@
 // v4 XAU/USD scalper server
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, State, WebSocketUpgrade,
+    },
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -10,8 +13,9 @@ use chrono::{NaiveDate, Utc};
 use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
 use std::collections::{VecDeque, BTreeSet};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
-use utoipa::OpenApi;
+use utoipa::{OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 pub use xau_scalper_server::{
     ArrivalConfirmation, EvalRequest, EvalResponse, SessionManager,
@@ -134,10 +138,20 @@ async fn main() {
         }
     });
 
+    // --- Phase 2: Real-time Data Gateway ---
+
+    // 1. Create a channel to broadcast live market data from MT5 to WebSocket clients.
+    let (tick_tx, _) = broadcast::channel::<String>(100);
+
+    // Add the tick_tx channel to the application state so the handler can access it.
+    let app_state_with_ticks = shared_state.with_ticks(tick_tx);
+
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/ws", get(websocket_handler)) // NEW: WebSocket endpoint
         .route("/health", get(|| async { "OK" }))
-        .route("/data", post(process_data_handler))
+        .route("/data", post(process_data_handler)) // For main analysis
+        .route("/ticks", post(tick_ingest_handler)) // NEW: For live ticks
         .route("/signals/:symbol", get(get_latest_signals_handler))
         .route("/signals/latest", get(get_all_latest_signals_handler))
         .route("/signals", get(get_signals_handler))
@@ -148,8 +162,8 @@ async fn main() {
         .route("/log_trade", post(log_trade_handler))
         // --- The history endpoint is now more powerful ---
         .route("/history", get(get_logs_handler).delete(clear_history_handler))
-        // Provide the state to the handlers
-        .with_state(shared_state);
+        // Provide the state (including the tick channel) to the handlers
+        .with_state(app_state_with_ticks);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
@@ -159,6 +173,51 @@ async fn main() {
         .unwrap();
 }
 
+/// Axum handler for WebSocket connections.
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ApplicationStateWithTicks>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(|socket| websocket_stream(socket, state))
+}
+
+/// The actual WebSocket logic once a connection is upgraded.
+async fn websocket_stream(mut socket: WebSocket, state: ApplicationStateWithTicks) {
+    tracing::info!("New WebSocket client connected.");
+    let mut rx = state.tick_tx.subscribe();
+
+    while let Ok(msg) = rx.recv().await {
+        if socket.send(Message::Text(msg)).await.is_err() {
+            // Client disconnected
+            tracing::info!("WebSocket client disconnected.");
+            break;
+        }
+    }
+}
+
+/// New handler to ingest a single tick via HTTP POST and broadcast it.
+async fn tick_ingest_handler(
+    State(state): State<ApplicationStateWithTicks>,
+    tick_json: String, // Axum can receive the raw body as a String
+) -> StatusCode {
+    if !tick_json.is_empty() {
+        // Send this JSON string to all connected WebSocket clients
+        if state.tick_tx.send(tick_json).is_err() {
+            // This is not a client error, just a server state observation.
+            // It's fine to log it, but we still return 200 OK to the EA.
+            tracing::warn!("Tick received, but no active WebSocket clients to broadcast to.");
+        }
+    }
+    StatusCode::OK
+}
+
+// We need to add the broadcast sender to our application state
+#[derive(Clone)]
+struct ApplicationStateWithTicks {
+    inner: ApplicationState,
+    tick_tx: broadcast::Sender<String>,
+}
+
 /// Awaits a shutdown signal (e.g., Ctrl+C) for graceful server shutdown.
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
@@ -166,6 +225,13 @@ async fn shutdown_signal() {
         .expect("failed to install CTRL+C signal handler");
     tracing::info!("Received shutdown signal, shutting down gracefully.");
 }
+
+impl ApplicationState {
+    fn with_ticks(self, tick_tx: broadcast::Sender<String>) -> ApplicationStateWithTicks {
+        ApplicationStateWithTicks { inner: self, tick_tx }
+    }
+}
+
 
 #[utoipa::path(
     post,
@@ -178,14 +244,14 @@ async fn shutdown_signal() {
 )]
 /// Handler to receive and store a push notification token from a client app.
 async fn save_push_token_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
     Json(body): Json<SavePushTokenRequest>,
 ) -> (StatusCode, Json<&'static str>) {
     if body.token.is_empty() || !body.token.starts_with("ExponentPushToken[") {
         return (StatusCode::BAD_REQUEST, Json("Invalid push token format"));
     }
 
-    let mut tokens = state.push_tokens.lock().unwrap();
+    let mut tokens = state.inner.push_tokens.lock().unwrap();
     tokens.insert(body.token);
     tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
 
@@ -200,8 +266,8 @@ async fn save_push_token_handler(
     )
 )]
 /// Handler to return a log of all signals generated in the last 24 hours.
-async fn get_signals_handler(State(state): State<ApplicationState>) -> Json<Vec<HistoricalSignal>> {
-    let history = state.signal_history.lock().unwrap_or_else(|e| {
+async fn get_signals_handler(State(state): State<ApplicationStateWithTicks>) -> Json<Vec<HistoricalSignal>> {
+    let history = state.inner.signal_history.lock().unwrap_or_else(|e| {
         tracing::error!("Signal history mutex poisoned! Recovering. Error: {}", e);
         e.into_inner()
     });
@@ -221,7 +287,7 @@ async fn get_signals_handler(State(state): State<ApplicationState>) -> Json<Vec<
     )
 )]
 async fn process_data_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
     Json(req): Json<EvalRequest>,
 ) -> (StatusCode, Json<&'static str>) {
     tracing::info!(
@@ -243,7 +309,7 @@ async fn process_data_handler(
         // The `get_or_create_session` handles the logic of creating a new session if it's the first time
         // we see this symbol. The lock is held for the duration of the data processing to ensure consistency.
         let mut sessions = state
-            .session_manager.sessions.lock().unwrap_or_else(|e| {
+            .inner.session_manager.sessions.lock().unwrap_or_else(|e| {
                 tracing::error!("Session manager mutex poisoned! Recovering. Error: {}", e);
                 e.into_inner()
             });
@@ -261,7 +327,7 @@ async fn process_data_handler(
 
         // Now, get the new signals and add them to history
         let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
-        let mut history = state.signal_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut history = state.inner.signal_history.lock().unwrap_or_else(|e| e.into_inner());
 
         let now = Utc::now().timestamp();
 
@@ -297,7 +363,7 @@ async fn process_data_handler(
 
     // --- NEW: Send notifications AFTER releasing the lock ---
     for (signal, symbol) in signals_to_send {
-        send_push_notification(state.push_tokens.clone(), &signal, &symbol).await;
+        send_push_notification(state.inner.push_tokens.clone(), &signal, &symbol).await;
     }
 
     (StatusCode::OK, Json("Data processed"))
@@ -323,7 +389,7 @@ async fn send_push_notification(
             let data = serde_json::json!({ "signalId": signal.signal_id, "symbol": symbol });
             ExpoPushMessage::builder(vec![token])
                 .title(format!("New {} Signal: {} {}", symbol, signal.classification.to_uppercase(), signal.entry_type.to_uppercase()))
-                .body(format!("Entry: {:.5}, SL: {:.5}, TP1: {:.5}", signal.entry_price, signal.sl_price, signal.tp1_price))
+                .body(format!("Entry: {:.5}, SL: {:.5}, TP1: {:.5}, TP2: {:.5}", signal.entry_price, signal.sl_price, signal.tp1_price, signal.tp2_price))
                 .data(&data)
                 .and_then(|builder| builder.build())
         })
@@ -350,10 +416,10 @@ async fn send_push_notification(
 )]
 /// Handler to return the last generated signals for a specific symbol.
 async fn get_latest_signals_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
     Path(symbol): Path<String>,
 ) -> Result<Json<LatestSignalsResponse>, StatusCode> {
-    let sessions = state.session_manager.sessions.lock().unwrap_or_else(|e| {
+    let sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
         tracing::error!("Session manager mutex poisoned in get_latest_signals_handler! Recovering. Error: {}", e);
         e.into_inner()
     });
@@ -379,9 +445,9 @@ async fn get_latest_signals_handler(
 )]
 /// Handler to return the latest signals for all active symbols.
 async fn get_all_latest_signals_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
 ) -> Json<Vec<LatestSignalsForSymbol>> {
-    let sessions = state.session_manager.sessions.lock().unwrap_or_else(|e| {
+    let sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
         tracing::error!("Session manager mutex poisoned in get_all_latest_signals_handler! Recovering. Error: {}", e);
         e.into_inner()
     });
@@ -455,10 +521,10 @@ async fn confirm_execution_handler(
 )]
 /// Handler to receive and store a trade log from the MQL5 EA
 async fn log_trade_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
     Json(log): Json<TradeLog>,
 ) -> Json<&'static str> {
-    let mut sessions = state.session_manager.sessions.lock().unwrap();
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
     if let Some(session) = sessions.get_mut(&log.symbol) {
         session.add_trade_log(log);
         tracing::info!(
@@ -486,12 +552,12 @@ async fn log_trade_handler(
 )]
 /// Handler to return all stored trade logs
 async fn get_logs_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
     Query(mut params): Query<HistoryParams>,
 ) -> Json<HistoryResponse> {
     // If a symbol is provided, get logs for that symbol. Otherwise, get all logs.
     let symbol_filter = params.symbol.take();
-    let sessions = state.session_manager.sessions.lock().unwrap();
+    let sessions = state.inner.session_manager.sessions.lock().unwrap();
 
     let logs: Vec<TradeLog> = if let Some(symbol) = symbol_filter {
         sessions.get(&symbol).map_or(vec![], |s| s.get_trade_logs().into())
@@ -566,9 +632,9 @@ async fn get_logs_handler(
 )]
 /// Handler to clear all stored trade logs.
 async fn clear_history_handler(
-    State(state): State<ApplicationState>,
+    State(state): State<ApplicationStateWithTicks>,
 ) -> (StatusCode, Json<&'static str>) {
-    let mut sessions = state.session_manager.sessions.lock().unwrap();
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
     let mut cleared_count = 0;
     for session in sessions.values_mut() {
         if !session.get_trade_logs().is_empty() {

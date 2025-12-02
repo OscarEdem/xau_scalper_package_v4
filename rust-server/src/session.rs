@@ -49,6 +49,7 @@ pub struct TradingSession {
     m30_closes: VecDeque<f64>,
     h1_closes: VecDeque<f64>,
     h1_highs: VecDeque<f64>,
+    h1_opens: VecDeque<f64>,
     h1_lows: VecDeque<f64>,
     h4_closes: VecDeque<f64>,
     h4_highs: VecDeque<f64>,
@@ -62,6 +63,12 @@ pub struct TradingSession {
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
     trade_logs: VecDeque<TradeLog>,
+
+    // NEW: Anti-Spam State
+    last_notified_signal_id: Option<String>,
+    last_notified_direction: String, // "long", "short", "none"
+    last_notified_time: i64,         // Unix timestamp
+    last_notified_price: f64,
 }
 
 impl TradingSession {
@@ -78,6 +85,7 @@ impl TradingSession {
             m30_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            h1_opens: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h1_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h4_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             h4_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
@@ -89,6 +97,12 @@ impl TradingSession {
             latest_scalp_signal: None,
             latest_swing_signal: None,
             trade_logs: VecDeque::with_capacity(500), // Store last 500 trades per symbol
+
+            // Initialize spam filters
+            last_notified_signal_id: None,
+            last_notified_direction: "none".to_string(),
+            last_notified_time: 0,
+            last_notified_price: 0.0,
         }
     }
 
@@ -107,6 +121,7 @@ impl TradingSession {
         self.m30_closes = req.m30_closes.iter().cloned().collect();
         self.h1_closes = req.h1_closes.clone().unwrap_or_default().into();
         self.h1_highs = req.h1_highs.clone().unwrap_or_default().into();
+        self.h1_opens = req.h1_opens.clone().unwrap_or_default().into();
         self.h1_lows = req.h1_lows.clone().unwrap_or_default().into();
         self.h4_closes = req.h4_closes.clone().unwrap_or_default().into();
         self.h4_highs = req.h4_highs.clone().unwrap_or_default().into();
@@ -147,8 +162,81 @@ impl TradingSession {
             }
         }
 
-        // 5. Store the final scalp signal.
-        self.latest_scalp_signal = Some(scalp_signal);
+        // 5. FILTERING LOGIC & FINAL STORAGE
+        let current_time = req.last_m1_timestamp;
+        let is_valid_signal = scalp_signal.entry_type != "none";
+
+        if is_valid_signal {
+            let direction_changed = scalp_signal.entry_type != self.last_notified_direction;
+            let time_diff = current_time - self.last_notified_time;
+            
+            // Cooldown: 5 minutes (300 seconds)
+            let cooldown_passed = time_diff > 300;
+
+            // Check if we are already in a trade for this direction
+            let already_in_trade = self.open_scalp_positions.iter().any(|p| 
+                (p.direction == "buy" && scalp_signal.entry_type == "long") ||
+                (p.direction == "sell" && scalp_signal.entry_type == "short")
+            );
+            
+            // --- Pyramiding Logic ---
+            // Calculate percentage distance from the LAST signal price
+            let price_delta_pct = if self.last_notified_price > 0.0 {
+                (scalp_signal.entry_price - self.last_notified_price) / self.last_notified_price
+            } else {
+                0.0
+            };
+
+            // Allow a new signal if price has moved significantly in our favor.
+            let pyramiding_threshold = 0.0015; // 0.15% (e.g., ~$3 on Gold)
+            let is_pyramiding_breakout = !direction_changed 
+                && match scalp_signal.entry_type.as_str() {
+                    "long" => price_delta_pct > pyramiding_threshold,  // Price went UP significantly
+                    "short" => price_delta_pct < -pyramiding_threshold, // Price went DOWN significantly
+                    _ => false,
+                };
+
+            // --- Updated Decision Matrix ---
+            let should_notify =
+                // Priority 1: Trend Reversal (Always notify)
+                direction_changed 
+                // Priority 2: Standard New Entry (Not in trade, cooldown passed)
+                || (!direction_changed && cooldown_passed && !already_in_trade)
+                // Priority 3: Pyramiding Exception (In trade, but strong breakout)
+                || (already_in_trade && is_pyramiding_breakout);
+
+            if should_notify {
+                // Tag the signal if it's a pyramid entry
+                if is_pyramiding_breakout {
+                    scalp_signal.classification = "scalp_pyramid".to_string();
+                    scalp_signal.reason = format!("Breakout_Add: {}", scalp_signal.reason);
+                }
+
+                // UPDATE STATE
+                self.last_notified_signal_id = Some(scalp_signal.signal_id.clone());
+                self.last_notified_direction = scalp_signal.entry_type.clone();
+                self.last_notified_time = current_time;
+                self.last_notified_price = scalp_signal.entry_price;
+                
+                // Allow the signal to pass through
+                self.latest_scalp_signal = Some(scalp_signal);
+            } else {
+                // SUPPRESS THE SIGNAL
+                // We set it to None so the API doesn't send a push notification.
+                // The original signal is logged above, but the final state is suppressed.
+                info!(
+                    symbol = %self.symbol,
+                    reason = "Suppressed by anti-spam filter",
+                    time_since_last = time_diff,
+                    already_in_trade = already_in_trade,
+                    "Scalp signal suppressed."
+                );
+                self.latest_scalp_signal = None; 
+            }
+        } else {
+            // If the engine returns "none", there's no signal to store or suppress.
+            self.latest_scalp_signal = Some(scalp_signal);
+        }
 
         // Placeholder for position management logic
         self.manage_positions();
@@ -172,6 +260,7 @@ impl TradingSession {
             m30_closes: self.m30_closes.iter().cloned().collect(),
             h1_closes: Some(self.h1_closes.iter().cloned().collect()),
             h1_highs: Some(self.h1_highs.iter().cloned().collect()),
+            h1_opens: Some(self.h1_opens.iter().cloned().collect()),
             h1_lows: Some(self.h1_lows.iter().cloned().collect()),
             h4_closes: Some(self.h4_closes.iter().cloned().collect()),
             h4_highs: Some(self.h4_highs.iter().cloned().collect()),
@@ -192,6 +281,9 @@ impl TradingSession {
         // Propagate all optional parameters from the original request
         engine_req.spread_limit_points = original_req.spread_limit_points;
         engine_req.spread_points = original_req.spread_points;
+        engine_req.kf_process_noise = original_req.kf_process_noise;
+        engine_req.kf_measurement_noise = original_req.kf_measurement_noise;
+        engine_req.upcoming_events = original_req.upcoming_events.clone();
         // ... propagate other optional params as needed ...
         engine_req
     }

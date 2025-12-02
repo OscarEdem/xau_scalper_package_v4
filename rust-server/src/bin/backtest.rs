@@ -1,7 +1,6 @@
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::error::Error;
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -17,28 +16,26 @@ pub struct Candle {
     volume: u32,
 }
 
-/// Holds a candle and its pre-calculated indicator values.
-#[derive(Debug, Clone)]
-struct EnrichedCandle {
-    time: String,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    ema_fast: f64,
-    ema_slow: f64,
-    rsi: f64,
-    atr: f64,
-}
-
-/// A new struct to hold the M1 candle and its corresponding M5 indicators.
+/// Holds a snapshot of all required data for a single M1 candle in the backtest.
 #[derive(Debug, Clone)]
 struct CombinedCandle {
-    m1: EnrichedCandle,
-    m5_ema_slow: f64,
-    m5_ema_fast: f64,
+    m1_open: f64,
+    m1_high: f64,
+    m1_low: f64,
+    m1_close: f64,
+    m5_closes: Vec<f64>,
+    m5_highs: Vec<f64>,
+    m5_lows: Vec<f64>,
     m30_closes: Vec<f64>,
     h1_closes: Option<Vec<f64>>,
+    h1_opens: Option<Vec<f64>>,
+    h1_highs: Option<Vec<f64>>,
+    h1_lows: Option<Vec<f64>>,
+    h4_closes: Option<Vec<f64>>,
+    h4_highs: Option<Vec<f64>>,
+    h4_lows: Option<Vec<f64>>,
+    d1_opens: Option<Vec<f64>>,
+    d1_closes: Option<Vec<f64>>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -71,6 +68,18 @@ struct Opt {
     /// Path to the H1 CSV file (optional)
     #[structopt(long, parse(from_os_str))]
     h1_file: Option<PathBuf>,
+
+    /// Path to the H4 CSV file (optional)
+    #[structopt(long, parse(from_os_str))]
+    h4_file: Option<PathBuf>,
+
+    /// Path to the D1 CSV file (optional)
+    #[structopt(long, parse(from_os_str))]
+    d1_file: Option<PathBuf>,
+
+    /// Path to the news events CSV file (optional)
+    #[structopt(long, parse(from_os_str))]
+    news_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -99,6 +108,8 @@ struct BacktestParams {
     tp_atr_multiplier: f64,
     min_sl_pips: f64,
     max_sl_pips: f64,
+    kf_process_noise: f64,
+    kf_measurement_noise: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +135,6 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
     let mut gross_profit = 0.0;
     let mut gross_loss = 0.0;
     let mut max_drawdown: f64 = 0.0;
-    let pip_size = 0.01;
 
     // Create a single trading session for this backtest run.
     let mut session = TradingSession::new("XAUUSD".to_string(), true);
@@ -137,30 +147,29 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
 
     for i in opt.history_size..combined_candles.len() {
         let combined_candle = &combined_candles[i];
-        let current_candle = &combined_candle.m1;
 
         // Build EvalRequest for the strategy
         let req = EvalRequest {
             symbol: "XAUUSD".to_string(),
             timeframe: "M1".to_string(),
-            closes: combined_candles[..=i].iter().map(|c| c.m1.close).collect(),
-            highs: combined_candles[..=i].iter().map(|c| c.m1.high).collect(),
-            opens: combined_candles[..=i].iter().map(|c| c.m1.open).collect(),
-            lows: combined_candles[..=i].iter().map(|c| c.m1.low).collect(),
-            m5_closes: combined_candles[..=i].iter().map(|c| c.m5_ema_slow).collect(), // Simplified, using M5 EMA as proxy
+            closes: combined_candles[..=i].iter().map(|c| c.m1_close).collect(),
+            highs: combined_candles[..=i].iter().map(|c| c.m1_high).collect(),
+            opens: combined_candles[..=i].iter().map(|c| c.m1_open).collect(),
+            lows: combined_candles[..=i].iter().map(|c| c.m1_low).collect(),
             volumes: vec![0; i + 1], // Not used in this backtest, provide dummy data
-            h1_highs: None, // Not used in this backtest
-            h1_lows: None, // Not used in this backtest
-            m5_highs: vec![], // Not used in strategy
-            m5_lows: vec![], // Not used in strategy
+            m5_closes: combined_candle.m5_closes.clone(),
+            m5_highs: combined_candle.m5_highs.clone(),
+            m5_lows: combined_candle.m5_lows.clone(),
             m30_closes: combined_candle.m30_closes.clone(),
             h1_closes: combined_candle.h1_closes.clone(),
-            // --- FIX: Add missing higher timeframe fields ---
-            h4_closes: None,
-            h4_highs: None,
-            h4_lows: None,
-            d1_opens: None,
-            d1_closes: None,
+            h1_opens: combined_candle.h1_opens.clone(),
+            h1_highs: combined_candle.h1_highs.clone(),
+            h1_lows: combined_candle.h1_lows.clone(),
+            h4_closes: combined_candle.h4_closes.clone(),
+            h4_highs: combined_candle.h4_highs.clone(),
+            h4_lows: combined_candle.h4_lows.clone(),
+            d1_opens: combined_candle.d1_opens.clone(),
+            d1_closes: combined_candle.d1_closes.clone(),
             open_positions: None, // No open positions for backtest
             rsi_period: Some(params.rsi_period),
             ema_fast: Some(params.ema_fast),
@@ -175,6 +184,8 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
             tp2_pips: None,
             sl_pips: Some(0.0), // Not used
             tp_atr_multiplier: Some(params.tp_atr_multiplier),
+            kf_process_noise: Some(params.kf_process_noise),
+            kf_measurement_noise: Some(params.kf_measurement_noise),
             sl_atr_multiplier: Some(params.sl_atr_multiplier),
             confirmation_bars: Some(2), // Default
             spread_limit_points: Some(30.0), // Default
@@ -191,13 +202,15 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
             chandelier_period: Some(22), // Default
             chandelier_atr_mult: Some(3.0), // Default
             max_hold_bars: Some(100), // Default
+            max_risk_pct: Some(0.01), // Default 1% risk
             imbalance_mitigation: Some(true),
             last_m1_timestamp: 0,
             last_m5_timestamp: None,
             last_m30_timestamp: None,
             last_h1_timestamp: None,
             mode: "scalp".to_string(), // Hardcode to scalp for this backtest
-            current_price: current_candle.close,
+            current_price: combined_candle.m1_close,
+            upcoming_events: Some(vec![]), // Assume no news for backtest
         };
 
         // Process the data through the session to generate signals.
@@ -210,9 +223,9 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
         if let Some(trade) = active_trade.take() {
             let (pnl, _reason) = match trade.direction {
                 TradeDirection::Long => {
-                    if current_candle.low <= trade.stop_loss {
+                    if combined_candle.m1_low <= trade.stop_loss {
                         (-(trade.entry_price - trade.stop_loss) * trade.lot_size, "Stop Loss")
-                    } else if current_candle.high >= trade.take_profit {
+                    } else if combined_candle.m1_high >= trade.take_profit {
                         ((trade.take_profit - trade.entry_price) * trade.lot_size, "Take Profit")
                     } else {
                         // Trade still active
@@ -221,9 +234,9 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
                     }
                 }
                 TradeDirection::Short => {
-                    if current_candle.high >= trade.stop_loss {
+                    if combined_candle.m1_high >= trade.stop_loss {
                         (-(trade.stop_loss - trade.entry_price) * trade.lot_size, "Stop Loss")
-                    } else if current_candle.low <= trade.take_profit {
+                    } else if combined_candle.m1_low <= trade.take_profit {
                         ((trade.entry_price - trade.take_profit) * trade.lot_size, "Take Profit")
                     } else {
                         // Trade still active
@@ -352,64 +365,87 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    // Load H4 data if provided
+    let h4_candles = if let Some(ref path) = opt.h4_file {
+        let file = File::open(path)?;
+        let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(file);
+        let candles: Vec<Candle> = rdr.deserialize().collect::<Result<_, _>>()?;
+        println!("Loaded {} H4 candles.", candles.len());
+        Some(candles)
+    } else {
+        None
+    };
+
+    // Load D1 data if provided
+    let d1_candles = if let Some(ref path) = opt.d1_file {
+        let file = File::open(path)?;
+        let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(file);
+        let candles: Vec<Candle> = rdr.deserialize().collect::<Result<_, _>>()?;
+        println!("Loaded {} D1 candles.", candles.len());
+        Some(candles)
+    } else {
+        None
+    };
+
+
     // --- Pre-calculate indicators for both timeframes ---
     // M1 Indicators
-    let m1_closes: Vec<f64> = m1_candles.iter().map(|c| c.close).collect();
-    let m1_highs: Vec<f64> = m1_candles.iter().map(|c| c.high).collect();
-    let m1_lows: Vec<f64> = m1_candles.iter().map(|c| c.low).collect();
     let _m1_opens: Vec<f64> = m1_candles.iter().map(|c| c.open).collect();
 
     // M5 Indicators
     let m5_closes: Vec<f64> = m5_candles.iter().map(|c| c.close).collect();
-    let _m5_highs: Vec<f64> = m5_candles.iter().map(|c| c.high).collect();
-    let _m5_lows: Vec<f64> = m5_candles.iter().map(|c| c.low).collect();
+    let m5_highs: Vec<f64> = m5_candles.iter().map(|c| c.high).collect();
+    let m5_lows: Vec<f64> = m5_candles.iter().map(|c| c.low).collect();
 
     // M30 Indicators
     let m30_closes = m30_candles.as_ref().map(|c| c.iter().map(|candle| candle.close).collect::<Vec<f64>>()).unwrap_or_default();
 
     // H1 Indicators
     let h1_closes = h1_candles.as_ref().map(|c| c.iter().map(|candle| candle.close).collect::<Vec<f64>>());
+    let h1_opens = h1_candles.as_ref().map(|c| c.iter().map(|candle| candle.open).collect::<Vec<f64>>());
+    let h1_highs = h1_candles.as_ref().map(|c| c.iter().map(|candle| candle.high).collect::<Vec<f64>>());
+    let h1_lows = h1_candles.as_ref().map(|c| c.iter().map(|candle| candle.low).collect::<Vec<f64>>());
 
-    // --- Create a lookup map for M5 candles for efficient access ---
-    let _m5_candle_map: HashMap<String, Candle> = m5_candles.iter().map(|c| (c.time.clone(), c.clone())).collect();
+    // H4 Indicators
+    let h4_closes = h4_candles.as_ref().map(|c| c.iter().map(|candle| candle.close).collect::<Vec<f64>>());
+    let h4_highs = h4_candles.as_ref().map(|c| c.iter().map(|candle| candle.high).collect::<Vec<f64>>());
+    let h4_lows = h4_candles.as_ref().map(|c| c.iter().map(|candle| candle.low).collect::<Vec<f64>>());
+
+    // D1 Indicators
+    let d1_opens = d1_candles.as_ref().map(|c| c.iter().map(|candle| candle.open).collect::<Vec<f64>>());
+    let d1_closes = d1_candles.as_ref().map(|c| c.iter().map(|candle| candle.close).collect::<Vec<f64>>());
 
     // --- Combine M1 and M5 data ---
     // Simplified alignment: assume M1 and M5 data are aligned by index for backtest purposes
     let mut combined_candles: Vec<CombinedCandle> = Vec::new();
 
-    // Calculate M1 indicators
-    let m1_ema_fast = xau_scalper_server::ema(&m1_closes, 3); // Default fast
-    let _m1_ema_mid = xau_scalper_server::ema(&m1_closes, 8); // Default mid
-    let m1_ema_slow = xau_scalper_server::ema(&m1_closes, 50); // Default slow
-    let m1_rsi = xau_scalper_server::rsi(&m1_closes, 16); // Default RSI
-    let m1_atr = xau_scalper_server::atr(&m1_highs, &m1_lows, &m1_closes, 14); // Default ATR
-
-    // Calculate M5 indicators
-    let m5_ema_slow = xau_scalper_server::ema(&m5_closes, 50); // Default M5 EMA
-
     // Combine data
     for i in 0..m1_candles.len() {
-        let m5_idx = i / 5; // Simplified: every 5 M1 bars = 1 M5 bar
-        if m5_idx >= m5_candles.len() { break; }
-
-        let enriched = EnrichedCandle {
-            time: m1_candles[i].time.clone(),
-            open: m1_candles[i].open,
-            high: m1_candles[i].high,
-            low: m1_candles[i].low,
-            close: m1_candles[i].close,
-            ema_fast: m1_ema_fast[i],
-            ema_slow: m1_ema_slow[i],
-            rsi: m1_rsi[i],
-            atr: m1_atr[i],
-        };
+        // Simplified time alignment for backtesting
+        let m5_idx = i / 5;
+        let m30_idx = i / 30;
+        let h1_idx = i / 60;
+        let h4_idx = i / 240;
+        let d1_idx = i / 1440;
 
         let combined = CombinedCandle {
-            m1: enriched,
-            m5_ema_slow: m5_ema_slow[m5_idx],
-            m5_ema_fast: 0.0, // Not used
-            m30_closes: m30_closes.clone(),
-            h1_closes: h1_closes.clone(),
+            m1_open: m1_candles[i].open,
+            m1_high: m1_candles[i].high,
+            m1_low: m1_candles[i].low,
+            m1_close: m1_candles[i].close,
+            m5_closes: m5_closes.iter().take(m5_idx + 1).cloned().collect(),
+            m5_highs: m5_highs.iter().take(m5_idx + 1).cloned().collect(),
+            m5_lows: m5_lows.iter().take(m5_idx + 1).cloned().collect(),
+            m30_closes: m30_closes.iter().take(m30_idx + 1).cloned().collect(),
+            h1_closes: h1_closes.as_ref().map(|d| d.iter().take(h1_idx + 1).cloned().collect()),
+            h1_opens: h1_opens.as_ref().map(|d| d.iter().take(h1_idx + 1).cloned().collect()),
+            h1_highs: h1_highs.as_ref().map(|d| d.iter().take(h1_idx + 1).cloned().collect()),
+            h1_lows: h1_lows.as_ref().map(|d| d.iter().take(h1_idx + 1).cloned().collect()),
+            h4_closes: h4_closes.as_ref().map(|d| d.iter().take(h4_idx + 1).cloned().collect()),
+            h4_highs: h4_highs.as_ref().map(|d| d.iter().take(h4_idx + 1).cloned().collect()),
+            h4_lows: h4_lows.as_ref().map(|d| d.iter().take(h4_idx + 1).cloned().collect()),
+            d1_opens: d1_opens.as_ref().map(|d| d.iter().take(d1_idx + 1).cloned().collect()),
+            d1_closes: d1_closes.as_ref().map(|d| d.iter().take(d1_idx + 1).cloned().collect()),
         };
 
         combined_candles.push(combined);
@@ -425,6 +461,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tp_multipliers = vec![1.5, 2.0];
     let min_sl_pips_range = vec![15.0, 25.0];
     let max_sl_pips_range = vec![150.0, 200.0, 250.0];
+    let kf_q_range = vec![0.01, 0.005];
+    let kf_r_range = vec![0.1, 0.2];
 
     let mut param_combinations = Vec::new();
     for fast_p in ema_fast_periods {
@@ -434,11 +472,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     for max_sl in &max_sl_pips_range {
                         for sl_m in sl_multipliers.iter() {
                             for tp_m in tp_multipliers.iter() {
-                                param_combinations.push(BacktestParams {
-                                    ema_fast: fast_p, ema_slow: slow_p, rsi_period: rsi_p,
-                                    sl_atr_multiplier: *sl_m, tp_atr_multiplier: *tp_m,
-                                    min_sl_pips: *min_sl, max_sl_pips: *max_sl,
-                                });
+                                for kf_q in &kf_q_range {
+                                    for kf_r in &kf_r_range {
+                                        param_combinations.push(BacktestParams {
+                                            ema_fast: fast_p, ema_slow: slow_p, rsi_period: rsi_p,
+                                            sl_atr_multiplier: *sl_m, tp_atr_multiplier: *tp_m,
+                                            min_sl_pips: *min_sl, max_sl_pips: *max_sl,
+                                            kf_process_noise: *kf_q, kf_measurement_noise: *kf_r,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -470,10 +513,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(result) = best_sharpe {
         println!("\n--- Best Result (Optimized for Sharpe Ratio) ---");
         println!(
-            "Parameters: EMA({}/{}), RSI({}), SL: {:.1}*ATR, TP: {:.1}*ATR, MinSL: {}, MaxSL: {}",
+            "Parameters: EMA({}/{}), RSI({}), SL: {:.1}*ATR, TP: {:.1}*ATR, MinSL: {}, MaxSL: {}, KF(q:{}, r:{})",
             result.params.ema_fast, result.params.ema_slow, result.params.rsi_period,
             result.params.sl_atr_multiplier, result.params.tp_atr_multiplier,
-            result.params.min_sl_pips, result.params.max_sl_pips
+            result.params.min_sl_pips, result.params.max_sl_pips,
+            result.params.kf_process_noise, result.params.kf_measurement_noise
         );
         println!("Sharpe Ratio: {:.3} | Profit Factor: {:.2}", result.sharpe_ratio, result.profit_factor);
         println!("Final Balance: {:.2}", result.final_balance);
@@ -492,10 +536,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(result) = best_pf_dd {
         println!("\n--- Best Result (Optimized for Profit Factor / Max Drawdown) ---");
         println!(
-            "Parameters: EMA({}/{}), RSI({}), SL: {:.1}*ATR, TP: {:.1}*ATR, MinSL: {}, MaxSL: {}",
+            "Parameters: EMA({}/{}), RSI({}), SL: {:.1}*ATR, TP: {:.1}*ATR, MinSL: {}, MaxSL: {}, KF(q:{}, r:{})",
             result.params.ema_fast, result.params.ema_slow, result.params.rsi_period,
             result.params.sl_atr_multiplier, result.params.tp_atr_multiplier,
-            result.params.min_sl_pips, result.params.max_sl_pips
+            result.params.min_sl_pips, result.params.max_sl_pips,
+            result.params.kf_process_noise, result.params.kf_measurement_noise
         );
         println!("Sharpe Ratio: {:.3} | Profit Factor: {:.2}", result.sharpe_ratio, result.profit_factor);
         println!("Final Balance: {:.2}", result.final_balance);

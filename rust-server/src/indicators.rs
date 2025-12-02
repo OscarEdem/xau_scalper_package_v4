@@ -15,6 +15,15 @@ pub struct OpenPosition {
     pub mode: String, // "scalp" | "swing"
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsEvent {
+    pub name: String,
+    pub timestamp: i64,      // Unix seconds
+    pub impact: String,      // "high", "medium", "low"
+}
+
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalRequest {
@@ -31,6 +40,7 @@ pub struct EvalRequest {
     pub m30_closes: Vec<f64>,
     pub h1_closes: Option<Vec<f64>>,
     pub h1_highs: Option<Vec<f64>>,
+    pub h1_opens: Option<Vec<f64>>,
     pub h1_lows: Option<Vec<f64>>,
     // Add these Higher Time Frames
     pub h4_closes: Option<Vec<f64>>,
@@ -39,6 +49,7 @@ pub struct EvalRequest {
     pub d1_opens: Option<Vec<f64>>,
     pub d1_closes: Option<Vec<f64>>,
     pub open_positions: Option<Vec<OpenPosition>>, // current live trades
+    pub upcoming_events: Option<Vec<NewsEvent>>,
     // Optional base parameters
     pub rsi_period: Option<usize>,
     pub ema_fast: Option<usize>,
@@ -52,6 +63,12 @@ pub struct EvalRequest {
     pub tp2_pips: Option<f64>,
     pub sl_pips: Option<f64>,
     pub tp_atr_multiplier: Option<f64>,
+    /// Process noise (q) for the Kalman Filter. Represents the uncertainty in the price model.
+    #[schema(example = 0.01)]
+    pub kf_process_noise: Option<f64>,
+    /// Measurement noise (r) for the Kalman Filter. Represents the uncertainty in the price measurement.
+    #[schema(example = 0.1)]
+    pub kf_measurement_noise: Option<f64>,
     pub sl_atr_multiplier: Option<f64>,
     // New scalping-focused parameters
     pub ema_mid: Option<usize>,
@@ -73,6 +90,7 @@ pub struct EvalRequest {
     pub chandelier_period: Option<usize>,
     pub chandelier_atr_mult: Option<f64>,
     pub max_hold_bars: Option<usize>,
+    pub max_risk_pct: Option<f64>,
     // Timestamp synchronization
     pub last_m1_timestamp: i64,
     pub last_m5_timestamp: Option<i64>,
@@ -88,6 +106,8 @@ pub struct EvalRequest {
 pub struct PriceLevel {
     pub top: f64,
     pub bottom: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_bullish: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -429,11 +449,11 @@ pub fn find_imbalance_zones(highs: &[f64], lows: &[f64], lookback: usize) -> Vec
     for i in (start_index + 2)..highs.len() {
         // Correct Bullish FVG: The low of the current candle is above the high of the candle two periods ago.
         if lows[i] > highs[i-2] {
-             zones.push(PriceLevel { top: lows[i], bottom: highs[i-2] });
+             zones.push(PriceLevel { top: lows[i], bottom: highs[i-2], is_bullish: Some(true) });
         }
         // Correct Bearish FVG: The high of the current candle is below the low of the candle two periods ago.
         if highs[i] < lows[i-2] {
-            zones.push(PriceLevel { top: lows[i-2], bottom: highs[i] });
+            zones.push(PriceLevel { top: lows[i-2], bottom: highs[i], is_bullish: Some(false) });
         }
     }
     zones
