@@ -4,8 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: xau/scalper:v4
-    container_name: xau_scalper_v4
+    image: xau/scalper:ml
+    container_name: xau_scalper_ml
     ports:
       - "127.0.0.1:3000:3000"
     restart: unless-stopped

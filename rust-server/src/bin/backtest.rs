@@ -80,6 +80,10 @@ struct Opt {
     /// Path to the news events CSV file (optional)
     #[structopt(long, parse(from_os_str))]
     news_file: Option<PathBuf>,
+
+    /// Predictor model to use (e.g., "gbm", "heston", "lstm")
+    #[structopt(long, default_value = "gbm")]
+    predictor_model: String,
 }
 
 #[derive(Debug)]
@@ -148,14 +152,17 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
     for i in opt.history_size..combined_candles.len() {
         let combined_candle = &combined_candles[i];
 
+        // --- OPTIMIZATION: Slice only the necessary window of data ---
+        let history_start_idx = i.saturating_sub(opt.history_size);
+
         // Build EvalRequest for the strategy
         let req = EvalRequest {
             symbol: "XAUUSD".to_string(),
             timeframe: "M1".to_string(),
-            closes: combined_candles[..=i].iter().map(|c| c.m1_close).collect(),
-            highs: combined_candles[..=i].iter().map(|c| c.m1_high).collect(),
-            opens: combined_candles[..=i].iter().map(|c| c.m1_open).collect(),
-            lows: combined_candles[..=i].iter().map(|c| c.m1_low).collect(),
+            closes: combined_candles[history_start_idx..=i].iter().map(|c| c.m1_close).collect(),
+            highs: combined_candles[history_start_idx..=i].iter().map(|c| c.m1_high).collect(),
+            opens: combined_candles[history_start_idx..=i].iter().map(|c| c.m1_open).collect(),
+            lows: combined_candles[history_start_idx..=i].iter().map(|c| c.m1_low).collect(),
             volumes: vec![0; i + 1], // Not used in this backtest, provide dummy data
             m5_closes: combined_candle.m5_closes.clone(),
             m5_highs: combined_candle.m5_highs.clone(),
@@ -211,6 +218,7 @@ fn run_single_backtest(params: BacktestParams, combined_candles: &[CombinedCandl
             mode: "scalp".to_string(), // Hardcode to scalp for this backtest
             current_price: combined_candle.m1_close,
             upcoming_events: Some(vec![]), // Assume no news for backtest
+            predictor_model: Some(opt.predictor_model.clone()),
         };
 
         // Process the data through the session to generate signals.

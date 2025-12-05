@@ -1,6 +1,7 @@
 use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
-use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, get_daily_bias, get_trend_bias, rsi, PriceLevel, engines::news_guard};
+use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, get_daily_bias, get_trend_bias, rsi, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache}};
+use tracing::debug;
 
 // --- 1. Engine Architecture: Helper Structs ---
 
@@ -38,7 +39,7 @@ struct Displacement {
 pub struct SwingEngine;
 
 impl SwingEngine {
-    pub fn evaluate(req: &EvalRequest) -> EvalResponse {
+    pub fn evaluate(req: &EvalRequest, predictor_cache: &PredictorCache) -> EvalResponse {
         // --- 0. Data Validation ---
         let (Some(h1_closes), Some(h1_highs), Some(h1_lows)) = (&req.h1_closes, &req.h1_highs, &req.h1_lows) else {
             return EvalResponse { reason: "Missing H1 Data".to_string(), ..Default::default() };
@@ -85,7 +86,7 @@ impl SwingEngine {
 
         // --- 6. Confluence Scoring ---
         let (long_score, short_score, reason_long, reason_short) = Self::confluence_scoring_engine(
-            htf_bias_score, &liquidity, &displacement, &fvg_zones, req.current_price
+            req, htf_bias_score, &liquidity, &displacement, &fvg_zones, req.current_price, predictor_cache
         );
 
         // --- 7. Execution Logic ---
@@ -236,11 +237,13 @@ impl SwingEngine {
 
     /// Combines all analysis into a final conviction score.
     fn confluence_scoring_engine(
+        req: &EvalRequest,
         htf_bias_score: f64,
         liquidity: &LiquidityAnalysis,
         displacement: &Displacement,
         fvg_zones: &Vec<PriceLevel>,
         current_price: f64,
+        predictor_cache: &PredictorCache
     ) -> (f64, f64, String, String) {
         let mut long_score = 0.0;
         let mut short_score = 0.0;
@@ -250,30 +253,30 @@ impl SwingEngine {
         // 1. HTF Bias (Weight: 30)
         if htf_bias_score > 0.0 {
             long_score += htf_bias_score.abs() * 30.0;
-            reason_long.push("HTF_Bullish");
+            reason_long.push("Bullish HTF Bias");
         } else if htf_bias_score < 0.0 {
             short_score += htf_bias_score.abs() * 30.0;
-            reason_short.push("HTF_Bearish");
+            reason_short.push("Bearish HTF Bias");
         }
 
         // 2. SFP Confidence (Weight: 40) - High impact event
         if liquidity.is_sfp_bullish {
             long_score += liquidity.sfp_confidence * 0.4;
-            reason_long.push("SFP_Bullish");
+            reason_long.push("Bullish Liquidity Grab (SFP)");
         }
         if liquidity.is_sfp_bearish {
             short_score += liquidity.sfp_confidence * 0.4;
-            reason_short.push("SFP_Bearish");
+            reason_short.push("Bearish Liquidity Grab (SFP)");
         }
 
         // 3. Displacement Strength (Weight: 30)
         if displacement.is_bullish {
             long_score += displacement.strength * 0.3;
-            reason_long.push("Displacement_Bullish");
+            reason_long.push("Bullish Displacement");
         }
         if displacement.is_bearish {
             short_score += displacement.strength * 0.3;
-            reason_short.push("Displacement_Bearish");
+            reason_short.push("Bearish Displacement");
         }
 
         // 4. FVG Alignment (Weight: 20)
@@ -281,18 +284,55 @@ impl SwingEngine {
         if displacement.is_bullish {
             if fvg_zones.iter().any(|z| z.bottom < current_price && z.is_bullish.unwrap_or(false)) {
                 long_score += 20.0;
-                reason_long.push("FVG_Bullish");
+                reason_long.push("Bullish FVG Support");
             }
         }
         // Bearish FVG created above price after a bearish move
         if displacement.is_bearish {
              if fvg_zones.iter().any(|z| z.top > current_price && !z.is_bullish.unwrap_or(true)) {
                 short_score += 20.0;
-                reason_short.push("FVG_Bearish");
+                reason_short.push("Bearish FVG Resistance");
             }
         }
 
-        (long_score, short_score, reason_long.join("+"), reason_short.join("+"))
+        // --- NEW: Ensemble Prediction Model Bias ---
+        // Load all three models and combine their predictions using confidence weighting.
+        let h1_closes = req.h1_closes.as_ref().map_or(&[][..], |v| v.as_slice());
+        let last_atr = atr(req.h1_highs.as_ref().unwrap(), req.h1_lows.as_ref().unwrap(), h1_closes, 14).last().cloned().unwrap_or(1.0);
+
+        let model_types = ["gbm", "heston", "lstm"];
+        let predictors: Vec<_> = model_types
+            .iter()
+            .map(|&model_type| (model_type, predictor_cache.get_or_load(model_type, "h1")))
+            .collect();
+
+        let mut total_confidence = 0.0;
+        let mut weighted_prediction_sum = 0.0;
+        let mut individual_predictions = Vec::new();
+
+        for (model_type, p) in predictors {
+            let pred_price = p.predict(h1_closes, 1.0).unwrap_or(current_price);
+            let confidence = p.confidence().unwrap_or(0.0);
+            let predicted_change = pred_price - current_price;
+            weighted_prediction_sum += predicted_change * confidence;
+            total_confidence += confidence;
+            individual_predictions.push(format!("{}:{:.4}({:.2})", model_type, predicted_change, confidence));
+        }
+
+        let final_prediction_bias = if total_confidence > 0.0 { weighted_prediction_sum / total_confidence } else { 0.0 };
+
+        // Granular logging for debugging
+        debug!(model_biases = %individual_predictions.join(", "), final_bias = final_prediction_bias, "Ensemble prediction calculated for swing");
+
+        if final_prediction_bias > 0.0 {
+            long_score += 15.0 * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble
+            reason_long.push("Ensemble Bullish Bias");
+        } else {
+            short_score += 15.0 * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
+            reason_short.push("Ensemble Bearish Bias");
+        }
+
+        (long_score, short_score, reason_long.join(" + "), reason_short.join(" + "))
     }
 
     /// Calculates SL and TP based on ATR and setup type.

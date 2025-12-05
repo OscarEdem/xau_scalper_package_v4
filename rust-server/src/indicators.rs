@@ -99,6 +99,8 @@ pub struct EvalRequest {
     // New fields for engine mode
     pub mode: String, // "scalp" or "swing"
     pub current_price: f64,
+    /// The predictor model to use (e.g., "gbm", "heston", "lstm").
+    pub predictor_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]

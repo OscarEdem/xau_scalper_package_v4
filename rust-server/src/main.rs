@@ -11,7 +11,7 @@ use axum::{
 use axum::routing::post;
 use chrono::{NaiveDate, Utc};
 use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
-use std::collections::{VecDeque, BTreeSet};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +36,7 @@ struct HistoricalSignal {
 struct ApplicationState {
     session_manager: SessionManager,
     signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
+    tick_history: Arc<Mutex<VecDeque<String>>>, // NEW: Cache for recent ticks
     push_tokens: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -69,15 +70,57 @@ struct SavePushTokenRequest {
     token: String,
 }
 
+/// Request body for updating a session's configuration.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSessionConfigRequest {
+    /// The name of the predictor model to use (e.g., "gbm", "heston", "lstm").
+    predictor_model: String,
+}
+
+/// Represents a single market tick.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct TickData {
+    symbol: String,
+    bid: f64,
+    ask: f64,
+    timestamp: i64,
+}
+
+/// Wrapper for sending historical ticks to a new WebSocket client.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct HistoryPayload {
+    r#type: String,
+    payload: VecDeque<String>,
+}
 
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
-    paths(process_data_handler, log_trade_handler, get_logs_handler, clear_history_handler, get_latest_signals_handler, get_all_latest_signals_handler, get_signals_handler, confirm_arrival_handler, confirm_execution_handler, save_push_token_handler),
-    components(
-        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest)
+    paths(
+        health_check_handler,
+        process_data_handler,
+        tick_ingest_handler,
+        get_latest_signals_handler,
+        get_all_latest_signals_handler,
+        get_signals_handler,
+        update_session_config_handler,
+        confirm_arrival_handler,
+        confirm_execution_handler,
+        save_push_token_handler,
+        log_trade_handler,
+        get_logs_handler,
+        clear_history_handler
     ),
-    tags((name = "XAU Scalper API", description = "API for XAU/USD Scalping Strategy"))
+    components(
+        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, UpdateSessionConfigRequest, TickData, HistoryPayload)
+    ),
+    info(
+        description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. The WebSocket endpoint at `/ws` streams live tick data as JSON strings. On connection, it first sends a `HistoryPayload` object containing recent ticks."
+    ),
+    tags((name = "Trading Signal API", description = "Endpoints for signal generation, data processing, and session management."))
 )]
 struct ApiDoc;
 
@@ -90,6 +133,7 @@ async fn main() {
     let shared_state = ApplicationState {
         session_manager: SessionManager::default(),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
+        tick_history: Arc::new(Mutex::new(VecDeque::with_capacity(500))), // NEW: Initialize cache
         push_tokens: Arc::new(Mutex::new(BTreeSet::new())),
     };
 
@@ -148,14 +192,15 @@ async fn main() {
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .route("/ws", get(websocket_handler)) // NEW: WebSocket endpoint
-        .route("/health", get(|| async { "OK" }))
+        .route("/ws", get(websocket_handler))
+        .route("/health", get(health_check_handler))
         .route("/data", post(process_data_handler)) // For main analysis
         .route("/ticks", post(tick_ingest_handler)) // NEW: For live ticks
         .route("/signals/:symbol", get(get_latest_signals_handler))
         .route("/signals/latest", get(get_all_latest_signals_handler))
         .route("/signals", get(get_signals_handler))
         // --- Add new routes for logging ---
+        .route("/sessions/:symbol/config", post(update_session_config_handler))
         .route("/confirm_arrival", post(confirm_arrival_handler))
         .route("/confirm_execution", post(confirm_execution_handler))
         .route("/save-push-token", post(save_push_token_handler))
@@ -183,7 +228,34 @@ async fn websocket_handler(
 
 /// The actual WebSocket logic once a connection is upgraded.
 async fn websocket_stream(mut socket: WebSocket, state: ApplicationStateWithTicks) {
-    tracing::info!("New WebSocket client connected.");
+    tracing::info!("New WebSocket client connected. Sending price history...");
+
+    // --- NEW: Send recent tick history on connect ---
+    let history_to_send = {
+        let history = state.inner.tick_history.lock().unwrap_or_else(|e| {
+            tracing::error!("Tick history mutex poisoned in websocket_stream! Recovering. Error: {}", e);
+            e.into_inner()
+        });
+        // The history is already a VecDeque of JSON strings. We just need to wrap them in a JSON array.
+        history.clone()
+    };
+
+    if !history_to_send.is_empty() {
+        // We'll wrap the history in an object to make it distinguishable from live ticks on the client.
+        let history_payload = serde_json::json!({
+            "type": "history",
+            "payload": history_to_send // This is already a VecDeque<String>
+        });
+
+        if let Ok(json_string) = serde_json::to_string(&history_payload) {
+            if socket.send(Message::Text(json_string)).await.is_err() {
+                tracing::info!("Failed to send initial price history to WebSocket client; it may have disconnected immediately.");
+                return; // Client is gone, no need to proceed.
+            }
+        }
+    }
+    // --- END NEW ---
+
     let mut rx = state.tick_tx.subscribe();
 
     while let Ok(msg) = rx.recv().await {
@@ -195,11 +267,31 @@ async fn websocket_stream(mut socket: WebSocket, state: ApplicationStateWithTick
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses((status = 200, description = "Server is running"))
+)]
+/// Simple health check endpoint.
+async fn health_check_handler() -> &'static str { "OK" }
+
 /// New handler to ingest a single tick via HTTP POST and broadcast it.
 async fn tick_ingest_handler(
     State(state): State<ApplicationStateWithTicks>,
     tick_json: String, // Axum can receive the raw body as a String
 ) -> StatusCode {
+    // --- NEW: Add the incoming tick to our history cache ---
+    const MAX_TICK_HISTORY: usize = 500;
+    if !tick_json.is_empty() {
+        let mut history = state.inner.tick_history.lock().unwrap_or_else(|e| {
+            tracing::error!("Tick history mutex poisoned in tick_ingest_handler! Recovering. Error: {}", e);
+            e.into_inner()
+        });
+        history.push_back(tick_json.clone());
+        if history.len() > MAX_TICK_HISTORY {
+            history.pop_front();
+        }
+    }
     if !tick_json.is_empty() {
         // Send this JSON string to all connected WebSocket clients
         if state.tick_tx.send(tick_json).is_err() {
@@ -210,6 +302,19 @@ async fn tick_ingest_handler(
     }
     StatusCode::OK
 }
+
+/// This is a trick for utoipa to document the raw JSON body of `tick_ingest_handler`.
+#[utoipa::path(
+    post,
+    path = "/ticks",
+    request_body(content = TickData, description = "A single market tick in JSON format", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Tick received and broadcasted successfully"),
+    ),
+    tag = "Trading Signal API"
+)]
+#[allow(dead_code)]
+async fn documented_tick_ingest_handler() {}
 
 // We need to add the broadcast sender to our application state
 #[derive(Clone)]
@@ -323,7 +428,7 @@ async fn process_data_handler(
         let (old_scalp_sig, old_swing_sig) = session.get_latest_signals();
 
         // Process data, which updates the signals within the session
-        session.on_data(&req);
+        session.on_data(&req, &state.inner.predictor_cache);
 
         // Now, get the new signals and add them to history
         let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
@@ -400,6 +505,41 @@ async fn send_push_notification(
     match client.send_push_notifications(messages).await {
         Ok(receipts) => tracing::info!("Push notifications sent successfully: {:?}", receipts),
         Err(e) => tracing::error!("Failed to send push notifications: {:?}", e),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/sessions/{symbol}/config",
+    params(
+        ("symbol" = String, Path, description = "The trading symbol to configure, e.g., XAUUSD")
+    ),
+    request_body = UpdateSessionConfigRequest,
+    responses(
+        (status = 200, description = "Session configuration updated successfully"),
+        (status = 404, description = "No session found for the specified symbol")
+    )
+)]
+/// Handler to update the configuration for a specific trading session.
+async fn update_session_config_handler(
+    State(state): State<ApplicationStateWithTicks>,
+    Path(symbol): Path<String>,
+    Json(body): Json<UpdateSessionConfigRequest>,
+) -> Result<Json<&'static str>, StatusCode> {
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
+
+    if let Some(session) = sessions.get_mut(&symbol) {
+        tracing::info!(
+            symbol = %symbol,
+            old_model = %session.predictor_model,
+            new_model = %body.predictor_model,
+            "Updating predictor model for session."
+        );
+        session.predictor_model = body.predictor_model;
+        Ok(Json("Session configuration updated"))
+    } else {
+        tracing::warn!("Attempted to configure non-existent session for symbol: {}", symbol);
+        Err(StatusCode::NOT_FOUND)
     }
 }
 

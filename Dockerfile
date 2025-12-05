@@ -31,15 +31,18 @@ COPY --from=builder /app/rust-server/target/release/backtest /usr/local/bin/back
 # Expose the port the app runs on (as seen in main.rs)
 EXPOSE 3000
 
-# Copy the CSV data into the final image
+# Set a working directory for the application
+WORKDIR /app
+
+# Copy the CSV data and all model assets (configs, ONNX files, etc.) into the final image.
+# Copying the entire `engines` directory ensures all current and future models are included.
 COPY m1_data.csv /app/m1_data.csv
 COPY m5_data.csv /app/m5_data.csv
+COPY rust-server/src/engines /app/src/engines
 
 # Convert the tab-delimited data to comma-separated for the backtester
-# This awk script does two things:
-# 1. NR==1: For the first record (the header), it prints the correct CSV headers.
-# 2. NR>1: For all other records, it prints the required columns.
-# We now process both M1 and M5 files.
+# This is a more robust way to convert TSV to CSV than using awk.
+# It handles the header and data separately and combines them.
 RUN dos2unix /app/m1_data.csv && \
     dos2unix /app/m5_data.csv && \
     (head -n 1 /app/m1_data.csv | tr '\t' ',' && tail -n +2 /app/m1_data.csv | tr '\t' ',') > /app/m1_data_comma.csv && \

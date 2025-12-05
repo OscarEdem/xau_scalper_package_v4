@@ -1,5 +1,6 @@
 use crate::{
     engines::{scalp::ScalpEngine, swing::SwingEngine},
+    engines::predictor_cache::PredictorCache,
     EvalRequest, EvalResponse, OpenPosition, TradeLog,
 };
 use std::collections::{HashMap, VecDeque};
@@ -35,6 +36,8 @@ pub struct TradingSession {
     /// Configuration flag for cross-engine filtering.
     /// If true, scalp signals will only be considered if they align with the swing trend.
     pub filter_scalp_by_swing: bool,
+    /// The predictor model to use for this session (e.g., "gbm", "lstm").
+    pub predictor_model: String,
 
     // --- State Data ---
     last_evaluation_timestamp: i64,
@@ -76,6 +79,7 @@ impl TradingSession {
         Self {
             symbol,
             filter_scalp_by_swing,
+            predictor_model: "gbm".to_string(), // Default to GBM
             last_evaluation_timestamp: 0,
             swing_trend: TrendDirection::Sideways,
             m1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
@@ -108,7 +112,7 @@ impl TradingSession {
 
     /// The main entry point for processing new data for this session.
     /// It updates internal buffers and then runs both trading engines.
-    pub fn on_data(&mut self, req: &EvalRequest) {
+    pub fn on_data(&mut self, req: &EvalRequest, predictor_cache: &PredictorCache) {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
         // 1. Update data buffers with the latest candle data from the request.
@@ -132,7 +136,7 @@ impl TradingSession {
 
         // 2. Run the Swing Engine first to establish the higher-timeframe context.
         let swing_req = self.build_engine_request("swing");
-        let swing_signal = SwingEngine::evaluate(&swing_req);
+        let swing_signal = SwingEngine::evaluate(&swing_req, predictor_cache);
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
 
         // Update the session's swing trend based on the new signal.
@@ -141,7 +145,7 @@ impl TradingSession {
 
         // 3. Run the Scalp Engine.
         let scalp_req = self.build_engine_request_with_params("scalp", req);
-        let mut scalp_signal = ScalpEngine::evaluate(&scalp_req);
+        let mut scalp_signal = ScalpEngine::evaluate(&scalp_req, predictor_cache);
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
         // 4. Apply cross-engine filtering if enabled.
@@ -284,6 +288,7 @@ impl TradingSession {
         engine_req.kf_process_noise = original_req.kf_process_noise;
         engine_req.kf_measurement_noise = original_req.kf_measurement_noise;
         engine_req.upcoming_events = original_req.upcoming_events.clone();
+        engine_req.predictor_model = Some(self.predictor_model.clone());
         // ... propagate other optional params as needed ...
         engine_req
     }
@@ -328,6 +333,11 @@ impl TradingSession {
     /// Returns a clone of the trade logs for this session.
     pub fn get_trade_logs(&self) -> VecDeque<TradeLog> {
         self.trade_logs.clone()
+    }
+
+    /// Clears all trade logs for this session.
+    pub fn clear_trade_logs(&mut self) {
+        self.trade_logs.clear();
     }
 }
 

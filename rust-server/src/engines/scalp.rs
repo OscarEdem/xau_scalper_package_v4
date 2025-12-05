@@ -1,11 +1,12 @@
 use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
-use crate::{adx, get_trend_bias, engines::news_guard};
+use crate::{adx, get_trend_bias, engines::{news_guard, predictor_cache::PredictorCache}};
+use tracing::debug;
 
 pub struct ScalpEngine;
 
 impl ScalpEngine {
-    pub fn evaluate(req: &EvalRequest) -> EvalResponse {
+    pub fn evaluate(req: &EvalRequest, predictor_cache: &PredictorCache) -> EvalResponse {
         // ---- SAFETY: ensure enough data ----
         let m5_closes = &req.m5_closes;
         let m1_closes = &req.closes; // m1 for triggers
@@ -95,54 +96,96 @@ impl ScalpEngine {
         let is_bear_m1 = norm_m1_surge < -(m1_surge_threshold * 0.5);
 
         // Compose a score (weights chosen conservatively)
+        let mut long_reasons = Vec::new();
         let mut long_score = 0.0;
+        let mut short_reasons = Vec::new();
         let mut short_score = 0.0;
 
         // Bias weighting: if higher timeframe bias exists, give it weight
-        let bias_weight: f64 = if bias > 0 { 0.2 } else if bias < 0 { -0.2 } else { 0.0 };
+        if bias > 0 {
+            long_score += 0.2;
+            long_reasons.push("HTF Bullish Bias");
+        } else if bias < 0 {
+            short_score += 0.2;
+            short_reasons.push("HTF Bearish Bias");
+        }
+
+        // ---- NEW: Ensemble Prediction Model Bias ----
+        // Load all three models and combine their predictions using confidence weighting.
+        let model_types = ["gbm", "heston", "lstm"];
+        let predictors: Vec<_> = model_types
+            .iter()
+            .map(|&model_type| (model_type, predictor_cache.get_or_load(model_type, "m5")))
+            .collect();
+
+        let mut total_confidence = 0.0;
+        let mut weighted_prediction_sum = 0.0;
+        let mut individual_predictions = Vec::new();
+
+        for (model_type, p) in predictors {
+            let pred_price = p.predict(m5_closes, 1.0 / 60.0).unwrap_or(req.current_price);
+            let confidence = p.confidence().unwrap_or(0.0);
+            // Use the predicted *change* for weighting
+            let predicted_change = pred_price - req.current_price;
+            weighted_prediction_sum += predicted_change * confidence;
+            total_confidence += confidence;
+            individual_predictions.push(format!("{}:{:.4}({:.2})", model_type, predicted_change, confidence));
+        }
+
+        let final_prediction_bias = if total_confidence > 0.0 { weighted_prediction_sum / total_confidence } else { 0.0 };
+
+        // Granular logging for debugging
+        debug!(model_biases = %individual_predictions.join(", "), final_bias = final_prediction_bias, "Ensemble prediction calculated");
+
+        if final_prediction_bias > 0.0 {
+            long_score += 0.15 * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble
+            long_reasons.push("Ensemble Bullish Bias");
+        } else {
+            short_score += 0.15 * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
+            short_reasons.push("Ensemble Bearish Bias");
+        }
 
         // Kalman flow contributes to continuation score
         if is_bull_flow {
             long_score += kalman_score * 0.5;
+            long_reasons.push("Bullish M5 Flow");
         }
         if is_bear_flow {
             short_score += kalman_score * 0.5;
+            short_reasons.push("Bearish M5 Flow");
         }
 
         // M1 surge gives timing confirmation
         if is_bull_m1 {
             long_score += m1_score * 0.35;
+            long_reasons.push("M1 Bullish Surge");
         }
         if is_bear_m1 {
             short_score += m1_score * 0.35;
+            short_reasons.push("M1 Bearish Surge");
         }
 
-        // Inducement (reversal) adds weight but must be aligned with bias
+        // Inducement (reversal) adds weight
         if inducement.as_str() == "bullish_inducement" {
-            long_score += 0.6 * inducement_score; // strong but not absolute
-            short_score *= 0.5; // reduce opposing score to avoid contradiction
+            long_score += 0.6 * inducement_score; // inducement_score is 1.0 here
+            long_reasons.push("Bullish Inducement");
+            short_score *= 0.5; // Reduce opposing score
         } else if inducement.as_str() == "bearish_inducement" {
-            short_score += 0.6 * inducement_score;
-            long_score *= 0.5;
-        }
-
-        // Add timeframe bias to tilt the final score
-        if bias > 0 {
-            long_score += bias_weight.abs(); // small nudge
-        } else if bias < 0 {
-            short_score += bias_weight.abs();
+            short_score += 0.6 * inducement_score; // inducement_score is 1.0 here
+            short_reasons.push("Bearish Inducement");
+            long_score *= 0.5; // Reduce opposing score
         }
 
         // Map raw scores [0..~1.5] to conviction % using a conservative scaler
         let conv_long = (1.0 / (1.0 + (-6.0 * (long_score - 0.6)).exp())) * 100.0; // logistic mapping
         let conv_short = (1.0 / (1.0 + (-6.0 * (short_score - 0.6)).exp())) * 100.0;
 
-        // Decide side if above minimum conviction threshold
+        // Decide side and final reason if above minimum conviction threshold
         let min_conv_to_trade = 45.0; // tuned conservatively
         let (entry_type, conviction, reason) = if conv_long >= min_conv_to_trade && conv_long > conv_short {
-            ("long".to_string(), conv_long, "Composite_Long".to_string())
+            ("long".to_string(), conv_long, long_reasons.join(" + "))
         } else if conv_short >= min_conv_to_trade && conv_short > conv_long {
-            ("short".to_string(), conv_short, "Composite_Short".to_string())
+            ("short".to_string(), conv_short, short_reasons.join(" + "))
         } else {
             return EvalResponse { reason: "No Signal (low conviction)".to_string(), ..Default::default() };
         };
@@ -184,13 +227,6 @@ impl ScalpEngine {
             return EvalResponse { reason: "No Signal (SL sanity check failed)".to_string(), ..Default::default() };
         }
 
-        // ---- Build EvalResponse with metadata useful for calibration ----
-        // Populate conviction and include feature snapshot in reason (concise)
-        let meta_reason = format!(
-            "{}|k_slope_norm={:.4}|m1_norm={:.4}|atr={:.4}|conv={:.1}",
-            reason, norm_k_slope, norm_m1_surge, last_atr, conviction
-        );
-
         EvalResponse {
             signal_id: Uuid::new_v4().to_string(),
             entry_type,
@@ -198,7 +234,7 @@ impl ScalpEngine {
             sl_price: sl,
             tp1_price: tp1,
             tp2_price: tp2,
-            reason: meta_reason,
+            reason,
             classification: "scalp_v2_adaptive".to_string(),
             conviction_score: Some(conviction),
             recommended_order_type,

@@ -4,7 +4,8 @@
 
 # Generated data files
 # This file is created by the Dockerfile or convert.ps1 from xauusd_m1_data.csv
-/rust-server/data.csv
+/rust-server/m1_data.csv
+/rust-server/m5_data.csv
 
 # Ignore local command history or notes
 /command.txt
