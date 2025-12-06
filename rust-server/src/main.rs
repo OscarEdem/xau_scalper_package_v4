@@ -11,8 +11,10 @@ use axum::{
 use axum::routing::post;
 use chrono::{NaiveDate, Utc};
 use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
+use tokio::fs; // Use tokio's async fs module
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 use utoipa::{OpenApi};
@@ -22,7 +24,10 @@ pub use xau_scalper_server::{
     ExecutionConfirmation, HistoryParams, HistoryResponse, HistoryStats, TradeLog, PriceLevel, VwapBands
 };
 
-/// A wrapper to store a signal with its creation timestamp for historical logging.
+const MAX_TICK_HISTORY: usize = 10000;
+const HISTORY_PAGE_SIZE: usize = 1000;
+const PUSH_TOKENS_FILE: &str = "push_tokens.json";
+
 #[derive(serde::Serialize, utoipa::ToSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 struct HistoricalSignal {
@@ -35,9 +40,11 @@ struct HistoricalSignal {
 #[derive(Clone)]
 struct ApplicationState {
     session_manager: SessionManager,
+    predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache,
     signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
     tick_history: Arc<Mutex<VecDeque<String>>>, // NEW: Cache for recent ticks
     push_tokens: Arc<Mutex<BTreeSet<String>>>,
+    ws_clients: Arc<AtomicUsize>,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -96,13 +103,22 @@ struct HistoryPayload {
     payload: VecDeque<String>,
 }
 
+/// Incoming message from a WebSocket client to request historical data.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WsClientRequest {
+    r#type: String,
+    /// The page number to retrieve (0-indexed).
+    page: usize,
+}
+
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
     paths(
         health_check_handler,
         process_data_handler,
-        tick_ingest_handler,
+        documented_tick_ingest_handler,
         get_latest_signals_handler,
         get_all_latest_signals_handler,
         get_signals_handler,
@@ -129,12 +145,28 @@ async fn main() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // --- NEW: Load push tokens from file on startup ---
+    let initial_push_tokens = match fs::read_to_string(PUSH_TOKENS_FILE).await {
+        Ok(content) => {
+            let tokens: BTreeSet<String> = serde_json::from_str(&content).unwrap_or_default();
+            tracing::info!("Loaded {} push notification tokens from {}", tokens.len(), PUSH_TOKENS_FILE);
+            tokens
+        }
+        Err(_) => {
+            tracing::info!("No '{}' file found. Starting with an empty set of push tokens.", PUSH_TOKENS_FILE);
+            BTreeSet::new()
+        }
+    };
+
     // Initialize the shared state
     let shared_state = ApplicationState {
         session_manager: SessionManager::default(),
+        predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::default(),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
-        tick_history: Arc::new(Mutex::new(VecDeque::with_capacity(500))), // NEW: Initialize cache
-        push_tokens: Arc::new(Mutex::new(BTreeSet::new())),
+        tick_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_TICK_HISTORY))), // NEW: Initialize cache
+        // Use the tokens loaded from the file
+        push_tokens: Arc::new(Mutex::new(initial_push_tokens)),
+        ws_clients: Arc::new(AtomicUsize::new(0)),
     };
 
     // --- Background task for stale signal cleanup (invalidates signals in live sessions) ---
@@ -162,21 +194,21 @@ async fn main() {
         }
     });
 
-    // --- NEW: Background task for 24-hour signal history cleanup ---
+    // --- Background task for 12-hour signal history cleanup ---
     let history_cleanup_state = shared_state.clone();
     tokio::spawn(async move {
         loop {
             // Check every hour
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             let now = Utc::now().timestamp();
-            const ONE_DAY_IN_SECONDS: i64 = 24 * 60 * 60;
+            const TWELVE_HOURS_IN_SECONDS: i64 = 12 * 60 * 60;
 
             if let Ok(mut history) = history_cleanup_state.signal_history.lock() {
                 let original_len = history.len();
-                history.retain(|hs| (now - hs.created_at) < ONE_DAY_IN_SECONDS);
+                history.retain(|hs| (now - hs.created_at) < TWELVE_HOURS_IN_SECONDS);
                 let removed_count = original_len - history.len();
                 if removed_count > 0 {
-                    tracing::info!("Removed {} signals from history older than 24 hours.", removed_count);
+                    tracing::info!("Removed {} signals from history older than 12 hours.", removed_count);
                 }
             }
         }
@@ -188,7 +220,7 @@ async fn main() {
     let (tick_tx, _) = broadcast::channel::<String>(100);
 
     // Add the tick_tx channel to the application state so the handler can access it.
-    let app_state_with_ticks = shared_state.with_ticks(tick_tx);
+    let app_state_with_ticks = Arc::new(shared_state.with_ticks(tick_tx));
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -207,6 +239,7 @@ async fn main() {
         .route("/log_trade", post(log_trade_handler))
         // --- The history endpoint is now more powerful ---
         .route("/history", get(get_logs_handler).delete(clear_history_handler))
+        .route("/models/loaded", get(get_loaded_models_handler))
         // Provide the state (including the tick channel) to the handlers
         .with_state(app_state_with_ticks);
 
@@ -221,35 +254,48 @@ async fn main() {
 /// Axum handler for WebSocket connections.
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(|socket| websocket_stream(socket, state))
 }
 
 /// The actual WebSocket logic once a connection is upgraded.
-async fn websocket_stream(mut socket: WebSocket, state: ApplicationStateWithTicks) {
-    tracing::info!("New WebSocket client connected. Sending price history...");
+async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWithTicks>) {
+    // Increment the active WS client counter and log the new total
+    let prev = state.inner.ws_clients.fetch_add(1, Ordering::SeqCst);
+    let new_total = prev + 1;
+    tracing::info!("New WebSocket client connected. Sending price history... total_clients={}", new_total);
 
     // --- NEW: Send recent tick history on connect ---
-    let history_to_send = {
+    // We only send the most recent `HISTORY_PAGE_SIZE` ticks initially.
+    let initial_history_vec = {
         let history = state.inner.tick_history.lock().unwrap_or_else(|e| {
             tracing::error!("Tick history mutex poisoned in websocket_stream! Recovering. Error: {}", e);
             e.into_inner()
         });
-        // The history is already a VecDeque of JSON strings. We just need to wrap them in a JSON array.
-        history.clone()
+
+        let start_index = history.len().saturating_sub(HISTORY_PAGE_SIZE);
+
+        // Parse each stored JSON string into a serde_json::Value. If parsing fails, skip that entry.
+        history
+            .range(start_index..)
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .collect::<Vec<serde_json::Value>>()
     };
 
-    if !history_to_send.is_empty() {
-        // We'll wrap the history in an object to make it distinguishable from live ticks on the client.
+    if !initial_history_vec.is_empty() {
+        // Send history as an array of JSON objects (no double-parse required on client)
         let history_payload = serde_json::json!({
-            "type": "history",
-            "payload": history_to_send // This is already a VecDeque<String>
+            "type": "history_page",
+            "payload": initial_history_vec
         });
 
         if let Ok(json_string) = serde_json::to_string(&history_payload) {
             if socket.send(Message::Text(json_string)).await.is_err() {
                 tracing::info!("Failed to send initial price history to WebSocket client; it may have disconnected immediately.");
+                // Decrement counter since the client is gone
+                let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                tracing::info!("WebSocket client disconnected during initial send. remaining_clients={}", remaining);
                 return; // Client is gone, no need to proceed.
             }
         }
@@ -257,12 +303,86 @@ async fn websocket_stream(mut socket: WebSocket, state: ApplicationStateWithTick
     // --- END NEW ---
 
     let mut rx = state.tick_tx.subscribe();
+    // Keepalive ping interval to avoid idle connection closures by proxies
+    let mut keepalive = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
-    while let Ok(msg) = rx.recv().await {
-        if socket.send(Message::Text(msg)).await.is_err() {
-            // Client disconnected
-            tracing::info!("WebSocket client disconnected.");
-            break;
+    loop {
+        tokio::select! {
+            biased;
+            // Prefer processing ticks when they arrive
+            recv = rx.recv() => {
+                match recv {
+                    Ok(msg) => {
+                        if socket.send(Message::Text(msg)).await.is_err() {
+                            let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                            tracing::info!("WebSocket client disconnected while sending tick. remaining_clients={}", remaining);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!("WebSocket subscriber lagged; skipped {} messages", skipped);
+                        // continue listening for new messages
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("Tick broadcast channel closed; ending websocket stream.");
+                        break;
+                    }
+                }
+            }
+            _ = keepalive.tick() => {
+                // send a ping frame to keep the connection alive through proxies
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                    tracing::info!("WebSocket client disconnected during keepalive ping. remaining_clients={}", remaining);
+                    break;
+                }
+            }
+            // --- NEW: Handle incoming messages from the client ---
+            Some(msg) = socket.recv() => {
+                if let Ok(Message::Text(text)) = msg {
+                    // Attempt to parse the client's request for a history page
+                    if let Ok(request) = serde_json::from_str::<WsClientRequest>(&text) {
+                        if request.r#type == "get_history" {
+                            tracing::info!("Client requested history page: {}", request.page);
+
+                            let history_page = {
+                                let history = state.inner.tick_history.lock().unwrap_or_else(|e| e.into_inner());
+                                let total_items = history.len();
+
+                                // Calculate the start and end indices for the requested page.
+                                // Pages are requested from newest to oldest, so page 0 is the latest data.
+                                let end = total_items.saturating_sub(request.page * HISTORY_PAGE_SIZE);
+                                let start = end.saturating_sub(HISTORY_PAGE_SIZE);
+
+                                history
+                                    .range(start..end)
+                                    .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                                    .collect::<Vec<serde_json::Value>>()
+                            };
+
+                            if !history_page.is_empty() {
+                                let payload = serde_json::json!({
+                                    "type": "history_page",
+                                    "page": request.page,
+                                    "payload": history_page,
+                                });
+                                if let Ok(json_string) = serde_json::to_string(&payload) {
+                                    if socket.send(Message::Text(json_string)).await.is_err() {
+                                        let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                                        tracing::info!("WebSocket client disconnected while sending history page. remaining_clients={}", remaining);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(Message::Close(_)) = msg {
+                    let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                    tracing::info!("WebSocket client sent close frame. remaining_clients={}", remaining);
+                    break;
+                }
+            }
         }
     }
 }
@@ -277,11 +397,10 @@ async fn health_check_handler() -> &'static str { "OK" }
 
 /// New handler to ingest a single tick via HTTP POST and broadcast it.
 async fn tick_ingest_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     tick_json: String, // Axum can receive the raw body as a String
 ) -> StatusCode {
     // --- NEW: Add the incoming tick to our history cache ---
-    const MAX_TICK_HISTORY: usize = 500;
     if !tick_json.is_empty() {
         let mut history = state.inner.tick_history.lock().unwrap_or_else(|e| {
             tracing::error!("Tick history mutex poisoned in tick_ingest_handler! Recovering. Error: {}", e);
@@ -349,29 +468,46 @@ impl ApplicationState {
 )]
 /// Handler to receive and store a push notification token from a client app.
 async fn save_push_token_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(body): Json<SavePushTokenRequest>,
 ) -> (StatusCode, Json<&'static str>) {
     if body.token.is_empty() || !body.token.starts_with("ExponentPushToken[") {
         return (StatusCode::BAD_REQUEST, Json("Invalid push token format"));
     }
 
-    let mut tokens = state.inner.push_tokens.lock().unwrap();
-    tokens.insert(body.token);
-    tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
+    let mut tokens = state.inner.push_tokens.lock().unwrap_or_else(|e| {
+        tracing::error!("Push tokens mutex poisoned; recovering. Error: {}", e);
+        e.into_inner()
+    });
+    let inserted = tokens.insert(body.token);
 
-    (StatusCode::OK, Json("Token saved"))
+    // --- NEW: Persist tokens to file if a new one was added ---
+    if inserted {
+        tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
+        // Clone the tokens to write them to the file without holding the lock.
+        let tokens_to_save = tokens.clone();
+        // In a separate task to avoid blocking the response.
+        tokio::spawn(async move {
+            if let Ok(json) = serde_json::to_string(&tokens_to_save) {
+                if let Err(e) = fs::write(PUSH_TOKENS_FILE, json).await {
+                    tracing::error!("Failed to write push tokens to file: {}", e);
+                }
+            }
+        });
+    }
+
+    (StatusCode::OK, Json("Token processed"))
 }
 
 #[utoipa::path(
     get,
     path = "/signals",
     responses(
-        (status = 200, description = "Returns a log of all signals generated in the last 24 hours", body = Vec<HistoricalSignal>)
+        (status = 200, description = "Returns a log of all signals generated in the last 12 hours", body = Vec<HistoricalSignal>)
     )
 )]
-/// Handler to return a log of all signals generated in the last 24 hours.
-async fn get_signals_handler(State(state): State<ApplicationStateWithTicks>) -> Json<Vec<HistoricalSignal>> {
+/// Handler to return a log of all signals generated in the last 12 hours.
+async fn get_signals_handler(State(state): State<Arc<ApplicationStateWithTicks>>) -> Json<Vec<HistoricalSignal>> {
     let history = state.inner.signal_history.lock().unwrap_or_else(|e| {
         tracing::error!("Signal history mutex poisoned! Recovering. Error: {}", e);
         e.into_inner()
@@ -391,8 +527,9 @@ async fn get_signals_handler(State(state): State<ApplicationStateWithTicks>) -> 
         (status = 200, description = "Data processed successfully")
     )
 )]
+#[axum::debug_handler]
 async fn process_data_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<EvalRequest>,
 ) -> (StatusCode, Json<&'static str>) {
     tracing::info!(
@@ -401,6 +538,35 @@ async fn process_data_handler(
         closes_count = req.closes.len(),
         "Received data processing request"
     );
+
+    // Also broadcast this incoming data as a tick-like message to any connected WebSocket clients
+    // and store it in the tick history so newly-connected clients receive recent data.
+    // We construct a simple JSON payload that the WS clients expect (stringified JSON).
+    let tick_payload = serde_json::json!({
+        "type": "tick",
+        "symbol": req.symbol.clone(),
+        "currentPrice": req.current_price,
+        "spreadPoints": req.spread_points.unwrap_or(0.0),
+        "lastM1Timestamp": req.last_m1_timestamp,
+    })
+    .to_string();
+
+    // Push into the in-memory tick history (bounded) and broadcast to clients. If the mutex
+    // is poisoned we recover and continue processing but log the error.
+    {
+        let mut history = state.inner.tick_history.lock().unwrap_or_else(|e| {
+            tracing::error!("Tick history mutex poisoned in process_data_handler: {}", e);
+            e.into_inner()
+        });
+        history.push_back(tick_payload.clone());
+        if history.len() > MAX_TICK_HISTORY {
+            history.pop_front();
+        }
+    }
+    // Broadcast to any connected WebSocket clients. If there are none, this returns Err and we log.
+    if state.tick_tx.send(tick_payload).is_err() {
+        tracing::debug!("No active WebSocket clients to broadcast tick to.");
+    }
 
     // For now, we assume a global config for filtering. This could also be part of the request.
     let filter_scalp_by_swing = true;
@@ -480,7 +646,10 @@ async fn send_push_notification(
     signal: &EvalResponse,
     symbol: &str,
 ) {
-    let tokens = tokens_arc.lock().unwrap().clone();
+    let tokens = tokens_arc.lock().unwrap_or_else(|e| {
+        tracing::error!("Push tokens mutex poisoned in send_push_notification; recovering. Error: {}", e);
+        e.into_inner()
+    }).clone();
     if tokens.is_empty() {
         tracing::warn!("Skipping push notification for signal ID: {}. No push tokens are registered.", signal.signal_id);
         return;
@@ -522,11 +691,14 @@ async fn send_push_notification(
 )]
 /// Handler to update the configuration for a specific trading session.
 async fn update_session_config_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Path(symbol): Path<String>,
     Json(body): Json<UpdateSessionConfigRequest>,
 ) -> Result<Json<&'static str>, StatusCode> {
-    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned while updating config; recovering. Error: {}", e);
+        e.into_inner()
+    });
 
     if let Some(session) = sessions.get_mut(&symbol) {
         tracing::info!(
@@ -556,7 +728,7 @@ async fn update_session_config_handler(
 )]
 /// Handler to return the last generated signals for a specific symbol.
 async fn get_latest_signals_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Path(symbol): Path<String>,
 ) -> Result<Json<LatestSignalsResponse>, StatusCode> {
     let sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
@@ -585,7 +757,7 @@ async fn get_latest_signals_handler(
 )]
 /// Handler to return the latest signals for all active symbols.
 async fn get_all_latest_signals_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
 ) -> Json<Vec<LatestSignalsForSymbol>> {
     let sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
         tracing::error!("Session manager mutex poisoned in get_all_latest_signals_handler! Recovering. Error: {}", e);
@@ -608,6 +780,14 @@ async fn get_all_latest_signals_handler(
     }
 
     Json(all_signals)
+}
+
+#[axum::debug_handler]
+async fn get_loaded_models_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+) -> Json<Vec<String>> {
+    let keys = state.inner.predictor_cache.loaded_keys();
+    Json(keys)
 }
 
 
@@ -661,10 +841,13 @@ async fn confirm_execution_handler(
 )]
 /// Handler to receive and store a trade log from the MQL5 EA
 async fn log_trade_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(log): Json<TradeLog>,
 ) -> Json<&'static str> {
-    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned in clear_history_handler; recovering. Error: {}", e);
+        e.into_inner()
+    });
     if let Some(session) = sessions.get_mut(&log.symbol) {
         session.add_trade_log(log);
         tracing::info!(
@@ -692,12 +875,15 @@ async fn log_trade_handler(
 )]
 /// Handler to return all stored trade logs
 async fn get_logs_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
     Query(mut params): Query<HistoryParams>,
 ) -> Json<HistoryResponse> {
     // If a symbol is provided, get logs for that symbol. Otherwise, get all logs.
     let symbol_filter = params.symbol.take();
-    let sessions = state.inner.session_manager.sessions.lock().unwrap();
+    let sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned in get_latest_signals_handler; recovering. Error: {}", e);
+        e.into_inner()
+    });
 
     let logs: Vec<TradeLog> = if let Some(symbol) = symbol_filter {
         sessions.get(&symbol).map_or(vec![], |s| s.get_trade_logs().into())
@@ -772,14 +958,17 @@ async fn get_logs_handler(
 )]
 /// Handler to clear all stored trade logs.
 async fn clear_history_handler(
-    State(state): State<ApplicationStateWithTicks>,
+    State(state): State<Arc<ApplicationStateWithTicks>>,
 ) -> (StatusCode, Json<&'static str>) {
-    let mut sessions = state.inner.session_manager.sessions.lock().unwrap();
+    let mut sessions = state.inner.session_manager.sessions.lock().unwrap_or_else(|e| {
+        tracing::error!("Session manager mutex poisoned in clear_history_handler; recovering. Error: {}", e);
+        e.into_inner()
+    });
     let mut cleared_count = 0;
     for session in sessions.values_mut() {
         if !session.get_trade_logs().is_empty() {
-            session.invalidate_signals(); // Also clear logs from session, assuming this is desired
-            cleared_count += 1;
+            session.clear_trade_logs(); // Correctly clear the trade logs
+            cleared_count += 1; // Count how many sessions had logs cleared
         }
     }
     tracing::info!("Trade history cleared manually for {} sessions.", cleared_count);

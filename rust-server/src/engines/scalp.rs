@@ -1,6 +1,6 @@
 use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
-use crate::{adx, get_trend_bias, engines::{news_guard, predictor_cache::PredictorCache}};
+use crate::{adx, get_trend_bias, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}};
 use tracing::debug;
 
 pub struct ScalpEngine;
@@ -111,31 +111,14 @@ impl ScalpEngine {
         }
 
         // ---- NEW: Ensemble Prediction Model Bias ----
-        // Load all three models and combine their predictions using confidence weighting.
-        let model_types = ["gbm", "heston", "lstm"];
-        let predictors: Vec<_> = model_types
-            .iter()
-            .map(|&model_type| (model_type, predictor_cache.get_or_load(model_type, "m5")))
-            .collect();
-
-        let mut total_confidence = 0.0;
-        let mut weighted_prediction_sum = 0.0;
-        let mut individual_predictions = Vec::new();
-
-        for (model_type, p) in predictors {
-            let pred_price = p.predict(m5_closes, 1.0 / 60.0).unwrap_or(req.current_price);
-            let confidence = p.confidence().unwrap_or(0.0);
-            // Use the predicted *change* for weighting
-            let predicted_change = pred_price - req.current_price;
-            weighted_prediction_sum += predicted_change * confidence;
-            total_confidence += confidence;
-            individual_predictions.push(format!("{}:{:.4}({:.2})", model_type, predicted_change, confidence));
-        }
-
-        let final_prediction_bias = if total_confidence > 0.0 { weighted_prediction_sum / total_confidence } else { 0.0 };
-
-        // Granular logging for debugging
-        debug!(model_biases = %individual_predictions.join(", "), final_bias = final_prediction_bias, "Ensemble prediction calculated");
+        let final_prediction_bias = ensemble_predictor::calculate_bias(
+            predictor_cache,
+            "m5",
+            m5_closes,
+            req.current_price,
+            1.0 / 60.0, // Scalp prediction for next minute
+        );
+        debug!(bias = final_prediction_bias, "Scalp ensemble prediction calculated");
 
         if final_prediction_bias > 0.0 {
             long_score += 0.15 * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble

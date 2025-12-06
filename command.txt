@@ -2,7 +2,9 @@ docker build -t xau-scalper-v4:latest .
 
 docker run --rm xau-scalper-v4:latest backtest --m1-file /app/m1_data_comma.csv --m5-file /app/m5_data_comma.csv
 
-
+# from repo root
+cd rust-server
+cargo build --release
 
 
 Best Result (Optimized for Sharpe Ratio) ---

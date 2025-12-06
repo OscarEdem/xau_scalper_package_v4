@@ -1,38 +1,55 @@
-use super::predictor::{self, Predictor};
+use super::predictor::{load_predictor, Predictor};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::info;
 
-type PredictorKey = (String, String);
-
-/// A thread-safe, caching loader for predictor models.
+/// A thread-safe, concurrent cache for predictor models.
 ///
-/// This struct holds predictor models in memory after their first load,
-/// preventing repeated and expensive file I/O and deserialization on every request.
+/// This struct holds initialized predictor models in memory to avoid the overhead
+/// of loading them from disk on every request. It uses a `DashMap` for efficient,
+/// lock-free reads and locked writes.
 #[derive(Clone, Default)]
 pub struct PredictorCache {
-    // Arc<dyn Predictor> is used because the trait object needs to be shareable across threads.
-    cache: Arc<DashMap<PredictorKey, Arc<dyn Predictor>>>,
+    /// The cache stores `Arc<Box<dyn Predictor>>` to allow shared, immutable access
+    /// to the models across multiple threads. The key is a string combination
+    /// of model type and timeframe, e.g., "lstm_h1".
+    cache: Arc<DashMap<String, Arc<Box<dyn Predictor>>>>,
 }
 
 impl PredictorCache {
-    /// Retrieves a predictor from the cache. If not present, it loads the model
-    /// from disk, inserts it into the cache, and then returns it.
+    /// Retrieves a predictor from the cache. If the predictor is not in the cache,
+    /// it loads the model, inserts it into the cache, and then returns it.
     ///
-    /// The returned predictor is wrapped in an `Arc` for shared ownership.
-    pub fn get_or_load(&self, model_type: &str, timeframe: &str) -> Arc<dyn Predictor> {
-        let key = (model_type.to_string(), timeframe.to_string());
+    /// This ensures that each model is loaded only once.
+    pub fn get_or_load(&self, model_type: &str, timeframe: &str) -> Arc<Box<dyn Predictor>> {
+        let key = format!("{}_{}", model_type, timeframe);
 
-        // Fast path: if the predictor is already in the cache, clone its Arc and return.
+        // First, try to get the predictor with a read-only lock.
         if let Some(predictor) = self.cache.get(&key) {
             return predictor.clone();
         }
 
-        // Slow path: predictor not in cache. Load it from disk.
-        info!(model_type, timeframe, "Loading and caching new predictor model.");
-        let predictor = predictor::load_predictor(model_type, timeframe);
-        let predictor_arc = Arc::from(predictor);
-        self.cache.insert(key, predictor_arc.clone());
-        predictor_arc
+        // If not found, we'll need to load it.
+        // The `entry` API of DashMap handles the complexity of concurrent inserts.
+        // The closure inside `or_insert_with` is only executed if the key is truly absent.
+        self.cache
+            .entry(key.clone())
+            .or_insert_with(|| {
+                info!("Cache miss for '{}'. Loading model...", key);
+                match load_predictor(model_type, timeframe) {
+                    Ok(predictor) => Arc::new(predictor),
+                    Err(e) => {
+                        tracing::error!("Failed to load predictor model: {:?}", e);
+                        // Insert a no-op predictor so we don't panic and poison locks.
+                        Arc::new(Box::new(super::predictor::NoopPredictor::default()) as Box<dyn Predictor>)
+                    }
+                }
+            })
+            .clone()
+    }
+
+    /// Returns a list of keys currently present in the cache (e.g. "gbm_h1").
+    pub fn loaded_keys(&self) -> Vec<String> {
+        self.cache.iter().map(|r| r.key().clone()).collect()
     }
 }

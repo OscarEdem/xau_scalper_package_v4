@@ -1,3 +1,4 @@
+pub mod ensemble_predictor;
 pub mod gbm;
 pub mod heston;
 pub mod lstm;

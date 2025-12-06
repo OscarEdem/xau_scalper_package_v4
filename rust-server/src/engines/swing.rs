@@ -1,6 +1,6 @@
 use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
-use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, get_daily_bias, get_trend_bias, rsi, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache}};
+use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, get_daily_bias, get_trend_bias, rsi, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}};
 use tracing::debug;
 
 // --- 1. Engine Architecture: Helper Structs ---
@@ -86,7 +86,7 @@ impl SwingEngine {
 
         // --- 6. Confluence Scoring ---
         let (long_score, short_score, reason_long, reason_short) = Self::confluence_scoring_engine(
-            req, htf_bias_score, &liquidity, &displacement, &fvg_zones, req.current_price, predictor_cache
+            req, htf_bias_score, &liquidity, &displacement, &fvg_zones, req.current_price, last_atr, predictor_cache
         );
 
         // --- 7. Execution Logic ---
@@ -243,7 +243,8 @@ impl SwingEngine {
         displacement: &Displacement,
         fvg_zones: &Vec<PriceLevel>,
         current_price: f64,
-        predictor_cache: &PredictorCache
+        last_atr: f64,
+        predictor_cache: &PredictorCache,
     ) -> (f64, f64, String, String) {
         let mut long_score = 0.0;
         let mut short_score = 0.0;
@@ -297,32 +298,15 @@ impl SwingEngine {
 
         // --- NEW: Ensemble Prediction Model Bias ---
         // Load all three models and combine their predictions using confidence weighting.
-        let h1_closes = req.h1_closes.as_ref().map_or(&[][..], |v| v.as_slice());
-        let last_atr = atr(req.h1_highs.as_ref().unwrap(), req.h1_lows.as_ref().unwrap(), h1_closes, 14).last().cloned().unwrap_or(1.0);
+        let final_prediction_bias = ensemble_predictor::calculate_bias(
+            predictor_cache,
+            "h1",
+            req.h1_closes.as_ref().map_or(&[][..], |v| v.as_slice()),
+            current_price,
+            1.0, // Swing prediction for next H1 period
+        );
 
-        let model_types = ["gbm", "heston", "lstm"];
-        let predictors: Vec<_> = model_types
-            .iter()
-            .map(|&model_type| (model_type, predictor_cache.get_or_load(model_type, "h1")))
-            .collect();
-
-        let mut total_confidence = 0.0;
-        let mut weighted_prediction_sum = 0.0;
-        let mut individual_predictions = Vec::new();
-
-        for (model_type, p) in predictors {
-            let pred_price = p.predict(h1_closes, 1.0).unwrap_or(current_price);
-            let confidence = p.confidence().unwrap_or(0.0);
-            let predicted_change = pred_price - current_price;
-            weighted_prediction_sum += predicted_change * confidence;
-            total_confidence += confidence;
-            individual_predictions.push(format!("{}:{:.4}({:.2})", model_type, predicted_change, confidence));
-        }
-
-        let final_prediction_bias = if total_confidence > 0.0 { weighted_prediction_sum / total_confidence } else { 0.0 };
-
-        // Granular logging for debugging
-        debug!(model_biases = %individual_predictions.join(", "), final_bias = final_prediction_bias, "Ensemble prediction calculated for swing");
+        debug!(bias = final_prediction_bias, "Swing ensemble prediction calculated");
 
         if final_prediction_bias > 0.0 {
             long_score += 15.0 * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble

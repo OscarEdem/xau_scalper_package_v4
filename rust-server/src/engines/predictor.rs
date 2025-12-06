@@ -1,48 +1,50 @@
-use crate::engines::{gbm::predict::GBM, heston::predict::Heston, lstm::predict::LSTM};
-use tracing::warn;
+use std::error::Error;
+use super::{gbm, heston, lstm};
 
-pub trait Predictor {
-    /// Predict the next price.
-    /// `history`: A slice of recent close prices (e.g., last 50 candles).
-    /// `dt`: Time step (e.g., 1.0/24.0 for hourly).
-    fn predict(&self, history: &[f64], dt: f64) -> Result<f64, Box<dyn std::error::Error>>;
+/// A common trait for all prediction models.
+/// This allows different models (GBM, Heston, LSTM) to be used interchangeably.
+pub trait Predictor: Send + Sync {
+    /// Predicts the price for a number of future periods.
+    fn predict(&self, data: &[f64], future_periods: f64) -> Result<f64, Box<dyn Error>>;
+    /// Returns the confidence of the model, if available.
+    fn confidence(&self) -> Option<f64>;
+}
 
-    /// Optional confidence score (0..1)
-    fn confidence(&self) -> Option<f64> {
-        None
+/// Factory function to load a specific predictor model.
+pub fn load_predictor(model_type: &str, timeframe: &str) -> Result<Box<dyn Predictor>, Box<dyn Error>> {
+    match model_type {
+        "gbm" => {
+            // GBM models are stored as JSON configs named like `gbm_h1_config.json` in `/app/models`.
+            let path = format!("./models/gbm_{}_config.json", timeframe);
+            let gbm = gbm::predict::GBM::load(&path)?;
+            Ok(Box::new(gbm))
+        }
+        "heston" => {
+            // Heston models are stored as JSON configs named like `heston_h1_config.json` in `/app/models`.
+            let path = format!("./models/heston_{}_config.json", timeframe);
+            let heston = heston::predict::Heston::load(&path)?;
+            Ok(Box::new(heston))
+        }
+        "lstm" => {
+            // LSTM models live as ONNX files named like `lstm_h1.onnx` in `/app/models`.
+            let model_path = format!("./models/lstm_{}.onnx", timeframe);
+            let lstm_model = lstm::predict::LSTM::load(&model_path)?;
+            Ok(Box::new(lstm_model))
+        }
+        _ => Err(format!("Unknown predictor model type: {}", model_type).into()),
     }
 }
 
-/// Factory function to dynamically load a predictor model based on a string identifier.
-pub fn load_predictor(model_type: &str, timeframe: &str) -> Box<dyn Predictor> {
-    let model_result: Result<Box<dyn Predictor>, _> = (|| {
-        match model_type {
-            "gbm" => {
-                let path = format!("src/engines/gbm/models/gbm_{}_config.json", timeframe);
-                Ok(Box::new(GBM::load(&path)?) as Box<dyn Predictor>)
-            }
-            "heston" => {
-                let path = format!("src/engines/heston/models/heston_{}_config.json", timeframe);
-                Ok(Box::new(Heston::load(&path)?) as Box<dyn Predictor>)
-            }
-            "lstm" => {
-                let path = format!("src/engines/lstm/models/lstm_{}.onnx", timeframe);
-                Ok(Box::new(LSTM::load(&path)?) as Box<dyn Predictor>)
-            }
-            _ => {
-                warn!("Unknown model type '{}'. Defaulting to 'gbm' for timeframe '{}'.", model_type, timeframe);
-                let path = format!("src/engines/gbm/models/gbm_{}_config.json", timeframe);
-                Ok(Box::new(GBM::load(&path)?) as Box<dyn Predictor>)
-            }
-        }
-    })();
+/// A no-op predictor used as a safe fallback when a real model cannot be loaded.
+#[derive(Default)]
+pub struct NoopPredictor;
 
-    match model_result {
-        Ok(predictor) => predictor,
-        Err(e) => {
-            warn!("Failed to load model '{}' for timeframe '{}': {}. Defaulting to GBM.", model_type, timeframe, e);
-            let fallback_path = format!("src/engines/gbm/models/gbm_{}_config.json", timeframe);
-            Box::new(GBM::load(&fallback_path).expect("Failed to load fallback GBM model"))
-        },
+impl Predictor for NoopPredictor {
+    fn predict(&self, _data: &[f64], _future_periods: f64) -> Result<f64, Box<dyn Error>> {
+        Err("No predictor available".into())
+    }
+
+    fn confidence(&self) -> Option<f64> {
+        None
     }
 }
