@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-const MAX_BUFFER_SIZE: usize = 200; // Store up to 200 recent candles per timeframe.
+const MAX_BUFFER_SIZE: usize = 500; // Store up to 200 recent candles per timeframe.
 
 /// Represents the dominant trend direction determined by the SwingEngine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +112,7 @@ impl TradingSession {
 
     /// The main entry point for processing new data for this session.
     /// It updates internal buffers and then runs both trading engines.
-    pub fn on_data(&mut self, req: &EvalRequest, predictor_cache: &PredictorCache) {
+    pub fn on_data(&mut self, req: EvalRequest, predictor_cache: &PredictorCache) {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
         // 1. Update data buffers with the latest candle data from the request.
@@ -135,7 +135,7 @@ impl TradingSession {
         self.last_evaluation_timestamp = req.last_m1_timestamp;
 
         // 2. Run the Swing Engine first to establish the higher-timeframe context.
-        let swing_req = self.build_engine_request("swing");
+        let swing_req = self.build_engine_request("swing", &req);
         let swing_signal = SwingEngine::evaluate(&swing_req, predictor_cache);
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
 
@@ -144,7 +144,7 @@ impl TradingSession {
         self.latest_swing_signal = Some(swing_signal);
 
         // 3. Run the Scalp Engine.
-        let scalp_req = self.build_engine_request_with_params("scalp", req);
+        let scalp_req = self.build_engine_request_with_params("scalp", &req);
         let mut scalp_signal = ScalpEngine::evaluate(&scalp_req, predictor_cache);
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
@@ -247,7 +247,7 @@ impl TradingSession {
     }
 
     /// Builds an `EvalRequest` for a specific engine using the session's data.
-    fn build_engine_request(&self, mode: &str) -> EvalRequest {
+    fn build_engine_request(&self, mode: &str, original_req: &EvalRequest) -> EvalRequest {
         // This clones the data from the session buffers.
         // For very high performance, you might use `Arc`s to avoid deep copies.
         EvalRequest {
@@ -273,7 +273,7 @@ impl TradingSession {
             d1_closes: Some(self.d1_closes.iter().cloned().collect()),
             open_positions: Some(if mode == "scalp" { self.open_scalp_positions.clone() } else { self.open_swing_positions.clone() }),
             mode: mode.to_string(),
-            current_price: *self.m1_closes.back().unwrap_or(&0.0), // Safely get the last price or default to 0.0
+            current_price: original_req.current_price, // Use the live price from the original request
             last_m1_timestamp: self.last_evaluation_timestamp,
             ..Default::default() // Fills in optional params
         }
@@ -281,7 +281,7 @@ impl TradingSession {
 
     /// Builds an `EvalRequest` for a specific engine, propagating optional parameters from the original request.
     fn build_engine_request_with_params(&self, mode: &str, original_req: &EvalRequest) -> EvalRequest {
-        let mut engine_req = self.build_engine_request(mode);
+        let mut engine_req = self.build_engine_request(mode, original_req);
         // Propagate all optional parameters from the original request
         engine_req.spread_limit_points = original_req.spread_limit_points;
         engine_req.spread_points = original_req.spread_points;

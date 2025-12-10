@@ -16,3 +16,5 @@ services:
       retries: 3
     environment:
       - RUST_LOG=info
+    env_file:
+      - ./.env

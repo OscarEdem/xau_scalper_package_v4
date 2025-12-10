@@ -16,6 +16,7 @@ chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "4", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }
 expo_push_notification_client = "0.2.0"
+scraper = "0.19.0"
 reqwest = { version = "0.12.5", features = ["json"] }
 serde_qs = "0.12"
 uuid = { version = "1.8.0", features = ["v4", "serde"] }

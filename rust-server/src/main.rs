@@ -18,14 +18,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 use utoipa::{OpenApi};
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::SwaggerUi; pub use xau_scalper_server::news_fetcher::fetch_investing_calendar;
 pub use xau_scalper_server::{
     ArrivalConfirmation, EvalRequest, EvalResponse, SessionManager,
     ExecutionConfirmation, HistoryParams, HistoryResponse, HistoryStats, TradeLog, PriceLevel, VwapBands
 };
 
-const MAX_TICK_HISTORY: usize = 10000;
-const HISTORY_PAGE_SIZE: usize = 1000;
 const PUSH_TOKENS_FILE: &str = "push_tokens.json";
 
 #[derive(serde::Serialize, utoipa::ToSchema, Clone)]
@@ -42,8 +40,8 @@ struct ApplicationState {
     session_manager: SessionManager,
     predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache,
     signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
-    tick_history: Arc<Mutex<VecDeque<String>>>, // NEW: Cache for recent ticks
     push_tokens: Arc<Mutex<BTreeSet<String>>>,
+    news_events: Arc<Mutex<Vec<xau_scalper_server::NewsEvent>>>,
     ws_clients: Arc<AtomicUsize>,
 }
 
@@ -95,23 +93,6 @@ struct TickData {
     timestamp: i64,
 }
 
-/// Wrapper for sending historical ticks to a new WebSocket client.
-#[derive(serde::Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct HistoryPayload {
-    r#type: String,
-    payload: VecDeque<String>,
-}
-
-/// Incoming message from a WebSocket client to request historical data.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WsClientRequest {
-    r#type: String,
-    /// The page number to retrieve (0-indexed).
-    page: usize,
-}
-
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
 #[openapi(
@@ -131,7 +112,7 @@ struct WsClientRequest {
         clear_history_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, UpdateSessionConfigRequest, TickData, HistoryPayload)
+        schemas(EvalRequest, EvalResponse, TradeLog, HistoryResponse, HistoryStats, PriceLevel, VwapBands, ArrivalConfirmation, ExecutionConfirmation, HistoryParams, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, UpdateSessionConfigRequest, TickData)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. The WebSocket endpoint at `/ws` streams live tick data as JSON strings. On connection, it first sends a `HistoryPayload` object containing recent ticks."
@@ -163,9 +144,9 @@ async fn main() {
         session_manager: SessionManager::default(),
         predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::default(),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
-        tick_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_TICK_HISTORY))), // NEW: Initialize cache
         // Use the tokens loaded from the file
         push_tokens: Arc::new(Mutex::new(initial_push_tokens)),
+        news_events: Arc::new(Mutex::new(Vec::new())),
         ws_clients: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -210,6 +191,25 @@ async fn main() {
                 if removed_count > 0 {
                     tracing::info!("Removed {} signals from history older than 12 hours.", removed_count);
                 }
+            }
+        }
+    });
+
+    // --- Background task for fetching news events ---
+    let news_fetch_state = shared_state.clone();
+    tokio::spawn(async move {
+        // Fetch immediately on startup
+        let initial_events = fetch_investing_calendar().await;
+        *news_fetch_state.news_events.lock().unwrap() = initial_events;
+
+        loop {
+            // Then, fetch every hour
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            tracing::info!("Periodically fetching news events...");
+            let events = fetch_investing_calendar().await;
+            // Only update if we actually got new events, to avoid clearing on a failed fetch
+            if !events.is_empty() {
+                *news_fetch_state.news_events.lock().unwrap() = events;
             }
         }
     });
@@ -264,45 +264,10 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
     // Increment the active WS client counter and log the new total
     let prev = state.inner.ws_clients.fetch_add(1, Ordering::SeqCst);
     let new_total = prev + 1;
-    tracing::info!("New WebSocket client connected. Sending price history... total_clients={}", new_total);
-
-    // --- NEW: Send recent tick history on connect ---
-    // We only send the most recent `HISTORY_PAGE_SIZE` ticks initially.
-    let initial_history_vec = {
-        let history = state.inner.tick_history.lock().unwrap_or_else(|e| {
-            tracing::error!("Tick history mutex poisoned in websocket_stream! Recovering. Error: {}", e);
-            e.into_inner()
-        });
-
-        let start_index = history.len().saturating_sub(HISTORY_PAGE_SIZE);
-
-        // Parse each stored JSON string into a serde_json::Value. If parsing fails, skip that entry.
-        history
-            .range(start_index..)
-            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .collect::<Vec<serde_json::Value>>()
-    };
-
-    if !initial_history_vec.is_empty() {
-        // Send history as an array of JSON objects (no double-parse required on client)
-        let history_payload = serde_json::json!({
-            "type": "history_page",
-            "payload": initial_history_vec
-        });
-
-        if let Ok(json_string) = serde_json::to_string(&history_payload) {
-            if socket.send(Message::Text(json_string)).await.is_err() {
-                tracing::info!("Failed to send initial price history to WebSocket client; it may have disconnected immediately.");
-                // Decrement counter since the client is gone
-                let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                tracing::info!("WebSocket client disconnected during initial send. remaining_clients={}", remaining);
-                return; // Client is gone, no need to proceed.
-            }
-        }
-    }
-    // --- END NEW ---
+    tracing::info!("New WebSocket client connected. Starting live tick stream... total_clients={}", new_total);
 
     let mut rx = state.tick_tx.subscribe();
+
     // Keepalive ping interval to avoid idle connection closures by proxies
     let mut keepalive = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
@@ -338,51 +303,6 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                     break;
                 }
             }
-            // --- NEW: Handle incoming messages from the client ---
-            Some(msg) = socket.recv() => {
-                if let Ok(Message::Text(text)) = msg {
-                    // Attempt to parse the client's request for a history page
-                    if let Ok(request) = serde_json::from_str::<WsClientRequest>(&text) {
-                        if request.r#type == "get_history" {
-                            tracing::info!("Client requested history page: {}", request.page);
-
-                            let history_page = {
-                                let history = state.inner.tick_history.lock().unwrap_or_else(|e| e.into_inner());
-                                let total_items = history.len();
-
-                                // Calculate the start and end indices for the requested page.
-                                // Pages are requested from newest to oldest, so page 0 is the latest data.
-                                let end = total_items.saturating_sub(request.page * HISTORY_PAGE_SIZE);
-                                let start = end.saturating_sub(HISTORY_PAGE_SIZE);
-
-                                history
-                                    .range(start..end)
-                                    .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                                    .collect::<Vec<serde_json::Value>>()
-                            };
-
-                            if !history_page.is_empty() {
-                                let payload = serde_json::json!({
-                                    "type": "history_page",
-                                    "page": request.page,
-                                    "payload": history_page,
-                                });
-                                if let Ok(json_string) = serde_json::to_string(&payload) {
-                                    if socket.send(Message::Text(json_string)).await.is_err() {
-                                        let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                                        tracing::info!("WebSocket client disconnected while sending history page. remaining_clients={}", remaining);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if let Ok(Message::Close(_)) = msg {
-                    let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                    tracing::info!("WebSocket client sent close frame. remaining_clients={}", remaining);
-                    break;
-                }
-            }
         }
     }
 }
@@ -400,18 +320,7 @@ async fn tick_ingest_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     tick_json: String, // Axum can receive the raw body as a String
 ) -> StatusCode {
-    // --- NEW: Add the incoming tick to our history cache ---
-    if !tick_json.is_empty() {
-        let mut history = state.inner.tick_history.lock().unwrap_or_else(|e| {
-            tracing::error!("Tick history mutex poisoned in tick_ingest_handler! Recovering. Error: {}", e);
-            e.into_inner()
-        });
-        history.push_back(tick_json.clone());
-        if history.len() > MAX_TICK_HISTORY {
-            history.pop_front();
-        }
-    }
-    if !tick_json.is_empty() {
+     if !tick_json.is_empty() {
         // Send this JSON string to all connected WebSocket clients
         if state.tick_tx.send(tick_json).is_err() {
             // This is not a client error, just a server state observation.
@@ -530,7 +439,7 @@ async fn get_signals_handler(State(state): State<Arc<ApplicationStateWithTicks>>
 #[axum::debug_handler]
 async fn process_data_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(req): Json<EvalRequest>,
+    Json(mut req): Json<EvalRequest>,
 ) -> (StatusCode, Json<&'static str>) {
     tracing::info!(
         symbol = %req.symbol,
@@ -551,22 +460,13 @@ async fn process_data_handler(
     })
     .to_string();
 
-    // Push into the in-memory tick history (bounded) and broadcast to clients. If the mutex
-    // is poisoned we recover and continue processing but log the error.
-    {
-        let mut history = state.inner.tick_history.lock().unwrap_or_else(|e| {
-            tracing::error!("Tick history mutex poisoned in process_data_handler: {}", e);
-            e.into_inner()
-        });
-        history.push_back(tick_payload.clone());
-        if history.len() > MAX_TICK_HISTORY {
-            history.pop_front();
-        }
-    }
-    // Broadcast to any connected WebSocket clients. If there are none, this returns Err and we log.
     if state.tick_tx.send(tick_payload).is_err() {
         tracing::debug!("No active WebSocket clients to broadcast tick to.");
     }
+
+    // --- NEW: Inject cached news events into the request ---
+    let news = state.inner.news_events.lock().unwrap().clone();
+    req.upcoming_events = Some(news);
 
     // For now, we assume a global config for filtering. This could also be part of the request.
     let filter_scalp_by_swing = true;
@@ -585,16 +485,18 @@ async fn process_data_handler(
                 e.into_inner()
             });
         
-        let session = sessions.entry(req.symbol.clone()).or_insert_with(|| {
-            tracing::info!("Creating new trading session for symbol: {}", req.symbol);
-            xau_scalper_server::TradingSession::new(req.symbol.clone(), filter_scalp_by_swing)
+        let symbol = req.symbol.clone(); // Clone the symbol before `req` is moved.
+
+        let session = sessions.entry(symbol.clone()).or_insert_with(|| {
+            tracing::info!("Creating new trading session for symbol: {}", symbol);
+            xau_scalper_server::TradingSession::new(symbol.clone(), filter_scalp_by_swing)
         });
 
         // --- Get old signals BEFORE processing new data ---
         let (old_scalp_sig, old_swing_sig) = session.get_latest_signals();
 
         // Process data, which updates the signals within the session
-        session.on_data(&req, &state.inner.predictor_cache);
+        session.on_data(req, &state.inner.predictor_cache);
 
         // Now, get the new signals and add them to history
         let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
@@ -605,12 +507,12 @@ async fn process_data_handler(
         if let Some(swing_sig) = swing_sig_opt {
             // Check if it's a new, actionable signal
             if swing_sig.entry_type != "none" && old_swing_sig.as_ref().map_or(true, |old| old.signal_id != swing_sig.signal_id) {
-                signals_to_send.push((swing_sig.clone(), req.symbol.clone()));
+                signals_to_send.push((swing_sig.clone(), symbol.clone()));
             }
             // Store in history regardless
             history.push_front(HistoricalSignal {
                 signal: ActiveSignal {
-                    symbol: req.symbol.clone(),
+                    symbol: symbol.clone(),
                     signal: swing_sig,
                 },
                 created_at: now,
@@ -619,12 +521,12 @@ async fn process_data_handler(
         if let Some(scalp_sig) = scalp_sig_opt {
             // Check if it's a new, actionable signal
             if scalp_sig.entry_type != "none" && old_scalp_sig.as_ref().map_or(true, |old| old.signal_id != scalp_sig.signal_id) {
-                signals_to_send.push((scalp_sig.clone(), req.symbol.clone()));
+                signals_to_send.push((scalp_sig.clone(), symbol.clone()));
             }
             // Store in history regardless
             history.push_front(HistoricalSignal {
                 signal: ActiveSignal {
-                    symbol: req.symbol.clone(),
+                    symbol: symbol.clone(),
                     signal: scalp_sig,
                 },
                 created_at: now,

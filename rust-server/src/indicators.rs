@@ -18,9 +18,10 @@ pub struct OpenPosition {
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
 #[serde(rename_all = "camelCase")]
 pub struct NewsEvent {
-    pub name: String,
+    pub event: String,
     pub timestamp: i64,      // Unix seconds
     pub impact: String,      // "high", "medium", "low"
+    pub country: String,
 }
 
 

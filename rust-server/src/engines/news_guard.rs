@@ -47,7 +47,7 @@ pub fn evaluate_news_guard(
                 allowed: false,
                 reason: Some(format!(
                     "Blocked: Approaching {} impact event '{}'",
-                    event.impact, event.name
+                    event.impact, event.event
                 )),
             };
         }
@@ -58,7 +58,7 @@ pub fn evaluate_news_guard(
                 allowed: false,
                 reason: Some(format!(
                     "Blocked: Post-event volatility after {} impact event '{}'",
-                    event.impact, event.name
+                    event.impact, event.event
                 )),
             };
         }
