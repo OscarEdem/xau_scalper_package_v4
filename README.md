@@ -22,7 +22,7 @@ The system is composed of two primary components that work in tandem:
 
 1.  **Rust Server (The Brain):** A powerful `axum` web server that receives market data from the EA. It performs complex, multi-timeframe analysis using a pre-defined strategy to calculate a trade signal and a "conviction score". It also acts as a central repository for all trade history.
     *   **Engines:** Scalp Engine (Kalman Filter, Momentum) and Swing Engine (Market Structure, Liquidity).
-    *   **AI Integration:** Uses ONNX runtime for LSTM models and statistical methods for price prediction.
+    *   **AI Integration:** Uses ONNX runtime for LSTM models and Google Gemini for fundamental macro analysis.
     *   **Notification Hub:** Sends push notifications via Expo and broadcasts live data via WebSockets.
 
 2.  **MQL5 Expert Advisor (The Bridge):** An EA that runs on the MetaTrader 5 chart. Its primary job is to collect M1, M5, and H1 market data and send it to the Rust server.
@@ -50,6 +50,7 @@ The system is composed of two primary components that work in tandem:
 -   **Confluence-Based Strategy:** Executes trades only when **five** distinct technical conditions align, generating a "Conviction Score" for each potential signal.
 -   **Dynamic Risk Management:** Automatically adjusts lot size based on the conviction score, risking more on "A+" setups and less (or nothing) on weaker signals.
 -   **Advanced Trailing Stop:** Implements an ATR-based "Chandelier Exit" to let winning trades run and protect profits adaptively based on market volatility.
+-   **Generative AI Analysis:** Integrates Google Gemini to parse economic news events and generate human-readable daily/weekly fundamental bias reports.
 -   **Centralized Trade Analytics API:** All trades are logged to the server, which exposes an interactive API (`/history`) with performance statistics (P/L, Win Rate, Profit Factor) and date filtering.
 -   **Interactive API Documentation:** Automatically generated Swagger UI provides a beautiful and easy-to-use interface for exploring the server's API.
 -   **High-Performance Backend:** Built in Rust for speed, safety, and reliability, ensuring signals are processed with minimal latency.
@@ -85,10 +86,10 @@ cargo build --release --package xau-scalper-server
 #### Build and Run with Docker:
 ```bash
 # Build the Docker image
-docker build -t xau-scalper-v7 .
+docker build -t xau-scalper-v4 .
 
 # Run the server inside a container
-docker run --rm -p 3000:3000 xau-scalper-v7
+docker run --rm -p 3000:3000 xau-scalper-v4
 ```
 The server will be accessible at `http://127.0.0.1:3000`.
 
@@ -125,20 +126,23 @@ Navigate to `http://127.0.0.1:3000/docs` in your browser to see a full, interact
 
 | Method | Endpoint               | Description                                                                 |
 | :----- | :------------ | :------------------------------------------------------------------------------------------------------ |
-| `POST` | `/eval`       | The core endpoint used by the EA to get a trade signal.                                                 |
-| `POST` | `/log_trade`  | Used by the EA to send details of opened and closed trades to the server for logging.                     |
-| `GET`  | `/history`    | **Analytics endpoint.** Returns trade history with performance stats. Can be filtered by `start_date` and `end_date`. |
+| `POST` | `/data`       | The core endpoint used by the EA to process market data.                                                |
+| `POST` | `/ticks`      | Ingests live tick data for WebSocket broadcasting.                                                      |
+| `GET`  | `/signals`    | Returns a log of all signals generated in the last 12 hours.                                            |
+| `GET`  | `/signals/latest` | Returns the latest signals for all active symbols.                                                  |
+| `GET`  | `/signals/{symbol}` | Returns the latest signals for a specific symbol.                                                 |
+| `GET`  | `/analysis/fundamental` | Generates a macro economic outlook report using Gemini AI. Params: `symbol`, `period`. |
+| `GET`  | `/definitions/reasons` | Returns a dictionary of signal reasons and their explanations.                                 |
+| `GET`  | `/models/loaded` | Returns a list of currently loaded predictor models.                                                 |
+| `GET`  | `/metrics`    | Returns server performance and usage metrics.                                                           |
+| `GET`  | `/metrics/prometheus` | Returns metrics in Prometheus format.                                                           |
 | `GET`  | `/health`     | A simple health check endpoint that returns "OK".                                                       |
 
 ### Analyzing Performance
 
-To view a performance report, access the history endpoint in your browser:
+To view the recent signal history, access the signals endpoint in your browser:
 
-`http://127.0.0.1:3000/history`
-
-To filter for a specific period:
-
-`http://127.0.0.1:3000/history?start_date=2023-11-01&end_date=2023-11-30`
+`http://127.0.0.1:3000/signals`
 
 ---
 
@@ -148,7 +152,7 @@ The MQL5 EA has several input parameters for customization:
 
 | Parameter              | Description                                                                    | Default Value |
 | ---------------------- | ------------------------------------------------------------------------------ | ------------- |
-| `ServerUrl`            | The URL of the Rust server's `/eval` endpoint.                                 | `http://127.0.0.1:3000/eval` |
+| `ServerUrl`            | The URL of the Rust server's `/data` endpoint.                                 | `http://127.0.0.1:3000/data` |
 | `RiskPercent`          | The percentage of account balance to risk on a full-conviction trade. | `0.5`         |
 | `NumCloses`            | **IMPORTANT:** Number of historical bars to send to the server. Must be > 202. | `80` (Change to `250`) |
 | `MaxSpreadPoints`      | The maximum allowed spread in points to place a trade.                         | `160`         |
