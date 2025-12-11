@@ -1,6 +1,6 @@
-use crate::{EvalRequest, EvalResponse};
+use crate::{EvalRequest, EvalResponse, PriceLevel};
 use ::uuid::Uuid;
-use crate::{adx, get_trend_bias, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}};
+use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}};
 use tracing::debug;
 
 pub struct ScalpEngine;
@@ -31,7 +31,7 @@ impl ScalpEngine {
             &atr_vals,
             &adx_vals,
             2.5, // ATR spike multiplier
-            15.0 // ADX threshold (lower for scalping)
+            req.adx_threshold.unwrap_or(10.0) // ADX threshold (configurable)
         );
 
         if !guard.allowed {
@@ -210,6 +210,30 @@ impl ScalpEngine {
             return EvalResponse { reason: "No Signal (SL sanity check failed)".to_string(), ..Default::default() };
         }
 
+        // ---- NEW: Data Population for Visualization ----
+        // 1. Imbalance Zones (FVGs) on M5
+        let fvg_zones = find_imbalance_zones(&req.m5_highs, &req.m5_lows, 20);
+
+        // 2. Liquidity Zones (Recent Swing Points) on M5
+        let (swing_highs, swing_lows) = find_swing_points(&req.m5_highs, &req.m5_lows, 60, 3);
+        let mut liquidity_zones = Vec::new();
+        
+        // Add last 2 swing highs as resistance
+        for (_, price) in swing_highs.iter().rev().take(2) {
+            liquidity_zones.push(PriceLevel { top: *price, bottom: *price, is_bullish: Some(false) });
+        }
+        // Add last 2 swing lows as support
+        for (_, price) in swing_lows.iter().rev().take(2) {
+            liquidity_zones.push(PriceLevel { top: *price, bottom: *price, is_bullish: Some(true) });
+        }
+
+        // 3. Sweep Detected mapping
+        let sweep_detected = match inducement.as_str() {
+            "bullish_inducement" => "low_sweep".to_string(),
+            "bearish_inducement" => "high_sweep".to_string(),
+            _ => "none".to_string(),
+        };
+
         EvalResponse {
             signal_id: Uuid::new_v4().to_string(),
             entry_type,
@@ -218,11 +242,15 @@ impl ScalpEngine {
             tp1_price: tp1,
             tp2_price: tp2,
             reason,
-            classification: "scalp_v2_adaptive".to_string(),
+            classification: "scalp".to_string(),
             conviction_score: Some(conviction),
             recommended_order_type,
             limit_order_price: entry_price,
             expiration_seconds: Some(180),
+            imbalance_zones: fvg_zones,
+            liquidity_zones,
+            sweep_detected,
+            volatility_regime: if vol_regime > 1.5 { "high".to_string() } else if vol_regime < 0.8 { "low".to_string() } else { "normal".to_string() },
             ..Default::default()
         }
     }

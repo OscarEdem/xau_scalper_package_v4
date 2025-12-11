@@ -14,6 +14,7 @@ use tracing::debug;
 /// * `current_price` - The current price, used as a baseline for predicted change.
 /// * `future_periods` - The number of future periods to predict (model-specific).
 ///
+///
 /// # Returns
 /// A `f64` representing the final weighted prediction bias. A positive value
 /// indicates a bullish bias, and a negative value indicates a bearish bias.

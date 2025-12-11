@@ -61,7 +61,7 @@ impl SwingEngine {
             &atr_vals,
             &adx_vals,
             2.0, // ATR spike multiplier
-            18.0 // ADX threshold
+            req.adx_threshold.unwrap_or(12.0) // ADX threshold (configurable)
         );
 
         if !guard.allowed {
@@ -104,6 +104,33 @@ impl SwingEngine {
             &entry_type, &reason, req.current_price, last_atr, h1_highs[n-1], h1_lows[n-1]
         );
 
+        // --- 9. Data Population for Response ---
+        // Construct Liquidity Zones from Market Structure (External Highs/Lows)
+        let mut liquidity_zones = Vec::new();
+        if structure.external_high.1 > 0.0 {
+            liquidity_zones.push(PriceLevel { 
+                top: structure.external_high.1, 
+                bottom: structure.external_high.1, 
+                is_bullish: Some(false) // Resistance / Buy-side Liquidity
+            });
+        }
+        if structure.external_low.1 > 0.0 {
+            liquidity_zones.push(PriceLevel { 
+                top: structure.external_low.1, 
+                bottom: structure.external_low.1, 
+                is_bullish: Some(true) // Support / Sell-side Liquidity
+            });
+        }
+
+        // Determine Sweep Detected String
+        let sweep_detected = if liquidity.is_sfp_bullish {
+            "low_sweep".to_string()
+        } else if liquidity.is_sfp_bearish {
+            "high_sweep".to_string()
+        } else {
+            "none".to_string()
+        };
+
         EvalResponse {
             signal_id: Uuid::new_v4().to_string(),
             entry_type,
@@ -117,6 +144,10 @@ impl SwingEngine {
             recommended_order_type: "market".to_string(),
             limit_order_price: 0.0, // Market order for swings
             expiration_seconds: None,
+            imbalance_zones: fvg_zones,
+            liquidity_zones,
+            sweep_detected,
+            volatility_regime: if last_atr > 2.0 { "high".to_string() } else { "normal".to_string() },
             ..Default::default()
         }
     }

@@ -15,13 +15,16 @@ pub struct OpenPosition {
     pub mode: String, // "scalp" | "swing"
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Hash, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewsEvent {
     pub event: String,
     pub timestamp: i64,      // Unix seconds
     pub impact: String,      // "high", "medium", "low"
     pub country: String,
+    pub forecast: Option<String>,
+    pub previous: Option<String>,
+    pub actual: Option<String>,
 }
 
 
@@ -174,80 +177,6 @@ impl Default for EvalResponse {
         }
     }
 }
-
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct TradeLog {
-    pub timestamp: String,
-    pub event_type: String, // "Open" or "Close"
-    pub ticket: u64,
-    pub symbol: String,
-    pub direction: String,
-    pub lot_size: f64,
-    pub price: f64,
-    pub sl: f64,
-    pub tp: f64,
-    pub profit: f64,
-    pub comment: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
-#[serde(rename_all = "camelCase")]
-pub struct ArrivalConfirmation {
-    pub signal_id: String,
-    pub arrival_price: f64,
-    pub spread: f64,
-    pub timestamp: String, // ISO
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionConfirmation {
-    pub signal_id: String,
-    pub order_ticket: u64,
-    pub fill_price: f64,
-    pub sl: f64,
-    pub tp: f64,
-    pub timestamp: String, // ISO
-}
-
-#[derive(Deserialize, ToSchema, IntoParams)]
-pub struct HistoryParams {
-    /// Optional start date for filtering logs (format: YYYY-MM-DD)
-    pub symbol: Option<String>,
-    /// Optional start date for filtering logs (format: YYYY-MM-DD)
-    pub start_date: Option<String>,
-    /// Optional end date for filtering logs (format: YYYY-MM-DD)
-    pub end_date: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct HistoryStats {
-    pub total_profit: f64,
-    pub total_trades: usize,
-    pub winning_trades: usize,
-    pub losing_trades: usize,
-    pub win_rate_percent: f64,
-    pub profit_factor: f64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct HistoryResponse {
-    #[serde(flatten)]
-    pub stats: HistoryStats,
-    pub trades: Vec<TradeLog>,
-}
-
-impl Default for HistoryResponse {
-    fn default() -> Self {
-        Self {
-            stats: HistoryStats {
-                total_profit: 0.0, total_trades: 0, winning_trades: 0, losing_trades: 0, win_rate_percent: 0.0, profit_factor: 0.0
-            },
-            trades: vec![]
-        }
-    }
-}
-
 
 pub fn ema(values: &Vec<f64>, period: usize) -> Vec<f64> {
     let mut out = vec![0.0; values.len()];

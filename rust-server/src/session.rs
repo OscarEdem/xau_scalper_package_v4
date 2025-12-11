@@ -1,9 +1,10 @@
 use crate::{
     engines::{scalp::ScalpEngine, swing::SwingEngine},
     engines::predictor_cache::PredictorCache,
-    EvalRequest, EvalResponse, OpenPosition, TradeLog,
+    EvalRequest, EvalResponse,
 };
-use std::collections::{HashMap, VecDeque};
+use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -61,11 +62,8 @@ pub struct TradingSession {
     d1_closes: VecDeque<f64>,
 
     // --- Engine Outputs & Positions ---
-    open_scalp_positions: Vec<OpenPosition>,
-    open_swing_positions: Vec<OpenPosition>,
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
-    trade_logs: VecDeque<TradeLog>,
 
     // NEW: Anti-Spam State
     last_notified_signal_id: Option<String>,
@@ -96,11 +94,8 @@ impl TradingSession {
             h4_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             d1_opens: VecDeque::with_capacity(MAX_BUFFER_SIZE),
             d1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            open_scalp_positions: Vec::new(),
-            open_swing_positions: Vec::new(),
             latest_scalp_signal: None,
             latest_swing_signal: None,
-            trade_logs: VecDeque::with_capacity(500), // Store last 500 trades per symbol
 
             // Initialize spam filters
             last_notified_signal_id: None,
@@ -116,22 +111,25 @@ impl TradingSession {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
         // 1. Update data buffers with the latest candle data from the request.
-        // In a real system, you'd likely receive individual new candles and push them.
-        // Here, we're just replacing the buffers for simplicity.
-        self.m1_closes = req.closes.iter().cloned().collect();
-        self.m5_closes = req.m5_closes.iter().cloned().collect();
-        self.m5_highs = req.m5_highs.iter().cloned().collect();
-        self.m5_lows = req.m5_lows.iter().cloned().collect();
-        self.m30_closes = req.m30_closes.iter().cloned().collect();
-        self.h1_closes = req.h1_closes.clone().unwrap_or_default().into();
-        self.h1_highs = req.h1_highs.clone().unwrap_or_default().into();
-        self.h1_opens = req.h1_opens.clone().unwrap_or_default().into();
-        self.h1_lows = req.h1_lows.clone().unwrap_or_default().into();
-        self.h4_closes = req.h4_closes.clone().unwrap_or_default().into();
-        self.h4_highs = req.h4_highs.clone().unwrap_or_default().into();
-        self.h4_lows = req.h4_lows.clone().unwrap_or_default().into();
-        self.d1_opens = req.d1_opens.clone().unwrap_or_default().into();
-        self.d1_closes = req.d1_closes.clone().unwrap_or_default().into();
+        // Smart update: If input is small (incremental), push back. If large (sync), replace.
+        Self::update_buffer(&mut self.m1_closes, &req.closes);
+        Self::update_buffer(&mut self.m5_closes, &req.m5_closes);
+        Self::update_buffer(&mut self.m5_highs, &req.m5_highs);
+        Self::update_buffer(&mut self.m5_lows, &req.m5_lows);
+        Self::update_buffer(&mut self.m30_closes, &req.m30_closes);
+        
+        if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v); }
+        if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v); }
+        if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v); }
+        if let Some(v) = &req.h1_lows { Self::update_buffer(&mut self.h1_lows, v); }
+        
+        if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v); }
+        if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v); }
+        if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v); }
+        
+        if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v); }
+        if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v); }
+        
         self.last_evaluation_timestamp = req.last_m1_timestamp;
 
         // 2. Run the Swing Engine first to establish the higher-timeframe context.
@@ -173,16 +171,11 @@ impl TradingSession {
         if is_valid_signal {
             let direction_changed = scalp_signal.entry_type != self.last_notified_direction;
             let time_diff = current_time - self.last_notified_time;
+            let conviction = scalp_signal.conviction_score.unwrap_or(0.0);
             
             // Cooldown: 5 minutes (300 seconds)
             let cooldown_passed = time_diff > 300;
 
-            // Check if we are already in a trade for this direction
-            let already_in_trade = self.open_scalp_positions.iter().any(|p| 
-                (p.direction == "buy" && scalp_signal.entry_type == "long") ||
-                (p.direction == "sell" && scalp_signal.entry_type == "short")
-            );
-            
             // --- Pyramiding Logic ---
             // Calculate percentage distance from the LAST signal price
             let price_delta_pct = if self.last_notified_price > 0.0 {
@@ -200,14 +193,20 @@ impl TradingSession {
                     _ => false,
                 };
 
+            // --- Reversal Logic ---
+            // If direction changes rapidly (e.g., within 3 minutes), we require higher conviction
+            // to avoid whipsaws in choppy markets.
+            let is_rapid_reversal = direction_changed && time_diff < 180;
+            let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
+
             // --- Updated Decision Matrix ---
             let should_notify =
-                // Priority 1: Trend Reversal (Always notify)
-                direction_changed 
-                // Priority 2: Standard New Entry (Not in trade, cooldown passed)
-                || (!direction_changed && cooldown_passed && !already_in_trade)
-                // Priority 3: Pyramiding Exception (In trade, but strong breakout)
-                || (already_in_trade && is_pyramiding_breakout);
+                // Priority 1: Trend Reversal (Notify if valid/strong enough)
+                is_valid_reversal 
+                // Priority 2: Standard New Entry (Cooldown passed)
+                || (!direction_changed && cooldown_passed)
+                // Priority 3: Pyramiding Exception (Strong breakout)
+                || is_pyramiding_breakout;
 
             if should_notify {
                 // Tag the signal if it's a pyramid entry
@@ -232,7 +231,6 @@ impl TradingSession {
                     symbol = %self.symbol,
                     reason = "Suppressed by anti-spam filter",
                     time_since_last = time_diff,
-                    already_in_trade = already_in_trade,
                     "Scalp signal suppressed."
                 );
                 self.latest_scalp_signal = None; 
@@ -244,6 +242,27 @@ impl TradingSession {
 
         // Placeholder for position management logic
         self.manage_positions();
+    }
+
+    /// Helper to update a buffer.
+    /// If `new_data` is large (> 10 items), it replaces the buffer (Sync).
+    /// If `new_data` is small, it appends to the buffer and maintains MAX_BUFFER_SIZE (Incremental).
+    fn update_buffer(buffer: &mut VecDeque<f64>, new_data: &Vec<f64>) {
+        if new_data.is_empty() { return; }
+
+        if new_data.len() > 10 {
+            // Assume full sync
+            buffer.clear();
+            buffer.extend(new_data.iter().cloned());
+        } else {
+            // Assume incremental update
+            for &val in new_data {
+                buffer.push_back(val);
+                if buffer.len() > MAX_BUFFER_SIZE {
+                    buffer.pop_front();
+                }
+            }
+        }
     }
 
     /// Builds an `EvalRequest` for a specific engine using the session's data.
@@ -271,7 +290,7 @@ impl TradingSession {
             h4_lows: Some(self.h4_lows.iter().cloned().collect()),
             d1_opens: Some(self.d1_opens.iter().cloned().collect()),
             d1_closes: Some(self.d1_closes.iter().cloned().collect()),
-            open_positions: Some(if mode == "scalp" { self.open_scalp_positions.clone() } else { self.open_swing_positions.clone() }),
+            open_positions: None,
             mode: mode.to_string(),
             current_price: original_req.current_price, // Use the live price from the original request
             last_m1_timestamp: self.last_evaluation_timestamp,
@@ -295,9 +314,7 @@ impl TradingSession {
 
     /// Placeholder for logic to manage open trades (e.g., trailing stops).
     fn manage_positions(&mut self) {
-        // Here you would iterate through `self.open_scalp_positions` and `self.open_swing_positions`
-        // and decide if any actions (like closing or updating SL/TP) are needed based on new data.
-        info!(symbol = %self.symbol, "Checking open positions (scalp: {}, swing: {}).", self.open_scalp_positions.len(), self.open_swing_positions.len());
+        // Position management logic removed as server no longer tracks open positions.
     }
 
     pub fn get_latest_signals(&self) -> (Option<EvalResponse>, Option<EvalResponse>) {
@@ -324,37 +341,20 @@ impl TradingSession {
         self.latest_scalp_signal = None;
         self.latest_swing_signal = None;
     }
-
-    /// Adds a new trade log to this session.
-    pub fn add_trade_log(&mut self, log: TradeLog) {
-        self.trade_logs.push_front(log);
-    }
-
-    /// Returns a clone of the trade logs for this session.
-    pub fn get_trade_logs(&self) -> VecDeque<TradeLog> {
-        self.trade_logs.clone()
-    }
-
-    /// Clears all trade logs for this session.
-    pub fn clear_trade_logs(&mut self) {
-        self.trade_logs.clear();
-    }
 }
 
 /// Manages all active TradingSessions, keyed by symbol.
 /// This is the main stateful component of the application.
 #[derive(Clone, Default)]
 pub struct SessionManager {
-    pub sessions: Arc<Mutex<HashMap<String, TradingSession>>>,
+    pub sessions: Arc<DashMap<String, Arc<Mutex<TradingSession>>>>,
 }
 
 impl SessionManager {
-    pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> std::sync::MutexGuard<'_, HashMap<String, TradingSession>> {
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.entry(symbol.to_string()).or_insert_with(|| {
+    pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> Arc<Mutex<TradingSession>> {
+        self.sessions.entry(symbol.to_string()).or_insert_with(|| {
             info!("Creating new trading session for symbol: {}", symbol);
-            TradingSession::new(symbol.to_string(), filter_scalp_by_swing)
-        });
-        sessions
+            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing)))
+        }).clone()
     }
 }

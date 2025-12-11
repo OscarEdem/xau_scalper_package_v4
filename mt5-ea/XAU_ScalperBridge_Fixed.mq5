@@ -41,9 +41,6 @@ input int    MaxPyramidEntries = 3;           // Maximum number of simultaneous 
 input double PyramidProfitPips = 15.0;        // Pips in profit required before adding a position
 input double PyramidRiskScale = 0.5;          // Scale risk for next entry (e.g., 0.5 = 50% of previous risk)
 
-// --- Logging Inputs ---
-input bool   EnableServerLogging = true;
-
 // --- NEW: Real-time Tick Bridge Inputs ---
 input bool   EnableTickBridge = true;             // Enable sending real-time ticks via HTTP
 
@@ -62,7 +59,6 @@ double CalculateLotSize(double stop_loss_pips, string symbol, double point_value
 string GetJsonValue(string json, string key, bool is_string);
 string GetNestedJsonValue(string json, string object_key, string value_key, bool is_string);
 int CountOpenPositions(ENUM_POSITION_TYPE direction);
-void LogEvent(string event_type, ulong ticket, string symbol, string direction, double lot_size, double price, double sl, double tp, double profit, string comment);
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -127,9 +123,6 @@ void OnTick()
      }
    last_bar = rates[0].time;
 
-   // If the tick bridge is the only thing enabled, we can stop here.
-   if(!EnableServerLogging && !EnablePyramiding) return;
-
 // --- Pre-trade checks ---
    double ask=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid=SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -179,34 +172,6 @@ void OnTick()
       Print("Could not get enough D1 bar data. Need ", NumCloses, " bars.");
       return;
      }
-
-// --- Prepare open positions data for server ---
-   string open_positions_json = "[";
-   int open_pos_count = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-        {
-         if(open_pos_count > 0)
-            open_positions_json += ",";
-
-         ulong ticket = PositionGetTicket(i);
-         string direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "buy" : "sell";
-         double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl = PositionGetDouble(POSITION_SL);
-         double tp = PositionGetDouble(POSITION_TP);
-         double lots = PositionGetDouble(POSITION_VOLUME);
-         datetime entry_time = (datetime)PositionGetInteger(POSITION_TIME);
-         string mode = "scalp"; // Default mode, server can override
-
-         open_positions_json += StringFormat(
-                                   "{\"ticket\":%llu,\"symbol\":\"%s\",\"direction\":\"%s\",\"entryPrice\":%.5f,\"sl\":%.5f,\"tp\":%.5f,\"lotSize\":%.2f,\"entryTimestamp\":\"%s\",\"mode\":\"%s\"}",
-                                   ticket, _Symbol, direction, entry_price, sl, tp, lots, TimeToString(entry_time, TIME_DATE | TIME_SECONDS), mode
-                                );
-         open_pos_count++;
-        }
-     }
-   open_positions_json += "]";
 
 // Build the JSON payload
    string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
@@ -298,7 +263,6 @@ void OnTick()
                             "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],"
                             "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],"
                             "\"d1Opens\":[%s],\"d1Closes\":[%s],"
-                            "\"openPositions\":%s,\"upcomingEvents\":[],"
                             "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
                             "\"spreadLimitPoints\":%.1f,"
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
@@ -315,7 +279,6 @@ void OnTick()
                             h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str,
                             h4_closes_str, h4_highs_str, h4_lows_str,
                             d1_opens_str, d1_closes_str,
-                            open_positions_json,
                             RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
                             StochKPeriod, StochDPeriod, StochSlowing,
                             SlAtrMultiplier, TpAtrMultiplier,
@@ -468,20 +431,13 @@ void OnTick()
             if(recommended_order_type == "limit_long" && limit_price > 0)
               {
                datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
-               if(trade.BuyLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit BUY"))
-                 {
-                  LogEvent("Pending", trade.ResultOrder(), _Symbol, "Buy Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
-                 }
+               trade.BuyLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit BUY");
               }
             else if(recommended_order_type == "market_long")
                  {
                   if(trade.Buy(lot_size, _Symbol, ask, sl_price, tp1_price, "XAU Scalper Bridge BUY"))
                     {
                      ulong ticket = trade.ResultDeal();
-                     if(PositionSelectByTicket(ticket))
-                       {
-                        LogEvent("Open", ticket, _Symbol, "Buy", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-                       }
                     }
                  }
            }
@@ -514,10 +470,7 @@ void OnTick()
                if(recommended_order_type == "limit_short" && limit_price > 0)
                  {
                   datetime expiration = (expiration_seconds > 0) ? TimeCurrent() + expiration_seconds : 0;
-                  if(trade.SellLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit SELL"))
-                    {
-                     LogEvent("Pending", trade.ResultOrder(), _Symbol, "Sell Limit", lot_size, limit_price, sl_price, tp1_price, 0.0, reason);
-                    }
+                  trade.SellLimit(lot_size, limit_price, _Symbol, sl_price, tp1_price, ORDER_TIME_GTC, expiration, "XAU Bridge Limit SELL");
                  }
                else
                   if(recommended_order_type == "market_short")
@@ -525,61 +478,10 @@ void OnTick()
                      if(trade.Sell(lot_size, _Symbol, bid, sl_price, tp1_price, "XAU Scalper Bridge SELL"))
                        {
                         ulong ticket = trade.ResultDeal();
-                        if(PositionSelectByTicket(ticket))
-                          {
-                           LogEvent("Open", ticket, _Symbol, "Sell", lot_size, PositionGetDouble(POSITION_PRICE_OPEN), sl_price, tp1_price, 0.0, reason);
-                          }
                        }
                     }
               }
            }
-     }
-  }
-
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &res)
-  {
-// --- NEW: Log trade closures ---
-   if(!EnableServerLogging)
-      return;
-
-// We are interested in completed deals that close a position
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL)
-     {
-      // A deal is added to history. Check if it closes a position.
-      // We can check this by looking for a corresponding position ticket in the deal.
-      if(HistoryDealSelect(trans.deal))
-        {
-         long position_id = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-         if(PositionSelectByTicket(position_id))
-           {
-            // Position still exists, this was an entry deal.
-            return;
-           }
-         else
-           {
-            // Position does not exist, this was a closing deal.
-            if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == MagicNumber)
-              {
-               string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
-               if(deal_symbol == _Symbol)
-                 {
-                  ulong ticket = HistoryDealGetInteger(trans.deal, DEAL_TICKET);
-                  string direction = (HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY) ? "Buy Close" : "Sell Close";
-                  double lots = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
-                  double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-                  double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-                  string comment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
-
-                  // Log the closing event
-                  LogEvent("Close", ticket, deal_symbol, direction, lots, price, 0.0, 0.0, profit, comment);
-
-                 }
-              }
-           }
-        }
      }
   }
 
@@ -613,35 +515,6 @@ int CountOpenPositions(ENUM_POSITION_TYPE direction)
         }
      }
    return count;
-  }
-
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
-void LogEvent(string event_type, ulong ticket, string symbol, string direction, double lot_size, double price, double sl, double tp, double profit, string comment)
-  {
-   if(!EnableServerLogging)
-      return;
-
-// Escape special characters in comment for JSON
-   string json_comment = comment;
-   StringReplace(json_comment, "\\", "\\\\");
-   StringReplace(json_comment, "\"", "\\\"");
-
-   string log_payload = StringFormat(
-                           "{\"timestamp\":\"%s\",\"eventType\":\"%s\",\"ticket\":%llu,\"symbol\":\"%s\","
-                           "\"direction\":\"%s\",\"lotSize\":%.2f,\"price\":%.5f,\"sl\":%.5f,\"tp\":%.5f,"
-                           "\"profit\":%.2f,\"comment\":\"%s\"}",
-                           TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), event_type, ticket, symbol,
-                           direction, lot_size, price, sl, tp, profit, json_comment
-                        );
-
-// Use separate buffers for logging to not interfere with the main eval request
-   char log_post_data[];
-   char log_result[];
-   string log_result_headers;
-   StringToCharArray(log_payload, log_post_data); // Corrected function call
-   WebRequest("POST", ServerUrl + "/log_trade", "Content-Type: application/json", 1000, log_post_data, log_result, log_result_headers);
   }
 
 //+------------------------------------------------------------------+

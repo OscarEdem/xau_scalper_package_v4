@@ -25,6 +25,8 @@ futures-util = "0.3"
 rand = "0.8"
 rand_distr = "0.4"
 
+[dependencies.anyhow]
+version = "1.0"
 [dependencies.csv]
 version = "1.3.0"
 
@@ -36,3 +38,6 @@ version = "1.8.1"
 
 [dependencies.dashmap]
 version = "5.5.3"
+
+[dependencies.dotenvy]
+version = "0.15"
