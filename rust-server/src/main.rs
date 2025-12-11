@@ -12,22 +12,25 @@ use axum::routing::post;
 use chrono::Utc;
 use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
 use dashmap::DashMap;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 use utoipa::{OpenApi};
-use utoipa_swagger_ui::SwaggerUi; pub use xau_scalper_server::{news_fetcher::fetch_investing_calendar};
+use utoipa_swagger_ui::SwaggerUi; pub use xau_scalper_server::{news_fetcher::fetch_calendar_events};
 use tokio::fs; // Use tokio's async fs module
 pub use xau_scalper_server::{
-    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands
+    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent
 };
 
 mod gemini;
 mod routes;
+mod config;
 
-const PUSH_TOKENS_FILE: &str = "push_tokens.json";
+use prometheus::{Encoder, TextEncoder, register_counter, register_gauge, Counter, Gauge};
+use lazy_static::lazy_static;
+use crate::config::Settings;
 
 #[derive(serde::Serialize, utoipa::ToSchema, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +54,8 @@ pub struct ApplicationState {
     // NEW: Metrics
     server_start_time: chrono::DateTime<chrono::Utc>,
     total_signals_generated: Arc<AtomicUsize>,
+    http_client: reqwest::Client,
+    config: Settings,
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -83,14 +88,6 @@ struct SavePushTokenRequest {
     token: String,
 }
 
-/// Request body for updating a session's configuration.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct UpdateSessionConfigRequest {
-    /// The name of the predictor model to use (e.g., "gbm", "heston", "lstm").
-    predictor_model: String,
-}
-
 /// Represents a single market tick.
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +96,19 @@ struct TickData {
     bid: f64,
     ask: f64,
     timestamp: i64,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SignalReasonInfo {
+    explanation: String,
+    advice: String,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SignalDefinitionsResponse {
+    definitions: HashMap<String, SignalReasonInfo>,
 }
 
 /// Server performance and usage metrics.
@@ -121,14 +131,15 @@ struct MetricsResponse {
         get_latest_signals_handler,
         get_all_latest_signals_handler,
         get_signals_handler,
-        update_session_config_handler,
         save_push_token_handler,
         routes::fundamental_analysis,
         get_loaded_models_handler,
-        metrics_handler
+        get_signal_definitions_handler,
+        metrics_handler,
+        prometheus_metrics_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, UpdateSessionConfigRequest, TickData, MetricsResponse)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsResponse, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -137,31 +148,42 @@ struct MetricsResponse {
 )]
 struct ApiDoc;
 
+lazy_static! {
+    static ref SIGNAL_COUNTER: Counter = register_counter!("xau_scalper_signals_total", "Total number of signals generated").unwrap();
+    static ref ACTIVE_SESSIONS: Gauge = register_gauge!("xau_scalper_active_sessions", "Number of active trading sessions").unwrap();
+    static ref ACTIVE_WS_CLIENTS: Gauge = register_gauge!("xau_scalper_active_ws_clients", "Number of active WebSocket clients").unwrap();
+    static ref HTTP_REQUESTS: Counter = register_counter!("xau_scalper_http_requests_total", "Total HTTP requests received").unwrap();
+}
+
 #[tokio::main]
 async fn main() {
     // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // --- NEW: Load Configuration ---
+    let config = Settings::new().expect("Failed to load configuration");
+    tracing::info!("Configuration loaded. Max buffer size: {}", config.trading.max_buffer_size);
+
     // --- NEW: Load push tokens from file on startup ---
-    let initial_push_tokens = match fs::read_to_string(PUSH_TOKENS_FILE).await {
+    let initial_push_tokens = match fs::read_to_string(&config.paths.push_tokens_file).await {
         Ok(content) => {
             let tokens: BTreeSet<String> = serde_json::from_str(&content).unwrap_or_default();
-            tracing::info!("Loaded {} push notification tokens from {}", tokens.len(), PUSH_TOKENS_FILE);
+            tracing::info!("Loaded {} push notification tokens from {}", tokens.len(), config.paths.push_tokens_file);
             tokens
         }
         Err(_) => {
-            tracing::info!("No '{}' file found. Starting with an empty set of push tokens.", PUSH_TOKENS_FILE);
+            tracing::info!("No '{}' file found. Starting with an empty set of push tokens.", config.paths.push_tokens_file);
             BTreeSet::new()
         }
     };
 
     // Initialize the shared state
     let shared_state = ApplicationState {
-        session_manager: SessionManager::default(),
-        predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::default(),
+        session_manager: SessionManager::new(config.trading.max_buffer_size),
+        predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::new(config.paths.models_dir.clone()),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
         // Use the tokens loaded from the file
         push_tokens: Arc::new(Mutex::new(initial_push_tokens)),
@@ -170,6 +192,11 @@ async fn main() {
         ws_clients: Arc::new(AtomicUsize::new(0)),
         server_start_time: Utc::now(),
         total_signals_generated: Arc::new(AtomicUsize::new(0)),
+        http_client: reqwest::Client::builder()
+            .user_agent("xau_scalper_ml/1.0")
+            .build()
+            .unwrap(),
+        config: config.clone(),
     };
 
     // --- Background task for stale signal cleanup (invalidates signals in live sessions) ---
@@ -229,14 +256,14 @@ async fn main() {
     tokio::spawn(async move {
         // Fetch immediately on startup
         tracing::info!("Performing initial fetch of weekly news events from Forex Factory...");
-        let initial_events = fetch_investing_calendar().await;
+        let initial_events = fetch_calendar_events().await;
         *news_fetch_state.news_events.lock().unwrap() = initial_events;
 
         loop {
             // Then, fetch every 6 hours
             tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)).await;
             tracing::info!("Periodically fetching weekly news events from Forex Factory...");
-            let events = fetch_investing_calendar().await;
+            let events = fetch_calendar_events().await;
             // Only update if we actually got new events, to avoid clearing on a failed fetch
             if !events.is_empty() {
                 *news_fetch_state.news_events.lock().unwrap() = events;
@@ -259,14 +286,15 @@ async fn main() {
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/ws", get(websocket_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/metrics/prometheus", get(prometheus_metrics_handler)) // NEW: Prometheus endpoint
         .route("/health", get(health_check_handler))
         .route("/data", post(process_data_handler)) // For main analysis
         .route("/ticks", post(tick_ingest_handler)) // NEW: For live ticks
         .route("/signals/:symbol", get(get_latest_signals_handler))
         .route("/signals/latest", get(get_all_latest_signals_handler))
         .route("/signals", get(get_signals_handler))
+        .route("/definitions/reasons", get(get_signal_definitions_handler))
         // --- Add new routes for logging ---
-        .route("/sessions/:symbol/config", post(update_session_config_handler))
         .route("/save-push-token", post(save_push_token_handler))
         .route("/models/loaded", get(get_loaded_models_handler))
         // --- Analysis Endpoints ---
@@ -274,8 +302,9 @@ async fn main() {
         // Provide the state to all handlers
         .with_state(app_state_with_ticks);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    tracing::info!("listening on {}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -295,6 +324,7 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
     // Increment the active WS client counter and log the new total
     let prev = state.inner.ws_clients.fetch_add(1, Ordering::SeqCst);
     let new_total = prev + 1;
+    ACTIVE_WS_CLIENTS.set(new_total as f64);
     tracing::info!("New WebSocket client connected. Starting live tick stream... total_clients={}", new_total);
 
     let mut rx = state.tick_tx.subscribe();
@@ -312,6 +342,7 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                         if socket.send(Message::Text(msg)).await.is_err() {
                             let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
                             tracing::info!("WebSocket client disconnected while sending tick. remaining_clients={}", remaining);
+                            ACTIVE_WS_CLIENTS.set(remaining as f64);
                             break;
                         }
                     }
@@ -331,6 +362,7 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                 if socket.send(Message::Ping(Vec::new())).await.is_err() {
                     let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
                     tracing::info!("WebSocket client disconnected during keepalive ping. remaining_clients={}", remaining);
+                    ACTIVE_WS_CLIENTS.set(remaining as f64);
                     break;
                 }
             }
@@ -377,6 +409,57 @@ async fn documented_tick_ingest_handler() {}
 
 #[utoipa::path(
     get,
+    path = "/definitions/reasons",
+    responses(
+        (status = 200, description = "Returns a dictionary of signal reasons and their explanations", body = SignalDefinitionsResponse)
+    )
+)]
+/// Handler to return a dictionary of signal reasons and their explanations.
+async fn get_signal_definitions_handler() -> Json<SignalDefinitionsResponse> {
+    let mut definitions = HashMap::new();
+
+    macro_rules! insert {
+        ($key:expr, $expl:expr, $adv:expr) => {
+            definitions.insert($key.to_string(), SignalReasonInfo {
+                explanation: $expl.to_string(),
+                advice: $adv.to_string(),
+            });
+        };
+    }
+
+    // Scalp Reasons
+    insert!("HTF Bullish Bias", "The Higher Timeframes (H1/H4) are trending Up.", "Trade with confidence. Aligning with the big trend increases win rate.");
+    insert!("HTF Bearish Bias", "The Higher Timeframes (H1/H4) are trending Down.", "Trade with confidence. Aligning with the big trend increases win rate.");
+    insert!("Ensemble Bullish Bias", "Our AI models (LSTM, GBM, Heston) collectively predict price rising.", "High Confidence. Mathematical models agree with the technicals.");
+    insert!("Ensemble Bearish Bias", "Our AI models (LSTM, GBM, Heston) collectively predict price falling.", "High Confidence. Mathematical models agree with the technicals.");
+    insert!("Bullish M5 Flow", "The 5-minute momentum (Kalman Filter) is sloping upwards.", "Momentum Entry. Price is currently moving in your favor.");
+    insert!("Bearish M5 Flow", "The 5-minute momentum (Kalman Filter) is sloping downwards.", "Momentum Entry. Price is currently moving in your favor.");
+    insert!("M1 Bullish Surge", "A sudden burst of buying volume/speed detected on the 1-minute chart.", "Precision Timing. This confirms the exact moment to enter.");
+    insert!("M1 Bearish Surge", "A sudden burst of selling volume/speed detected on the 1-minute chart.", "Precision Timing. This confirms the exact moment to enter.");
+    insert!("Bullish Inducement", "Price swept a recent low to trap sellers, then reversed up.", "Reversal Trade. Expect a fast move away from the trap. Use a tighter Stop Loss.");
+    insert!("Bearish Inducement", "Price swept a recent high to trap buyers, then reversed down.", "Reversal Trade. Expect a fast move away from the trap. Use a tighter Stop Loss.");
+    insert!("Breakout_Add", "This is a 'Pyramiding' signal. The trend is strong, and we are adding to a winner.", "Add to Position. Only take this if your first trade is already in profit.");
+
+    // Swing Reasons
+    insert!("Bullish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major support level but closed back above it.", "Strong Reversal. Institutions bought the lows. Target the next high.");
+    insert!("Bearish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major resistance level but closed back below it.", "Strong Reversal. Institutions sold the highs. Target the next low.");
+    insert!("Bullish Displacement", "A large, strong green candle broke market structure.", "Trend Start. This indicates 'Smart Money' has entered the market with intent.");
+    insert!("Bearish Displacement", "A large, strong red candle broke market structure.", "Trend Start. This indicates 'Smart Money' has entered the market with intent.");
+    insert!("Bullish FVG Support", "Price is reacting off a 'Fair Value Gap' (Imbalance) created by buyers.", "Limit Entry. These gaps often act as magnets and then trampolines for price.");
+    insert!("Bearish FVG Resistance", "Price is reacting off a 'Fair Value Gap' (Imbalance) created by sellers.", "Limit Entry. These gaps often act as magnets and then ceilings for price.");
+
+    // Blocking/Status
+    insert!("Blocked: Volatility Spike Detected", "The market is moving abnormally fast (ATR Spike).", "Safety First. Algorithms are paused to prevent getting stopped out by noise.");
+    insert!("Blocked: Low Trend Strength (ADX)", "The market is flat/ranging (ADX is very low).", "No Trade. Scalping strategies fail in flat markets. Wait for a breakout.");
+    insert!("Filtered: Scalp signal conflicts with swing trend", "The Scalp engine wanted to trade, but the Swing trend is opposite.", "Trend Filter. We blocked a counter-trend trade to protect your capital.");
+    insert!("No Signal (low conviction)", "The setup appeared but didn't reach the required confidence score (e.g., < 45%).", "Patience. The setup wasn't 'A+' quality. Better to wait for a clearer setup.");
+    insert!("No Signal (SL sanity check failed)", "The calculated Stop Loss was either dangerously tight or way too wide.", "Risk Management. The risk profile for this specific candle setup was unsafe.");
+
+    Json(SignalDefinitionsResponse { definitions })
+}
+
+#[utoipa::path(
+    get,
     path = "/metrics",
     responses(
         (status = 200, description = "Returns server performance and usage metrics", body = MetricsResponse)
@@ -393,6 +476,22 @@ async fn metrics_handler(
         active_websockets: state.inner.ws_clients.load(Ordering::SeqCst),
     };
     Json(metrics)
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics/prometheus",
+    responses(
+        (status = 200, description = "Returns Prometheus metrics", body = String, content_type = "text/plain")
+    )
+)]
+/// Handler to return Prometheus metrics.
+async fn prometheus_metrics_handler() -> String {
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = vec![];
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
 }
 
 // We need to add the broadcast sender to our application state
@@ -444,13 +543,14 @@ async fn save_push_token_handler(
     // --- NEW: Persist tokens to file if a new one was added ---
     if inserted {
         tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
+        let file_path = state.inner.config.paths.push_tokens_file.clone();
         // Clone the tokens to write them to the file without holding the lock.
         let tokens_to_save = tokens.clone();
         // In a separate task to avoid blocking the response.
         tokio::spawn(async move {
             if let Ok(json) = serde_json::to_string(&tokens_to_save) {
-                if let Err(e) = fs::write(PUSH_TOKENS_FILE, json).await {
-                    tracing::error!("Failed to write push tokens to file: {}", e);
+                if let Err(e) = fs::write(&file_path, json).await {
+                    tracing::error!("Failed to write push tokens to file {}: {}", file_path, e);
                 }
             }
         });
@@ -490,105 +590,91 @@ async fn get_signals_handler(State(state): State<Arc<ApplicationStateWithTicks>>
 #[axum::debug_handler]
 async fn process_data_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(mut req): Json<EvalRequest>,
-) -> (StatusCode, Json<&'static str>) {
+    Json(mut req): Json<EvalRequest<'static>>,
+) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
+    HTTP_REQUESTS.inc();
     tracing::info!(
         symbol = %req.symbol,
         timeframe = %req.timeframe,
         closes_count = req.closes.len(),
+        m5_count = req.m5_closes.len(),
+        h1_count = req.h1_closes.as_ref().map_or(0, |v| v.len()),
         "Received data processing request"
     );
 
     // Also broadcast this incoming data as a tick-like message to any connected WebSocket clients
     // and store it in the tick history so newly-connected clients receive recent data.
     // We construct a simple JSON payload that the WS clients expect (stringified JSON).
-    let tick_payload = serde_json::json!({
-        "type": "tick",
-        "symbol": req.symbol.clone(),
-        "currentPrice": req.current_price,
-        "spreadPoints": req.spread_points.unwrap_or(0.0),
-        "lastM1Timestamp": req.last_m1_timestamp,
-    })
-    .to_string();
+    
+    // Optimization: Only serialize and send if there are actual subscribers
+    if state.tick_tx.receiver_count() > 0 {
+        let tick_payload = serde_json::json!({
+            "type": "tick",
+            "symbol": req.symbol.clone(),
+            "currentPrice": req.current_price,
+            "spreadPoints": req.spread_points.unwrap_or(0.0),
+            "lastM1Timestamp": req.last_m1_timestamp,
+        })
+        .to_string();
 
-    if state.tick_tx.send(tick_payload).is_err() {
-        tracing::debug!("No active WebSocket clients to broadcast tick to.");
+        let _ = state.tick_tx.send(tick_payload);
     }
 
     // --- NEW: Inject cached news events into the request ---
     let news = state.inner.news_events.lock().unwrap().clone();
-    req.upcoming_events = Some(news);
+    req.upcoming_events = Some(std::borrow::Cow::Owned(news));
 
     // For now, we assume a global config for filtering. This could also be part of the request.
     let filter_scalp_by_swing = true;
 
-    // --- NEW: Define signals to send outside the lock scope ---
-    let mut signals_to_send = Vec::new();
-
-    // Scope the mutex lock to release it before the .await call
-    {
-        let symbol = req.symbol.clone(); // Clone the symbol before `req` is moved.
+    // --- PERFORMANCE FIX: Offload heavy math to a blocking thread ---
+    // This prevents the async runtime from stalling during indicator calculation/ONNX inference.
+    let state_clone = state.clone();
+    
+    let signals_to_send = tokio::task::spawn_blocking(move || {
+        let mut signals = Vec::new();
+        let symbol = req.symbol.to_string();
 
         // Use the helper to get the session Arc, handling the map lock internally
-        let session_arc = state.inner.session_manager.get_or_create_session(&symbol, filter_scalp_by_swing);
+        let session_arc = state_clone.inner.session_manager.get_or_create_session(&symbol, filter_scalp_by_swing);
+        ACTIVE_SESSIONS.set(state_clone.inner.session_manager.sessions.len() as f64);
         
         // Lock the specific session
         let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
 
-        // --- Get old signals BEFORE processing new data ---
-        let (old_scalp_sig, old_swing_sig) = session.get_latest_signals();
+        // Process data (Heavy CPU work happens here)
+        let new_signals = session.on_data(req, &state_clone.inner.predictor_cache);
 
-        // Process data, which updates the signals within the session
-        session.on_data(req, &state.inner.predictor_cache);
-
-        // Now, get the new signals and add them to history
-        let (scalp_sig_opt, swing_sig_opt) = session.get_latest_signals();
-        let mut history = state.inner.signal_history.lock().unwrap_or_else(|e| e.into_inner());
-
+        // Add to history
+        let mut history = state_clone.inner.signal_history.lock().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now().timestamp();
 
-        if let Some(swing_sig) = swing_sig_opt {
-            // Check if it's a new, actionable signal
-            if swing_sig.entry_type != "none" && old_swing_sig.as_ref().map_or(true, |old| old.signal_id != swing_sig.signal_id) {
-                signals_to_send.push((swing_sig.clone(), symbol.clone()));
-                
-                // Store in history only if it's a new, actionable signal
-                history.push_front(HistoricalSignal {
-                    signal: ActiveSignal {
-                        symbol: symbol.clone(),
-                        signal: swing_sig,
-                    },
-                    created_at: now,
-                });
-            }
+        for sig in new_signals {
+            signals.push((sig.clone(), symbol.clone()));
+            history.push_front(HistoricalSignal {
+                signal: ActiveSignal { symbol: symbol.clone(), signal: sig },
+                created_at: now,
+            });
         }
-        if let Some(scalp_sig) = scalp_sig_opt {
-            // Check if it's a new, actionable signal
-            if scalp_sig.entry_type != "none" && old_scalp_sig.as_ref().map_or(true, |old| old.signal_id != scalp_sig.signal_id) {
-                signals_to_send.push((scalp_sig.clone(), symbol.clone()));
-
-                // Store in history only if it's a new, actionable signal
-                history.push_front(HistoricalSignal {
-                    signal: ActiveSignal {
-                        symbol: symbol.clone(),
-                        signal: scalp_sig,
-                    },
-                    created_at: now,
-                });
-            }
-        }
-    } // --- The `sessions` lock is dropped here ---
+        signals
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to join blocking task: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // --- NEW: Send notifications AFTER releasing the lock ---
     let num_new_signals = signals_to_send.len();
     if num_new_signals > 0 {
         state.inner.total_signals_generated.fetch_add(num_new_signals, Ordering::SeqCst);
+        SIGNAL_COUNTER.inc_by(num_new_signals as f64);
     }
     for (signal, symbol) in signals_to_send {
         send_push_notification(state.inner.push_tokens.clone(), &signal, &symbol).await;    
     }
 
-    (StatusCode::OK, Json("Data processed"))
+    Ok((StatusCode::OK, Json("Data processed")))
 }
 
 /// Sends a push notification for a new signal to all registered devices.
@@ -625,42 +711,6 @@ async fn send_push_notification(
     match client.send_push_notifications(messages).await {
         Ok(receipts) => tracing::info!("Push notifications sent successfully: {:?}", receipts),
         Err(e) => tracing::error!("Failed to send push notifications: {:?}", e),
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/sessions/{symbol}/config",
-    params(
-        ("symbol" = String, Path, description = "The trading symbol to configure, e.g., XAUUSD")
-    ),
-    request_body = UpdateSessionConfigRequest,
-    responses(
-        (status = 200, description = "Session configuration updated successfully"),
-        (status = 404, description = "No session found for the specified symbol")
-    )
-)]
-/// Handler to update the configuration for a specific trading session.
-async fn update_session_config_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Path(symbol): Path<String>,
-    Json(body): Json<UpdateSessionConfigRequest>,
-) -> Result<Json<&'static str>, StatusCode> {
-    let sessions = &state.inner.session_manager.sessions;
-
-    if let Some(session_arc) = sessions.get(&symbol) {
-        let mut session = session_arc.lock().unwrap();
-        tracing::info!(
-            symbol = %symbol,
-            old_model = %session.predictor_model,
-            new_model = %body.predictor_model,
-            "Updating predictor model for session."
-        );
-        session.predictor_model = body.predictor_model;
-        Ok(Json("Session configuration updated"))
-    } else {
-        tracing::warn!("Attempted to configure non-existent session for symbol: {}", symbol);
-        Err(StatusCode::NOT_FOUND)
     }
 }
 

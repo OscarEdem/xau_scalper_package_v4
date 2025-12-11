@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🌉 XAU Scalper Bridge v7
+# 🌉 XAU Scalper Bridge v4
 
 ### A High-Performance Algorithmic Trading System for XAU/USD
 
@@ -12,7 +12,7 @@
 
 ---
 
-**XAU Scalper Bridge** is a sophisticated, multi-component algorithmic trading system designed for scalping the XAU/USD (Gold) market. It leverages a high-performance Rust backend for complex signal analysis and a robust MQL5 Expert Advisor (EA) for seamless integration with the MetaTrader 5 terminal.
+**XAU Scalper Bridge** is a sophisticated, multi-component algorithmic trading system designed for scalping and swing trading the XAU/USD (Gold) market. It leverages a high-performance Rust backend for complex signal analysis, incorporating AI models (LSTM, GBM, Heston) and institutional trading concepts (Smart Money Concepts).
 
 The core philosophy is to trade **quality over quantity** by waiting for a confluence of technical factors across multiple timeframes before executing a trade.
 
@@ -21,8 +21,11 @@ The core philosophy is to trade **quality over quantity** by waiting for a confl
 The system is composed of two primary components that work in tandem:
 
 1.  **Rust Server (The Brain):** A powerful `axum` web server that receives market data from the EA. It performs complex, multi-timeframe analysis using a pre-defined strategy to calculate a trade signal and a "conviction score". It also acts as a central repository for all trade history.
+    *   **Engines:** Scalp Engine (Kalman Filter, Momentum) and Swing Engine (Market Structure, Liquidity).
+    *   **AI Integration:** Uses ONNX runtime for LSTM models and statistical methods for price prediction.
+    *   **Notification Hub:** Sends push notifications via Expo and broadcasts live data via WebSockets.
 
-2.  **MQL5 Expert Advisor (The Bridge):** An EA that runs on the MetaTrader 5 chart. Its job is to collect M1 and M5 market data, send it to the Rust server, execute trades based on the server's response, manage the position with an advanced trailing stop, and log all trade events back to the server.
+2.  **MQL5 Expert Advisor (The Bridge):** An EA that runs on the MetaTrader 5 chart. Its primary job is to collect M1, M5, and H1 market data and send it to the Rust server.
 
 ```
 +---------------------------+      (1) Market Data (M1/M5)      +---------------------+
@@ -116,11 +119,11 @@ The server provides a powerful interface for monitoring and analysis.
 
 ### Interactive API Docs (Swagger UI)
 
-Navigate to `http://127.0.0.1:3000/swagger-ui` in your browser to see a full, interactive documentation of all available API endpoints.
+Navigate to `http://127.0.0.1:3000/docs` in your browser to see a full, interactive documentation of all available API endpoints.
 
 ### API Endpoints
 
-| Method | Endpoint      | Description                                                                                             |
+| Method | Endpoint               | Description                                                                 |
 | :----- | :------------ | :------------------------------------------------------------------------------------------------------ |
 | `POST` | `/eval`       | The core endpoint used by the EA to get a trade signal.                                                 |
 | `POST` | `/log_trade`  | Used by the EA to send details of opened and closed trades to the server for logging.                     |
@@ -146,7 +149,7 @@ The MQL5 EA has several input parameters for customization:
 | Parameter              | Description                                                                    | Default Value |
 | ---------------------- | ------------------------------------------------------------------------------ | ------------- |
 | `ServerUrl`            | The URL of the Rust server's `/eval` endpoint.                                 | `http://127.0.0.1:3000/eval` |
-| `RiskPercent`          | The percentage of account balance to risk on a full-conviction (score=5) trade. | `0.5`         |
+| `RiskPercent`          | The percentage of account balance to risk on a full-conviction trade. | `0.5`         |
 | `NumCloses`            | **IMPORTANT:** Number of historical bars to send to the server. Must be > 202. | `80` (Change to `250`) |
 | `MaxSpreadPoints`      | The maximum allowed spread in points to place a trade.                         | `160`         |
 | `MagicNumber`          | A unique ID to distinguish this EA's trades from others.                       | `1337`        |
@@ -193,4 +196,3 @@ The project includes a high-speed, parallelized backtester to find the optimal s
 ## 📜 License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
-

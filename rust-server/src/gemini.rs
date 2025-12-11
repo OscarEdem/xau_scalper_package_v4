@@ -7,6 +7,7 @@ const GEMINI_API_URL: &str =
    "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
 
 pub async fn generate_analysis(
+    client: &Client,
     pair: &str,
     recent_data: &str,
     prompt: &str,
@@ -14,8 +15,6 @@ pub async fn generate_analysis(
     // 1. Get API Key
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
-    
-    let client = Client::new();
 
     // 2. Build Request Body
     let body = json!({

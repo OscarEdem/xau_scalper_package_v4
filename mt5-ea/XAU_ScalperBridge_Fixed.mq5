@@ -253,6 +253,11 @@ void OnTick()
      }
 
    long last_m1_timestamp = (long)m1_rates[ArraySize(m1_rates)-1].time;
+   long last_m5_timestamp = (long)m5_rates[ArraySize(m5_rates)-1].time;
+   long last_m30_timestamp = (long)m30_rates[ArraySize(m30_rates)-1].time;
+   long last_h1_timestamp = (long)h1_rates[ArraySize(h1_rates)-1].time;
+   long last_h4_timestamp = (long)h4_rates[ArraySize(h4_rates)-1].time;
+   long last_d1_timestamp = (long)d1_rates[ArraySize(d1_rates)-1].time;
 
    string json_payload = StringFormat(
                             "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
@@ -263,6 +268,7 @@ void OnTick()
                             "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],"
                             "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],"
                             "\"d1Opens\":[%s],\"d1Closes\":[%s],"
+                            "\"lastM5Timestamp\":%lld,\"lastM30Timestamp\":%lld,\"lastH1Timestamp\":%lld,\"lastH4Timestamp\":%lld,\"lastD1Timestamp\":%lld,"
                             "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
                             "\"spreadLimitPoints\":%.1f,"
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
@@ -279,6 +285,7 @@ void OnTick()
                             h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str,
                             h4_closes_str, h4_highs_str, h4_lows_str,
                             d1_opens_str, d1_closes_str,
+                            last_m5_timestamp, last_m30_timestamp, last_h1_timestamp, last_h4_timestamp, last_d1_timestamp,
                             RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
                             StochKPeriod, StochDPeriod, StochSlowing,
                             SlAtrMultiplier, TpAtrMultiplier,

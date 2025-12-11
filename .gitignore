@@ -1,6 +1,7 @@
 # Rust / Cargo
 # Ignore the build directory
-/rust-server/target/
+target/
+rust-server/target/
 
 # Generated data files
 # This file is created by the Dockerfile or convert.ps1 from xauusd_m1_data.csv

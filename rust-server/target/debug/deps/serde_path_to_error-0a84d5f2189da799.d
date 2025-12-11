@@ -1,9 +1,0 @@
-C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server\target\debug\deps\serde_path_to_error-0a84d5f2189da799.d: C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs
-
-C:\Users\USER\Desktop\TestV1\xau_scalper_package_v4-main\rust-server\target\debug\deps\libserde_path_to_error-0a84d5f2189da799.rmeta: C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs
-
-C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs:
-C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs:
-C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs:
-C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs:
-C:\Users\USER\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs:

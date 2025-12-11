@@ -1,5 +1,5 @@
 use crate::NewsEvent;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{error, info};
@@ -9,21 +9,70 @@ use tracing::{error, info};
 struct ForexFactoryEvent {
     title: String,
     country: String,
-    date: String, // e.g., "2025-12-10 13:30:00"
+    date: String,
     impact: String,
-    // We don't need forecast, previous, or actual for now, but they are available.
     forecast: Option<String>,
     previous: Option<String>,
     actual: Option<String>,
 }
 
-/// Fetches and parses the economic calendar from the stable Forex Factory JSON endpoint.
-/// This function is tailored to find high-impact USD news relevant to XAU/USD trading.
-pub async fn fetch_investing_calendar() -> Vec<NewsEvent> {
-    let client = match Client::builder()
-        .user_agent("xau_scalper_ml/1.0")
-        .build()
-    {
+/// Maps ForexFactory country codes to ISO currency codes.
+pub fn map_country_to_currency(country: &str) -> Option<String> {
+    match country.to_uppercase().as_str() {
+        "US" | "USA" | "USD" => Some("USD".to_string()),
+        "EU" | "EMU" | "EUR" | "DE" | "FR" | "IT" | "ES" => Some("EUR".to_string()),
+        "GB" | "UK" | "GBP" | "GREAT BRITAIN" => Some("GBP".to_string()),
+        "CA" | "CAN" | "CAD" | "CANADA" => Some("CAD".to_string()),
+        "AU" | "AUS" | "AUD" | "AUSTRALIA" => Some("AUD".to_string()),
+        "NZ" | "NZD" | "NEW ZEALAND" => Some("NZD".to_string()),
+        "JP" | "JPN" | "JPY" | "JAPAN" => Some("JPY".to_string()),
+        "CH" | "CHF" | "SWITZERLAND" => Some("CHF".to_string()),
+        "CN" | "CNY" | "CHINA" => Some("CNY".to_string()),
+        _ => None,
+    }
+}
+
+/// Determines if New York is in Daylight Saving Time for a given naive datetime.
+/// DST starts 2nd Sunday in March and ends 1st Sunday in November.
+fn is_ny_dst(dt: NaiveDateTime) -> bool {
+    let year = dt.year();
+    
+    // DST starts 2nd Sunday in March at 02:00
+    let march_1 = NaiveDate::from_ymd_opt(year, 3, 1).unwrap();
+    let days_to_sunday_mar = (7 - march_1.weekday().num_days_from_sunday()) % 7;
+    let second_sunday_march = march_1 + Duration::days(days_to_sunday_mar as i64 + 7);
+    let dst_start = second_sunday_march.and_hms_opt(2, 0, 0).unwrap();
+
+    // DST ends 1st Sunday in November at 02:00
+    let nov_1 = NaiveDate::from_ymd_opt(year, 11, 1).unwrap();
+    let days_to_sunday_nov = (7 - nov_1.weekday().num_days_from_sunday()) % 7;
+    let first_sunday_nov = nov_1 + Duration::days(days_to_sunday_nov as i64);
+    let dst_end = first_sunday_nov.and_hms_opt(2, 0, 0).unwrap();
+
+    dt >= dst_start && dt < dst_end
+}
+
+/// Parses ForexFactory datetime (ET) and converts it to UTC timestamp.
+pub fn parse_forexfactory_datetime_to_utc(date_str: &str) -> Option<i64> {
+    // Try parsing standard formats
+    let naive = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
+
+    // Determine offset: EDT is UTC-4, EST is UTC-5
+    let is_dst = is_ny_dst(naive);
+    let offset_hours = if is_dst { -4 } else { -5 };
+    let offset = FixedOffset::east_opt(offset_hours * 3600).unwrap();
+
+    // The naive time is in ET, so we interpret it with that offset
+    let dt_with_tz = offset.from_local_datetime(&naive).single()?;
+    
+    Some(dt_with_tz.with_timezone(&Utc).timestamp())
+}
+
+/// Fetches the entire economic calendar for the week, filtering only by impact.
+pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
+    let client = match Client::builder().user_agent("xau_scalper_ml/1.0").build() {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to build reqwest client: {}", e);
@@ -31,73 +80,58 @@ pub async fn fetch_investing_calendar() -> Vec<NewsEvent> {
         }
     };
 
-    // This public endpoint has been stable for years and is used by many trading tools.
     let url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
-    
     let events: Vec<ForexFactoryEvent> = match client.get(url).send().await {
-        Ok(res) => match res.json().await {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to parse Forex Factory JSON response: {}", e);
-                return vec![];
-            }
-        },
+        Ok(res) => res.json().await.unwrap_or_default(),
         Err(e) => {
             error!("Failed to fetch Forex Factory calendar: {}", e);
             return vec![];
         }
     };
 
-    let now = Utc::now();
-    let mut gold_relevant_events = Vec::new();
-
-    // Major currencies to track
-    let major_currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "CNY"];
+    let now = Utc::now().timestamp();
+    info!("Filtering news events. Server Time (UTC): {}", now);
+    let mut relevant_events = Vec::new();
 
     for event in events {
-        // Filter by impact and major currency
-        if !major_currencies.contains(&event.country.as_str()) {
-            continue;
-        }
-        
-        if event.impact != "High" && event.impact != "Medium" {
-            continue;
-        }
+        // 3. Map country to currency
+        let currency = match map_country_to_currency(&event.country) {
+            Some(c) => c,
+            None => continue,
+        };
 
-        // Parse datetime. The feed usually provides "YYYY-MM-DD HH:MM:SS" without offset.
-        // We assume UTC as this specific feed (nfs.faireconomy.media) is typically UTC.
-        let datetime_utc = DateTime::parse_from_rfc3339(&event.date)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                NaiveDateTime::parse_from_str(&event.date, "%Y-%m-%d %H:%M:%S")
-                    .map(|naive| Utc.from_utc_datetime(&naive))
-            })
-            .unwrap_or_else(|e| {
-                error!("Failed to parse date '{}': {}", event.date, e);
-                Utc::now()
-            });
-
-        // Only consider future events (or events within the last 5 minutes, allowing for delays).
-        if (datetime_utc - now).num_minutes() < -5 {
+        // 4. Filter by Impact (High or Medium only)
+        let impact = event.impact.to_lowercase();
+        if impact != "high" && impact != "medium" {
             continue;
         }
 
-        // Add event
-            let timestamp = datetime_utc.timestamp();
-            gold_relevant_events.push(NewsEvent {
-                event: event.title,
-                timestamp,
-                impact: event.impact.to_lowercase(), // Standardize to "high", "medium", "low"
-                country: event.country,
-                forecast: event.forecast,
-                previous: event.previous,
-                actual: event.actual,
-            });
+        // 5. Timezone correction
+        let timestamp = match parse_forexfactory_datetime_to_utc(&event.date) {
+            Some(ts) => ts,
+            None => continue,
+        };
+
+        // 6. Filter by time (>= now - 5 mins)
+        if timestamp < (now - 300) {
+            continue;
+        }
+
+        relevant_events.push(NewsEvent {
+            event: event.title,
+            timestamp,
+            impact,
+            country: event.country,
+            currency,
+            forecast: event.forecast,
+            previous: event.previous,
+            actual: event.actual,
+        });
     }
 
-    // Sort by time ascending for chronological order.
-    gold_relevant_events.sort_by_key(|e| e.timestamp);
+    // 7. Sort ascending
+    relevant_events.sort_by_key(|e| e.timestamp);
 
-    info!("Found and parsed {} high-impact USD news events relevant for XAU/USD.", gold_relevant_events.len());
-    gold_relevant_events
+    info!("Fetched {} global high-impact news events.", relevant_events.len());
+    relevant_events
 }

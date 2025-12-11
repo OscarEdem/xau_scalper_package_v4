@@ -1,19 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
-
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenPosition {
-    pub ticket: u64,
-    pub symbol: String,
-    pub direction: String, // "buy" or "sell"
-    pub entry_price: f64,
-    pub sl: f64,
-    pub tp: f64,
-    pub lot_size: f64,
-    pub entry_timestamp: String, // ISO
-    pub mode: String, // "scalp" | "swing"
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Hash, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -22,38 +10,57 @@ pub struct NewsEvent {
     pub timestamp: i64,      // Unix seconds
     pub impact: String,      // "high", "medium", "low"
     pub country: String,
+    pub currency: String,
     pub forecast: Option<String>,
     pub previous: Option<String>,
     pub actual: Option<String>,
 }
 
 
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct EvalRequest {
-    pub symbol: String,
-    pub timeframe: String,
-    pub closes: Vec<f64>, // For a new candle, this might just contain one value
-    pub highs: Vec<f64>,  // For a new candle, this might just contain one value
-    pub opens: Vec<f64>,
-    pub lows: Vec<f64>,
-    pub volumes: Vec<u64>,
-    pub m5_closes: Vec<f64>, // These can be sent as full buffers or as single new values
-    pub m5_highs: Vec<f64>,
-    pub m5_lows: Vec<f64>,
-    pub m30_closes: Vec<f64>,
-    pub h1_closes: Option<Vec<f64>>,
-    pub h1_highs: Option<Vec<f64>>,
-    pub h1_opens: Option<Vec<f64>>,
-    pub h1_lows: Option<Vec<f64>>,
+pub struct EvalRequest<'a> {
+    pub symbol: Cow<'a, str>,
+    pub timeframe: Cow<'a, str>,
+    #[schema(value_type = Vec<f64>)]
+    pub closes: Cow<'a, [f64]>, 
+    #[schema(value_type = Vec<f64>)]
+    pub highs: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub opens: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub lows: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<u64>)]
+    pub volumes: Cow<'a, [u64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub m5_closes: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub m5_highs: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub m5_lows: Cow<'a, [f64]>,
+    #[schema(value_type = Vec<f64>)]
+    pub m30_closes: Cow<'a, [f64]>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h1_closes: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h1_highs: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h1_opens: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h1_lows: Option<Cow<'a, [f64]>>,
     // Add these Higher Time Frames
-    pub h4_closes: Option<Vec<f64>>,
-    pub h4_highs: Option<Vec<f64>>, // Optional, for structure checks
-    pub h4_lows: Option<Vec<f64>>,  // Optional, for structure checks
-    pub d1_opens: Option<Vec<f64>>,
-    pub d1_closes: Option<Vec<f64>>,
-    pub open_positions: Option<Vec<OpenPosition>>, // current live trades
-    pub upcoming_events: Option<Vec<NewsEvent>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h4_closes: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h4_highs: Option<Cow<'a, [f64]>>, 
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub h4_lows: Option<Cow<'a, [f64]>>,  
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub d1_opens: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub d1_closes: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<NewsEvent>>)]
+    pub upcoming_events: Option<Cow<'a, [NewsEvent]>>,
     // Optional base parameters
     pub rsi_period: Option<usize>,
     pub ema_fast: Option<usize>,
@@ -100,8 +107,10 @@ pub struct EvalRequest {
     pub last_m5_timestamp: Option<i64>,
     pub last_m30_timestamp: Option<i64>,
     pub last_h1_timestamp: Option<i64>,
+    pub last_h4_timestamp: Option<i64>,
+    pub last_d1_timestamp: Option<i64>,
     // New fields for engine mode
-    pub mode: String, // "scalp" or "swing"
+    pub mode: Cow<'a, str>, // "scalp" or "swing"
     pub current_price: f64,
     /// The predictor model to use (e.g., "gbm", "heston", "lstm").
     pub predictor_model: Option<String>,
@@ -150,6 +159,8 @@ pub struct EvalResponse {
     pub recommended_order_type: String, // "market", "limit_buy", "limit_sell"
     pub limit_order_price: f64,         // The exact price to place the limit
     pub expiration_seconds: Option<u64>, // Cancel limit if not filled in X seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_info: Option<HashMap<String, String>>,
 }
 
 impl Default for EvalResponse {
@@ -174,11 +185,12 @@ impl Default for EvalResponse {
             recommended_order_type: "none".to_string(),
             limit_order_price: 0.0,
             expiration_seconds: None,
+            debug_info: None,
         }
     }
 }
 
-pub fn ema(values: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn ema(values: &[f64], period: usize) -> Vec<f64> {
     let mut out = vec![0.0; values.len()];
     if values.is_empty() || period == 0 {
         return out;
@@ -201,7 +213,7 @@ pub fn ema(values: &Vec<f64>, period: usize) -> Vec<f64> {
     out
 }
 
-pub fn rsi(values: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn rsi(values: &[f64], period: usize) -> Vec<f64> {
     let mut out = vec![50.0; values.len()];
     if values.len() <= period {
         return out;
@@ -234,7 +246,7 @@ pub fn rsi(values: &Vec<f64>, period: usize) -> Vec<f64> {
     out
 }
 
-pub fn atr(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<f64> {
     if highs.len() < period || period == 0 {
         return vec![0.0; highs.len()];
     }
@@ -255,7 +267,7 @@ pub fn atr(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, period: usize) 
     atrs
 }
 
-pub fn sma(values: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn sma(values: &[f64], period: usize) -> Vec<f64> {
     let mut out = vec![0.0; values.len()];
     if values.is_empty() || period == 0 || values.len() < period {
         return out;
@@ -281,7 +293,7 @@ pub fn sma(values: &Vec<f64>, period: usize) -> Vec<f64> {
     out
 }
 
-pub fn stochastic(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, k_period: usize, d_period: usize, slowing_period: usize) -> (Vec<f64>, Vec<f64>) {
+pub fn stochastic(highs: &[f64], lows: &[f64], closes: &[f64], k_period: usize, d_period: usize, slowing_period: usize) -> (Vec<f64>, Vec<f64>) {
     let n = closes.len();
     if n == 0 || k_period == 0 || d_period == 0 || slowing_period == 0 || n < k_period {
         return (vec![0.0; n], vec![0.0; n]);
@@ -314,7 +326,7 @@ pub fn stochastic(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, k_period
 // --- Early Entry Helpers ---
 
 /// Simple Rate-of-Change: (close_now - close_n_periods_ago) / close_n_periods_ago * 100
-pub fn roc(closes: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn roc(closes: &[f64], period: usize) -> Vec<f64> {
     let n = closes.len();
     let mut out = vec![0.0; n];
     if period == 0 || n < period { return out; }
@@ -326,7 +338,7 @@ pub fn roc(closes: &Vec<f64>, period: usize) -> Vec<f64> {
 }
 
 /// EMA slope (difference between last two EMA points)
-pub fn ema_slope(ema_vals: &Vec<f64>) -> f64 {
+pub fn ema_slope(ema_vals: &[f64]) -> f64 {
     if ema_vals.len() < 2 { return 0.0; }
     ema_vals[ema_vals.len() - 1] - ema_vals[ema_vals.len() - 2]
 }
@@ -371,6 +383,42 @@ pub fn find_swing_points(highs: &[f64], lows: &[f64], lookback: usize, n: usize)
     (swing_highs, swing_lows)
 }
 
+/// Finds liquidity zones based on swing points, adding a buffer to create a zone.
+/// This prevents zones from being single price points (top == bottom).
+pub fn find_liquidity_zones(
+    highs: &[f64],
+    lows: &[f64],
+    lookback: usize,
+    swing_n: usize,
+    buffer_points: f64,
+) -> Vec<PriceLevel> {
+    let (swing_highs, swing_lows) = find_swing_points(highs, lows, lookback, swing_n);
+    let mut zones = Vec::new();
+
+    for (_, price) in swing_highs {
+        zones.push(PriceLevel {
+            top: price + buffer_points,
+            bottom: price,
+            is_bullish: Some(false), // Supply/Resistance
+        });
+    }
+
+    for (_, price) in swing_lows {
+        zones.push(PriceLevel {
+            top: price,
+            bottom: price - buffer_points,
+            is_bullish: Some(true), // Demand/Support
+        });
+    }
+    zones
+}
+
+/// Calculates dynamic zone thickness based on a specific candle's range and ATR.
+pub fn calculate_dynamic_thickness(idx: usize, highs: &[f64], lows: &[f64], last_atr: f64) -> f64 {
+    let range = if idx < highs.len() { highs[idx] - lows[idx] } else { last_atr };
+    (range * 0.25).max(last_atr * 0.1)
+}
+
 /// Detects Fair Value Gaps (Imbalances).
 /// A bullish FVG is when the low of candle `i` is higher than the high of candle `i-2`.
 /// The FVG is the space between `high[i-2]` and `low[i]`.
@@ -381,11 +429,28 @@ pub fn find_imbalance_zones(highs: &[f64], lows: &[f64], lookback: usize) -> Vec
     for i in (start_index + 2)..highs.len() {
         // Correct Bullish FVG: The low of the current candle is above the high of the candle two periods ago.
         if lows[i] > highs[i-2] {
-             zones.push(PriceLevel { top: lows[i], bottom: highs[i-2], is_bullish: Some(true) });
+            let top = lows[i];
+            let bottom = highs[i-2];
+            
+            // Check for mitigation: has any subsequent candle traded below the bottom of the gap?
+            // If price has traded completely through the gap, it is invalidated.
+            let is_mitigated = lows[(i + 1)..].iter().any(|&l| l <= bottom);
+
+            if !is_mitigated {
+                zones.push(PriceLevel { top, bottom, is_bullish: Some(true) });
+            }
         }
         // Correct Bearish FVG: The high of the current candle is below the low of the candle two periods ago.
         if highs[i] < lows[i-2] {
-            zones.push(PriceLevel { top: lows[i-2], bottom: highs[i], is_bullish: Some(false) });
+            let top = lows[i-2];
+            let bottom = highs[i];
+
+            // Check for mitigation: has any subsequent candle traded above the top of the gap?
+            let is_mitigated = highs[(i + 1)..].iter().any(|&h| h >= top);
+
+            if !is_mitigated {
+                zones.push(PriceLevel { top, bottom, is_bullish: Some(false) });
+            }
         }
     }
     zones
@@ -397,22 +462,53 @@ pub fn vwap(closes: &[f64], highs: &[f64], lows: &[f64], volumes: &[u64], period
     let mut vwap_bands = vec![];
     if n < period { return vwap_bands; }
 
-    for i in period..=n {
-        let start = i - period;
-        let typical_price_vol: f64 = (start..i).map(|j| ((highs[j] + lows[j] + closes[j]) / 3.0) * volumes[j] as f64).sum();
-        let total_volume: u64 = volumes[start..i].iter().sum();
-        let vwap = if total_volume > 0 { typical_price_vol / total_volume as f64 } else { closes[i-1] };
+    // Rolling variables for O(N) complexity
+    let mut sum_vol = 0.0;
+    let mut sum_pv = 0.0;
+    let mut sum_pv2 = 0.0;
 
-        let variance: f64 = (start..i).map(|j| volumes[j] as f64 * (closes[j] - vwap).powi(2)).sum();
-        let std_dev = if total_volume > 0 { (variance / total_volume as f64).sqrt() } else { 0.0 };
+    // Initialize first window
+    for i in 0..period {
+        let tp = (highs[i] + lows[i] + closes[i]) / 3.0;
+        let v = volumes[i] as f64;
+        sum_vol += v;
+        sum_pv += v * tp;
+        sum_pv2 += v * tp * tp;
+    }
 
+    // Helper closure to calculate bands from current sums
+    let mut calc_bands = |s_vol: f64, s_pv: f64, s_pv2: f64, close: f64| {
+        let vwap = if s_vol > 0.0 { s_pv / s_vol } else { close };
+        // Variance = E[X^2] - (E[X])^2. Clamp to 0.0 to handle float precision issues.
+        let variance = if s_vol > 0.0 { ((s_pv2 / s_vol) - vwap * vwap).max(0.0) } else { 0.0 };
+        let std_dev = variance.sqrt();
         vwap_bands.push(VwapBands { vwap, upper_band1: vwap + std_dev, lower_band1: vwap - std_dev, upper_band2: vwap + 2.0 * std_dev, lower_band2: vwap - 2.0 * std_dev });
+    };
+
+    calc_bands(sum_vol, sum_pv, sum_pv2, closes[period - 1]);
+
+    // Rolling update
+    for i in period..n {
+        let remove_idx = i - period;
+        let tp_out = (highs[remove_idx] + lows[remove_idx] + closes[remove_idx]) / 3.0;
+        let v_out = volumes[remove_idx] as f64;
+        sum_vol -= v_out;
+        sum_pv -= v_out * tp_out;
+        sum_pv2 -= v_out * tp_out * tp_out;
+
+        let tp_in = (highs[i] + lows[i] + closes[i]) / 3.0;
+        let v_in = volumes[i] as f64;
+        sum_vol += v_in;
+        sum_pv += v_in * tp_in;
+        sum_pv2 += v_in * tp_in * tp_in;
+
+        calc_bands(sum_vol, sum_pv, sum_pv2, closes[i]);
     }
     vwap_bands
 }
 
 /// Volatility pulse: latest ATR > factor * median ATR over lookback
-pub fn atr_pulse(atr_vals: &Vec<f64>, lookback: usize, factor: f64) -> bool {
+pub fn atr_pulse(atr_vals: &[f64], lookback: usize, factor: f64) -> bool {
     let n = atr_vals.len();
     if n < lookback + 1 { return false; }
 
@@ -430,7 +526,7 @@ pub fn atr_pulse(atr_vals: &Vec<f64>, lookback: usize, factor: f64) -> bool {
 
 /// Determines the trend bias based on an EMA.
 /// Returns 1 for bullish, -1 for bearish, 0 for neutral/insufficient data.
-pub fn get_trend_bias(closes: &Vec<f64>, period: usize) -> i8 {
+pub fn get_trend_bias(closes: &[f64], period: usize) -> i8 {
     let n = closes.len();
     if n < period + 2 {
         return 0; // Not enough data
@@ -452,7 +548,7 @@ pub fn get_trend_bias(closes: &Vec<f64>, period: usize) -> i8 {
 
 /// Determines the daily bias based on the previous day's candle.
 /// Returns "bullish", "bearish", or "neutral".
-pub fn get_daily_bias(opens: &Vec<f64>, closes: &Vec<f64>) -> String {
+pub fn get_daily_bias(opens: &[f64], closes: &[f64]) -> String {
     if opens.is_empty() || closes.is_empty() {
         return "neutral".to_string();
     }
@@ -552,9 +648,9 @@ pub fn get_fvg_limit_price(
 
 /// Detects divergence using the current forming candle's data for zero-lag signals.
 pub fn detect_realtime_divergence(
-    lows: &Vec<f64>,
-    highs: &Vec<f64>,
-    rsi_vals: &Vec<f64>,
+    lows: &[f64],
+    highs: &[f64],
+    rsi_vals: &[f64],
     lookback: usize,
 ) -> String {
     let n = lows.len();
@@ -586,7 +682,7 @@ pub fn detect_realtime_divergence(
 // --- New Swing Functions ---
 
 /// ADX Implementation (compact)
-pub fn adx(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, period: usize) -> Vec<f64> {
+pub fn adx(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<f64> {
     let n = closes.len();
     let mut out = vec![0.0; n];
     if n <= period || period == 0 { return out; }
@@ -648,7 +744,7 @@ pub fn adx(highs: &Vec<f64>, lows: &Vec<f64>, closes: &Vec<f64>, period: usize) 
 }
 
 /// Chandelier Exit (long)
-pub fn chandelier_exit_high(highs: &Vec<f64>, atr_vals: &Vec<f64>, lookback: usize, atr_mult: f64) -> Option<f64> {
+pub fn chandelier_exit_high(highs: &[f64], atr_vals: &[f64], lookback: usize, atr_mult: f64) -> Option<f64> {
     let n = highs.len();
     if n < lookback || atr_vals.len() < 1 { return None; }
     let hi = highs[n - lookback..n].iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
@@ -656,81 +752,10 @@ pub fn chandelier_exit_high(highs: &Vec<f64>, atr_vals: &Vec<f64>, lookback: usi
     Some(hi - atr_mult * last_atr)
 }
 
-pub fn chandelier_exit_low(lows: &Vec<f64>, atr_vals: &Vec<f64>, lookback: usize, atr_mult: f64) -> Option<f64> {
+pub fn chandelier_exit_low(lows: &[f64], atr_vals: &[f64], lookback: usize, atr_mult: f64) -> Option<f64> {
     let n = lows.len();
     if n < lookback || atr_vals.len() < 1 { return None; }
     let lo = lows[n - lookback..n].iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let last_atr = atr_vals.last().cloned().unwrap_or(0.0);
     Some(lo + atr_mult * last_atr)
-}
-
-/// Trend detector (HTF EMA alignment + ADX)
-pub fn is_strong_uptrend(mtf_ema_short: f64, mtf_ema_long: f64, adx_val: f64, adx_threshold: f64) -> bool {
-    mtf_ema_short > mtf_ema_long && adx_val >= adx_threshold
-}
-pub fn is_strong_downtrend(mtf_ema_short: f64, mtf_ema_long: f64, adx_val: f64, adx_threshold: f64) -> bool {
-    mtf_ema_short < mtf_ema_long && adx_val >= adx_threshold
-}
-
-/// Manage open positions (pseudo/proper)
-pub fn manage_open_positions(
-    open_positions: &Vec<OpenPosition>,
-    highs: &Vec<f64>,
-    lows: &Vec<f64>,
-    closes: &Vec<f64>,
-    atr_vals: &Vec<f64>,
-    adx_vals: &Vec<f64>,
-    params: &EvalRequest // use your params for chandelier, thresholds
-) -> Vec<(u64, String /*action: hold|close|update*/, Option<f64> /*new_sl*/)> {
-    let mut actions = vec![];
-    for pos in open_positions.iter() {
-        let n = closes.len();
-        // compute chandelier stop depending on direction
-        let chandelier_period = params.chandelier_period.unwrap_or(22);
-        let chandelier_mult = params.chandelier_atr_mult.unwrap_or(3.0);
-        if pos.direction == "buy" {
-            // Check for TP hit first
-            if highs[n-1] >= pos.tp {
-                actions.push((pos.ticket, "close".to_string(), None));
-                continue;
-            }
-            if let Some(ch_stop) = chandelier_exit_high(&highs, &atr_vals, chandelier_period, chandelier_mult) {
-                // if price hits stop or ADX collapses -> close
-                let adx_now = adx_vals.last().cloned().unwrap_or(0.0);
-                if lows[n-1] <= ch_stop || adx_now < params.adx_threshold.unwrap_or(25.0) {
-                    actions.push((pos.ticket, "close".to_string(), None));
-                } else {
-                    // update SL to higher of current SL and ch_stop
-                    if ch_stop > pos.sl {
-                        actions.push((pos.ticket, "update_sl".to_string(), Some(ch_stop)));
-                    } else {
-                        actions.push((pos.ticket, "hold".to_string(), None));
-                    }
-                }
-            } else {
-                actions.push((pos.ticket, "hold".to_string(), None));
-            }
-        } else { // sell
-            // Check for TP hit first
-            if lows[n-1] <= pos.tp {
-                actions.push((pos.ticket, "close".to_string(), None));
-                continue;
-            }
-            if let Some(ch_stop) = chandelier_exit_low(&lows, &atr_vals, chandelier_period, chandelier_mult) {
-                let adx_now = adx_vals.last().cloned().unwrap_or(0.0);
-                if highs[n-1] >= ch_stop || adx_now < params.adx_threshold.unwrap_or(25.0) {
-                    actions.push((pos.ticket, "close".to_string(), None));
-                } else {
-                    if ch_stop < pos.sl {
-                        actions.push((pos.ticket, "update_sl".to_string(), Some(ch_stop)));
-                    } else {
-                        actions.push((pos.ticket, "hold".to_string(), None));
-                    }
-                }
-            } else {
-                actions.push((pos.ticket, "hold".to_string(), None));
-            }
-        }
-    }
-    actions
 }

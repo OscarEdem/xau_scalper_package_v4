@@ -8,12 +8,31 @@ use tracing::info;
 /// This struct holds initialized predictor models in memory to avoid the overhead
 /// of loading them from disk on every request. It uses a `DashMap` for efficient,
 /// lock-free reads and locked writes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PredictorCache {
     /// The cache stores `Arc<Box<dyn Predictor>>` to allow shared, immutable access
     /// to the models across multiple threads. The key is a string combination
     /// of model type and timeframe, e.g., "lstm_h1".
     cache: Arc<DashMap<String, Arc<Box<dyn Predictor>>>>,
+    models_dir: String,
+}
+
+impl Default for PredictorCache {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(DashMap::new()),
+            models_dir: "./models/".to_string(),
+        }
+    }
+}
+
+impl PredictorCache {
+    pub fn new(models_dir: String) -> Self {
+        Self {
+            cache: Arc::new(DashMap::new()),
+            models_dir,
+        }
+    }
 }
 
 impl PredictorCache {
@@ -36,7 +55,7 @@ impl PredictorCache {
             .entry(key.clone())
             .or_insert_with(|| {
                 info!("Cache miss for '{}'. Loading model...", key);
-                match load_predictor(model_type, timeframe) {
+                match load_predictor(model_type, timeframe, &self.models_dir) {
                     Ok(predictor) => Arc::new(predictor),
                     Err(e) => {
                         tracing::error!("Failed to load predictor model: {:?}", e);

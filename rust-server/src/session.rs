@@ -4,11 +4,10 @@ use crate::{
     EvalRequest, EvalResponse,
 };
 use dashmap::DashMap;
-use std::collections::VecDeque;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tracing::info;
-
-const MAX_BUFFER_SIZE: usize = 500; // Store up to 200 recent candles per timeframe.
 
 /// Represents the dominant trend direction determined by the SwingEngine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +27,77 @@ impl From<&str> for TrendDirection {
     }
 }
 
+/// Handles trade execution logic: Cooldowns, Anti-Spam, Pyramiding, and Reversals.
+/// Decouples the "decision to notify" from the "session state".
+#[derive(Debug, Clone)]
+pub struct ExecutionManager {
+    pub last_notified_signal_id: Option<String>,
+    pub last_notified_direction: String, // "long", "short", "none"
+    pub last_notified_time: i64,         // Unix timestamp
+    pub last_notified_price: f64,
+    pub pyramiding_enabled: bool,
+}
+
+impl ExecutionManager {
+    pub fn new(pyramiding_enabled: bool) -> Self {
+        Self {
+            last_notified_signal_id: None,
+            last_notified_direction: "none".to_string(),
+            last_notified_time: 0,
+            last_notified_price: 0.0,
+            pyramiding_enabled,
+        }
+    }
+
+    /// Evaluates if a signal should be broadcasted based on execution rules.
+    /// Returns true if the signal is valid for notification.
+    pub fn evaluate_execution(&mut self, signal: &mut EvalResponse, current_time: i64) -> bool {
+        if signal.entry_type == "none" {
+            return false;
+        }
+
+        // Check if this is the same signal ID we are already tracking
+        if self.last_notified_signal_id.as_ref() == Some(&signal.signal_id) {
+            // Keep it active, but don't re-notify
+            return false;
+        }
+
+        let direction_changed = signal.entry_type != self.last_notified_direction;
+        let time_diff = current_time - self.last_notified_time;
+        let conviction = signal.conviction_score.unwrap_or(0.0);
+        
+        // Cooldown: 5 minutes (300 seconds)
+        let cooldown_passed = time_diff > 300;
+
+        // --- Pyramiding Logic ---
+        let price_delta_pct = if self.last_notified_price > 0.0 {
+            (signal.entry_price - self.last_notified_price) / self.last_notified_price
+        } else { 0.0 };
+
+        let pyramiding_threshold = 0.0015; // 0.15%
+        let is_pyramiding_breakout = self.pyramiding_enabled && !direction_changed 
+            && match signal.entry_type.as_str() {
+                "long" => price_delta_pct > pyramiding_threshold,
+                "short" => price_delta_pct < -pyramiding_threshold,
+                _ => false,
+            };
+
+        // --- Reversal Logic ---
+        let is_rapid_reversal = direction_changed && time_diff < 180;
+        let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
+
+        // --- Decision ---
+        is_valid_reversal || (!direction_changed && cooldown_passed) || is_pyramiding_breakout
+    }
+
+    pub fn update_state(&mut self, signal: &EvalResponse, current_time: i64) {
+        self.last_notified_signal_id = Some(signal.signal_id.clone());
+        self.last_notified_direction = signal.entry_type.clone();
+        self.last_notified_time = current_time;
+        self.last_notified_price = signal.entry_price;
+    }
+}
+
 /// Manages the state for a single trading symbol (e.g., "XAUUSD").
 /// A TradingSession is created for each symbol the system trades. It holds all
 /// necessary data buffers, open positions, and latest signals for that symbol.
@@ -39,9 +109,16 @@ pub struct TradingSession {
     pub filter_scalp_by_swing: bool,
     /// The predictor model to use for this session (e.g., "gbm", "lstm").
     pub predictor_model: String,
+    pub max_buffer_size: usize,
 
     // --- State Data ---
     last_evaluation_timestamp: i64,
+    last_m1_timestamp: i64,
+    last_m5_timestamp: i64,
+    last_m30_timestamp: i64,
+    last_h1_timestamp: i64,
+    last_h4_timestamp: i64,
+    last_d1_timestamp: i64,
     swing_trend: TrendDirection,
 
     // --- Data Buffers ---
@@ -65,85 +142,223 @@ pub struct TradingSession {
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
 
-    // NEW: Anti-Spam State
-    last_notified_signal_id: Option<String>,
-    last_notified_direction: String, // "long", "short", "none"
-    last_notified_time: i64,         // Unix timestamp
-    last_notified_price: f64,
+    pub execution: ExecutionManager,
+    pub swing_execution: ExecutionManager,
 }
 
 impl TradingSession {
-    pub fn new(symbol: String, filter_scalp_by_swing: bool) -> Self {
+    pub fn new(symbol: String, filter_scalp_by_swing: bool, max_buffer_size: usize) -> Self {
         Self {
             symbol,
             filter_scalp_by_swing,
             predictor_model: "gbm".to_string(), // Default to GBM
+            max_buffer_size,
             last_evaluation_timestamp: 0,
+            last_m1_timestamp: 0,
+            last_m5_timestamp: 0,
+            last_m30_timestamp: 0,
+            last_h1_timestamp: 0,
+            last_h4_timestamp: 0,
+            last_d1_timestamp: 0,
             swing_trend: TrendDirection::Sideways,
-            m1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            m5_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            m5_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            m5_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            m30_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h1_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h1_opens: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h1_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h4_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h4_highs: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            h4_lows: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            d1_opens: VecDeque::with_capacity(MAX_BUFFER_SIZE),
-            d1_closes: VecDeque::with_capacity(MAX_BUFFER_SIZE),
+            m1_closes: VecDeque::with_capacity(max_buffer_size),
+            m5_closes: VecDeque::with_capacity(max_buffer_size),
+            m5_highs: VecDeque::with_capacity(max_buffer_size),
+            m5_lows: VecDeque::with_capacity(max_buffer_size),
+            m30_closes: VecDeque::with_capacity(max_buffer_size),
+            h1_closes: VecDeque::with_capacity(max_buffer_size),
+            h1_highs: VecDeque::with_capacity(max_buffer_size),
+            h1_opens: VecDeque::with_capacity(max_buffer_size),
+            h1_lows: VecDeque::with_capacity(max_buffer_size),
+            h4_closes: VecDeque::with_capacity(max_buffer_size),
+            h4_highs: VecDeque::with_capacity(max_buffer_size),
+            h4_lows: VecDeque::with_capacity(max_buffer_size),
+            d1_opens: VecDeque::with_capacity(max_buffer_size),
+            d1_closes: VecDeque::with_capacity(max_buffer_size),
             latest_scalp_signal: None,
             latest_swing_signal: None,
-
-            // Initialize spam filters
-            last_notified_signal_id: None,
-            last_notified_direction: "none".to_string(),
-            last_notified_time: 0,
-            last_notified_price: 0.0,
+            execution: ExecutionManager::new(true), // Scalp: Allow pyramiding
+            swing_execution: ExecutionManager::new(false), // Swing: No pyramiding (First signal only)
         }
     }
 
     /// The main entry point for processing new data for this session.
     /// It updates internal buffers and then runs both trading engines.
-    pub fn on_data(&mut self, req: EvalRequest, predictor_cache: &PredictorCache) {
+    /// Note: req is now EvalRequest<'static> (owned) coming from the API.
+    /// Returns a list of signals that should be notified.
+    pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache) -> Vec<EvalResponse> {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
         // 1. Update data buffers with the latest candle data from the request.
         // Smart update: If input is small (incremental), push back. If large (sync), replace.
-        Self::update_buffer(&mut self.m1_closes, &req.closes);
-        Self::update_buffer(&mut self.m5_closes, &req.m5_closes);
-        Self::update_buffer(&mut self.m5_highs, &req.m5_highs);
-        Self::update_buffer(&mut self.m5_lows, &req.m5_lows);
-        Self::update_buffer(&mut self.m30_closes, &req.m30_closes);
+        // Guard against duplicate ticks: Only update if timestamp advanced OR it's a full sync (>10 items).
         
-        if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v); }
-        if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v); }
-        if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v); }
-        if let Some(v) = &req.h1_lows { Self::update_buffer(&mut self.h1_lows, v); }
+        // M1 Update
+        if req.last_m1_timestamp > self.last_m1_timestamp || req.closes.len() > 10 {
+            Self::update_buffer(&mut self.m1_closes, &req.closes, self.max_buffer_size);
+            self.last_m1_timestamp = req.last_m1_timestamp;
+        }
+
+        // M5 Update
+        if let Some(ts) = req.last_m5_timestamp {
+            if ts > self.last_m5_timestamp || req.m5_closes.len() > 10 {
+                Self::update_buffer(&mut self.m5_closes, &req.m5_closes, self.max_buffer_size);
+                Self::update_buffer(&mut self.m5_highs, &req.m5_highs, self.max_buffer_size);
+                Self::update_buffer(&mut self.m5_lows, &req.m5_lows, self.max_buffer_size);
+                self.last_m5_timestamp = ts;
+            }
+        } else if !req.m5_closes.is_empty() {
+            tracing::warn!(symbol = %self.symbol, "Received M5 data but no last_m5_timestamp. Ignoring update.");
+        }
+
+        // M30 Update
+        if let Some(ts) = req.last_m30_timestamp {
+            if ts > self.last_m30_timestamp || req.m30_closes.len() > 10 {
+                Self::update_buffer(&mut self.m30_closes, &req.m30_closes, self.max_buffer_size);
+                self.last_m30_timestamp = ts;
+            }
+        } else if !req.m30_closes.is_empty() {
+            tracing::warn!(symbol = %self.symbol, "Received M30 data but no last_m30_timestamp. Ignoring update.");
+        }
         
-        if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v); }
-        if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v); }
-        if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v); }
+        // H1 Update
+        if let Some(ts) = req.last_h1_timestamp {
+            if ts > self.last_h1_timestamp || req.h1_closes.as_ref().map_or(false, |v| v.len() > 10) {
+                if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v, self.max_buffer_size); }
+                if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v, self.max_buffer_size); }
+                if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v, self.max_buffer_size); }
+                if let Some(v) = &req.h1_lows { Self::update_buffer(&mut self.h1_lows, v, self.max_buffer_size); }
+                self.last_h1_timestamp = ts;
+            }
+        } else if req.h1_closes.as_ref().map_or(false, |v| !v.is_empty()) {
+            tracing::warn!(symbol = %self.symbol, "Received H1 data but no last_h1_timestamp. Ignoring update.");
+        }
         
-        if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v); }
-        if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v); }
+        // H4 Update
+        if let Some(ts) = req.last_h4_timestamp {
+            if ts > self.last_h4_timestamp || req.h4_closes.as_ref().map_or(false, |v| v.len() > 10) {
+                if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v, self.max_buffer_size); }
+                if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v, self.max_buffer_size); }
+                if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v, self.max_buffer_size); }
+                self.last_h4_timestamp = ts;
+            }
+        } else if req.h4_closes.as_ref().map_or(false, |v| !v.is_empty()) {
+            tracing::warn!(symbol = %self.symbol, "Received H4 data but no last_h4_timestamp. Ignoring update.");
+        }
+        
+        // D1 Update
+        if let Some(ts) = req.last_d1_timestamp {
+            if ts > self.last_d1_timestamp || req.d1_closes.as_ref().map_or(false, |v| v.len() > 10) {
+                if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v, self.max_buffer_size); }
+                if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v, self.max_buffer_size); }
+                self.last_d1_timestamp = ts;
+            }
+        } else if req.d1_closes.as_ref().map_or(false, |v| !v.is_empty()) {
+            tracing::warn!(symbol = %self.symbol, "Received D1 data but no last_d1_timestamp. Ignoring update.");
+        }
         
         self.last_evaluation_timestamp = req.last_m1_timestamp;
 
-        // 2. Run the Swing Engine first to establish the higher-timeframe context.
-        let swing_req = self.build_engine_request("swing", &req);
-        let swing_signal = SwingEngine::evaluate(&swing_req, predictor_cache);
+        // Log buffer status to help debug "Insufficient Data"
+        info!(
+            symbol = %self.symbol,
+            m1_len = self.m1_closes.len(),
+            m5_len = self.m5_closes.len(),
+            h1_len = self.h1_closes.len(),
+            "Session buffers updated."
+        );
+
+        let mut notifications = Vec::new();
+
+        // 2. Run the Swing Engine
+        // Scope the request to drop the borrow of self immediately after use
+        let mut swing_signal = {
+            let mut swing_req = self.build_engine_request("swing", req.current_price);
+            swing_req.upcoming_events = req.upcoming_events.clone();
+            SwingEngine::evaluate(&swing_req, predictor_cache)
+        };
+        
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
+
+        // Latching Logic & Trade Management
+        if let Some(existing) = &self.latest_swing_signal {
+            if existing.signal_id == swing_signal.signal_id {
+                // 1. Latch Entry
+                swing_signal.entry_price = existing.entry_price;
+                swing_signal.limit_order_price = existing.limit_order_price;
+                swing_signal.recommended_order_type = existing.recommended_order_type.clone();
+
+                // 2. SL Management (Lock & Trail)
+                let current_price = req.current_price;
+                let mut managed_sl = existing.sl_price; // Start with locked SL
+
+                // Preserve Initial SL in debug_info for the frontend
+                let initial_sl = existing.debug_info.as_ref()
+                    .and_then(|d| d.get("initial_sl"))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:.2}", existing.sl_price));
+
+                if swing_signal.debug_info.is_none() {
+                    swing_signal.debug_info = Some(HashMap::new());
+                }
+                if let Some(d) = &mut swing_signal.debug_info {
+                    d.insert("initial_sl".to_string(), initial_sl);
+                }
+
+                if swing_signal.entry_type == "long" {
+                    // Invalidation: If price dropped below existing SL, kill signal
+                    if current_price < managed_sl {
+                        swing_signal.entry_type = "none".to_string();
+                        swing_signal.reason = format!("Invalidated (Hit SL): {:.2} < {:.2}", current_price, managed_sl);
+                    } else {
+                        // Trailing: Move SL up if targets reached
+                        if current_price > swing_signal.tp1_price { managed_sl = managed_sl.max(swing_signal.entry_price); }
+                        if current_price > swing_signal.tp2_price { managed_sl = managed_sl.max(swing_signal.tp1_price); }
+                        // Lock: Ensure SL never drops
+                        swing_signal.sl_price = managed_sl.max(swing_signal.sl_price);
+                    }
+                } else if swing_signal.entry_type == "short" {
+                    // Invalidation
+                    if current_price > managed_sl {
+                        swing_signal.entry_type = "none".to_string();
+                        swing_signal.reason = format!("Invalidated (Hit SL): {:.2} > {:.2}", current_price, managed_sl);
+                    } else {
+                        // Trailing
+                        if current_price < swing_signal.tp1_price { managed_sl = managed_sl.min(swing_signal.entry_price); }
+                        if current_price < swing_signal.tp2_price { managed_sl = managed_sl.min(swing_signal.tp1_price); }
+                        // Lock: Ensure SL never rises
+                        swing_signal.sl_price = managed_sl.min(swing_signal.sl_price);
+                    }
+                }
+            }
+        }
+
+        // Swing Execution Logic (Anti-Flicker & First-Signal Only)
+        let current_time = req.last_m1_timestamp;
+        let should_notify_swing = self.swing_execution.evaluate_execution(&mut swing_signal, current_time);
+        if should_notify_swing {
+            self.swing_execution.update_state(&swing_signal, current_time);
+            notifications.push(swing_signal.clone());
+        }
 
         // Update the session's swing trend based on the new signal.
         self.swing_trend = TrendDirection::from(swing_signal.entry_type.as_str());
         self.latest_swing_signal = Some(swing_signal);
 
-        // 3. Run the Scalp Engine.
-        let scalp_req = self.build_engine_request_with_params("scalp", &req);
-        let mut scalp_signal = ScalpEngine::evaluate(&scalp_req, predictor_cache);
+        // 3. Run the Scalp Engine (reuse base_req data)
+        let predictor_model = self.predictor_model.clone();
+        let mut scalp_signal = {
+            let mut scalp_req = self.build_engine_request("scalp", req.current_price);
+            // Apply scalp-specific params from the original request
+            scalp_req.spread_limit_points = req.spread_limit_points;
+            scalp_req.spread_points = req.spread_points;
+            scalp_req.kf_process_noise = req.kf_process_noise;
+            scalp_req.kf_measurement_noise = req.kf_measurement_noise;
+            scalp_req.upcoming_events = req.upcoming_events.clone();
+            scalp_req.predictor_model = Some(predictor_model);
+
+            ScalpEngine::evaluate(&scalp_req, predictor_cache)
+        };
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
         // 4. Apply cross-engine filtering if enabled.
@@ -153,112 +368,65 @@ impl TradingSession {
             if self.swing_trend != TrendDirection::Sideways && scalp_trend != self.swing_trend {
                 info!(
                     symbol = %self.symbol,
-                    "Filtering scalp signal. Direction ({:?}) conflicts with swing trend ({:?}).",
+                    "Scalp signal ({:?}) conflicts with swing trend ({:?}). Adding caution warning.",
                     scalp_trend, self.swing_trend
                 );
-                // Invalidate the scalp signal
-                scalp_signal = EvalResponse {
-                    reason: format!("Filtered: Scalp signal conflicts with swing trend ({:?})", self.swing_trend),
-                    ..Default::default()
+                // Warn user but allow signal
+                let trend_desc = match self.swing_trend {
+                    TrendDirection::Up => "Upward",
+                    TrendDirection::Down => "Downward",
+                    _ => "Sideways",
                 };
+                scalp_signal.reason = format!("(Counter-Trend: {}): {}", trend_desc, scalp_signal.reason);
             }
         }
 
         // 5. FILTERING LOGIC & FINAL STORAGE
-        let current_time = req.last_m1_timestamp;
-        let is_valid_signal = scalp_signal.entry_type != "none";
+        // Delegate execution logic to the ExecutionManager
+        let should_notify = self.execution.evaluate_execution(&mut scalp_signal, current_time);
+        let is_same_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);
 
-        if is_valid_signal {
-            let direction_changed = scalp_signal.entry_type != self.last_notified_direction;
-            let time_diff = current_time - self.last_notified_time;
-            let conviction = scalp_signal.conviction_score.unwrap_or(0.0);
-            
-            // Cooldown: 5 minutes (300 seconds)
-            let cooldown_passed = time_diff > 300;
-
-            // --- Pyramiding Logic ---
-            // Calculate percentage distance from the LAST signal price
-            let price_delta_pct = if self.last_notified_price > 0.0 {
-                (scalp_signal.entry_price - self.last_notified_price) / self.last_notified_price
-            } else {
-                0.0
-            };
-
-            // Allow a new signal if price has moved significantly in our favor.
-            let pyramiding_threshold = 0.0015; // 0.15% (e.g., ~$3 on Gold)
-            let is_pyramiding_breakout = !direction_changed 
-                && match scalp_signal.entry_type.as_str() {
-                    "long" => price_delta_pct > pyramiding_threshold,  // Price went UP significantly
-                    "short" => price_delta_pct < -pyramiding_threshold, // Price went DOWN significantly
-                    _ => false,
-                };
-
-            // --- Reversal Logic ---
-            // If direction changes rapidly (e.g., within 3 minutes), we require higher conviction
-            // to avoid whipsaws in choppy markets.
-            let is_rapid_reversal = direction_changed && time_diff < 180;
-            let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
-
-            // --- Updated Decision Matrix ---
-            let should_notify =
-                // Priority 1: Trend Reversal (Notify if valid/strong enough)
-                is_valid_reversal 
-                // Priority 2: Standard New Entry (Cooldown passed)
-                || (!direction_changed && cooldown_passed)
-                // Priority 3: Pyramiding Exception (Strong breakout)
-                || is_pyramiding_breakout;
-
-            if should_notify {
-                // Tag the signal if it's a pyramid entry
-                if is_pyramiding_breakout {
-                    scalp_signal.classification = "scalp_pyramid".to_string();
-                    scalp_signal.reason = format!("Breakout_Add: {}", scalp_signal.reason);
-                }
-
-                // UPDATE STATE
-                self.last_notified_signal_id = Some(scalp_signal.signal_id.clone());
-                self.last_notified_direction = scalp_signal.entry_type.clone();
-                self.last_notified_time = current_time;
-                self.last_notified_price = scalp_signal.entry_price;
-                
-                // Allow the signal to pass through
-                self.latest_scalp_signal = Some(scalp_signal);
-            } else {
-                // SUPPRESS THE SIGNAL
-                // We set it to None so the API doesn't send a push notification.
-                // The original signal is logged above, but the final state is suppressed.
-                info!(
-                    symbol = %self.symbol,
-                    reason = "Suppressed by anti-spam filter",
-                    time_since_last = time_diff,
-                    "Scalp signal suppressed."
-                );
-                self.latest_scalp_signal = None; 
-            }
+        if should_notify {
+            // Update execution state
+            self.execution.update_state(&scalp_signal, current_time);
+            notifications.push(scalp_signal.clone());
+            self.latest_scalp_signal = Some(scalp_signal);
+        } else if is_same_id {
+            // Keep active for API visibility, but don't re-notify
+            self.latest_scalp_signal = Some(scalp_signal);
+        } else if scalp_signal.entry_type != "none" {
+            // Valid signal but suppressed by spam filter
+            info!(
+                symbol = %self.symbol,
+                reason = "Suppressed by anti-spam filter",
+                "Scalp signal suppressed."
+            );
+            self.latest_scalp_signal = None;
         } else {
             // If the engine returns "none", there's no signal to store or suppress.
             self.latest_scalp_signal = Some(scalp_signal);
         }
 
-        // Placeholder for position management logic
-        self.manage_positions();
+        notifications
     }
 
     /// Helper to update a buffer.
     /// If `new_data` is large (> 10 items), it replaces the buffer (Sync).
     /// If `new_data` is small, it appends to the buffer and maintains MAX_BUFFER_SIZE (Incremental).
-    fn update_buffer(buffer: &mut VecDeque<f64>, new_data: &Vec<f64>) {
+    fn update_buffer(buffer: &mut VecDeque<f64>, new_data: &[f64], max_len: usize) {
         if new_data.is_empty() { return; }
 
         if new_data.len() > 10 {
             // Assume full sync
             buffer.clear();
-            buffer.extend(new_data.iter().cloned());
+            // Cap at MAX_BUFFER_SIZE to prevent unbounded growth
+            let start = new_data.len().saturating_sub(max_len);
+            buffer.extend(new_data[start..].iter().cloned());
         } else {
             // Assume incremental update
             for &val in new_data {
                 buffer.push_back(val);
-                if buffer.len() > MAX_BUFFER_SIZE {
+                if buffer.len() > max_len {
                     buffer.pop_front();
                 }
             }
@@ -266,55 +434,54 @@ impl TradingSession {
     }
 
     /// Builds an `EvalRequest` for a specific engine using the session's data.
-    fn build_engine_request(&self, mode: &str, original_req: &EvalRequest) -> EvalRequest {
-        // This clones the data from the session buffers.
-        // For very high performance, you might use `Arc`s to avoid deep copies.
+    /// Uses Zero-Copy (Cow::Borrowed) to avoid allocations.
+    fn build_engine_request<'a>(&'a mut self, mode: &str, current_price: f64) -> EvalRequest<'a> {
+        // make_contiguous ensures the VecDeque is a single slice in memory
+        let m1_closes = self.m1_closes.make_contiguous();
+        let m5_closes = self.m5_closes.make_contiguous();
+        let m5_highs = self.m5_highs.make_contiguous();
+        let m5_lows = self.m5_lows.make_contiguous();
+        let m30_closes = self.m30_closes.make_contiguous();
+        
+        // For Option fields, we map them
+        let h1_closes = if !self.h1_closes.is_empty() { Some(Cow::Borrowed(self.h1_closes.make_contiguous() as &[f64])) } else { None };
+        let h1_highs = if !self.h1_highs.is_empty() { Some(Cow::Borrowed(self.h1_highs.make_contiguous() as &[f64])) } else { None };
+        let h1_opens = if !self.h1_opens.is_empty() { Some(Cow::Borrowed(self.h1_opens.make_contiguous() as &[f64])) } else { None };
+        let h1_lows = if !self.h1_lows.is_empty() { Some(Cow::Borrowed(self.h1_lows.make_contiguous() as &[f64])) } else { None };
+        
+        let h4_closes = if !self.h4_closes.is_empty() { Some(Cow::Borrowed(self.h4_closes.make_contiguous() as &[f64])) } else { None };
+        let h4_highs = if !self.h4_highs.is_empty() { Some(Cow::Borrowed(self.h4_highs.make_contiguous() as &[f64])) } else { None };
+        let h4_lows = if !self.h4_lows.is_empty() { Some(Cow::Borrowed(self.h4_lows.make_contiguous() as &[f64])) } else { None };
+        
+        let d1_opens = if !self.d1_opens.is_empty() { Some(Cow::Borrowed(self.d1_opens.make_contiguous() as &[f64])) } else { None };
+        let d1_closes = if !self.d1_closes.is_empty() { Some(Cow::Borrowed(self.d1_closes.make_contiguous() as &[f64])) } else { None };
+
         EvalRequest {
-            symbol: self.symbol.clone(),
-            timeframe: "M1".to_string(), // Base timeframe
-            closes: self.m1_closes.iter().cloned().collect(),
-            highs: vec![], // Populate with real data if needed by engines
-            opens: vec![], // Populate with real data if needed by engines
-            lows: vec![],  // Populate with real data if needed by engines
-            volumes: vec![], // Populate with real data if needed by engines
-            m5_closes: self.m5_closes.iter().cloned().collect(),
-            m5_highs: self.m5_highs.iter().cloned().collect(),
-            m5_lows: self.m5_lows.iter().cloned().collect(),
-            m30_closes: self.m30_closes.iter().cloned().collect(),
-            h1_closes: Some(self.h1_closes.iter().cloned().collect()),
-            h1_highs: Some(self.h1_highs.iter().cloned().collect()),
-            h1_opens: Some(self.h1_opens.iter().cloned().collect()),
-            h1_lows: Some(self.h1_lows.iter().cloned().collect()),
-            h4_closes: Some(self.h4_closes.iter().cloned().collect()),
-            h4_highs: Some(self.h4_highs.iter().cloned().collect()),
-            h4_lows: Some(self.h4_lows.iter().cloned().collect()),
-            d1_opens: Some(self.d1_opens.iter().cloned().collect()),
-            d1_closes: Some(self.d1_closes.iter().cloned().collect()),
-            open_positions: None,
-            mode: mode.to_string(),
-            current_price: original_req.current_price, // Use the live price from the original request
+            symbol: Cow::Borrowed(&self.symbol),
+            timeframe: Cow::Borrowed("M1"),
+            closes: Cow::Borrowed(m1_closes),
+            highs: Cow::Borrowed(&[]), 
+            opens: Cow::Borrowed(&[]), 
+            lows: Cow::Borrowed(&[]),  
+            volumes: Cow::Borrowed(&[]), 
+            m5_closes: Cow::Borrowed(m5_closes),
+            m5_highs: Cow::Borrowed(m5_highs),
+            m5_lows: Cow::Borrowed(m5_lows),
+            m30_closes: Cow::Borrowed(m30_closes),
+            h1_closes,
+            h1_highs,
+            h1_opens,
+            h1_lows,
+            h4_closes,
+            h4_highs,
+            h4_lows,
+            d1_opens,
+            d1_closes,
+            mode: Cow::Owned(mode.to_string()), // Mode is usually small string
+            current_price, 
             last_m1_timestamp: self.last_evaluation_timestamp,
             ..Default::default() // Fills in optional params
         }
-    }
-
-    /// Builds an `EvalRequest` for a specific engine, propagating optional parameters from the original request.
-    fn build_engine_request_with_params(&self, mode: &str, original_req: &EvalRequest) -> EvalRequest {
-        let mut engine_req = self.build_engine_request(mode, original_req);
-        // Propagate all optional parameters from the original request
-        engine_req.spread_limit_points = original_req.spread_limit_points;
-        engine_req.spread_points = original_req.spread_points;
-        engine_req.kf_process_noise = original_req.kf_process_noise;
-        engine_req.kf_measurement_noise = original_req.kf_measurement_noise;
-        engine_req.upcoming_events = original_req.upcoming_events.clone();
-        engine_req.predictor_model = Some(self.predictor_model.clone());
-        // ... propagate other optional params as needed ...
-        engine_req
-    }
-
-    /// Placeholder for logic to manage open trades (e.g., trailing stops).
-    fn manage_positions(&mut self) {
-        // Position management logic removed as server no longer tracks open positions.
     }
 
     pub fn get_latest_signals(&self) -> (Option<EvalResponse>, Option<EvalResponse>) {
@@ -345,16 +512,27 @@ impl TradingSession {
 
 /// Manages all active TradingSessions, keyed by symbol.
 /// This is the main stateful component of the application.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionManager {
     pub sessions: Arc<DashMap<String, Arc<Mutex<TradingSession>>>>,
+    pub max_buffer_size: usize,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self { sessions: Arc::new(DashMap::new()), max_buffer_size: 500 }
+    }
 }
 
 impl SessionManager {
+    pub fn new(max_buffer_size: usize) -> Self {
+        Self { sessions: Arc::new(DashMap::new()), max_buffer_size }
+    }
+
     pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> Arc<Mutex<TradingSession>> {
         self.sessions.entry(symbol.to_string()).or_insert_with(|| {
             info!("Creating new trading session for symbol: {}", symbol);
-            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing)))
+            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, self.max_buffer_size)))
         }).clone()
     }
 }

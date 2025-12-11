@@ -51,6 +51,8 @@ If both sides have weighty events → judge which narrative is stronger.
 
 If events are low-impact or conflicting → Neutral.
 
+If specific price levels are provided in the input, analyze them in the context of the macro bias.
+
 Output Format (MANDATORY)
 
 A. Human Institutional Narrative
@@ -81,6 +83,9 @@ Risk appetite
 Risks & Opposing Forces:
 Any conflicting indicators or secondary data that could soften or reverse the bias.
 
+Key Levels (If Provided):
+List any support/resistance levels found in the input data.
+
 B. Machine JSON Output
 
 {
@@ -89,6 +94,7 @@ B. Machine JSON Output
   "bias": "",
   "stronger_currency": "",
   "high_impact_drivers": [],
+  "key_levels": [],
   "macro_narrative": "",
   "risks": [],
   "confidence": 0
@@ -98,7 +104,7 @@ Rules
 
 No trade advice.
 
-No prices or levels.
+Do not invent prices. Only cite specific levels if they are explicitly provided in the input.
 
 No invented data.
 

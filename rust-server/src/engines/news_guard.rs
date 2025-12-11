@@ -11,6 +11,7 @@ pub struct GuardResult {
 ///
 /// # Arguments
 /// * `current_timestamp` - The current time in Unix seconds.
+/// * `symbol` - The trading symbol (e.g., "XAUUSD").
 /// * `upcoming_events` - A list of scheduled news events.
 /// * `pre_event_block_minutes` - How many minutes before a high-impact event to block trading.
 /// * `post_event_block_minutes` - How many minutes after a high-impact event to block trading.
@@ -20,12 +21,22 @@ pub struct GuardResult {
 /// - Medium-impact events use half the block time.
 /// - Low-impact events are ignored.
 pub fn evaluate_news_guard(
+    symbol: &str,
     current_timestamp: i64,
-    upcoming_events: &Vec<NewsEvent>,
+    upcoming_events: &[NewsEvent],
     pre_event_block_minutes: i64,
     post_event_block_minutes: i64,
 ) -> GuardResult {
+    // Extract base and quote from symbol (e.g., XAUUSD -> XAU, USD)
+    let base = if symbol.len() >= 3 { &symbol[0..3] } else { "" };
+    let quote = if symbol.len() >= 6 { &symbol[3..6] } else { "" };
+
     for event in upcoming_events {
+        // Double-check: Only block if the event currency matches base or quote
+        if event.currency != base && event.currency != quote {
+            continue;
+        }
+
         let (pre_block, post_block) = match event.impact.as_str() {
             "high" => (pre_event_block_minutes * 60, post_event_block_minutes * 60),
             "medium" => (
@@ -78,8 +89,8 @@ pub fn evaluate_news_guard(
 /// * `atr_multiplier` - The factor to detect a spike (e.g., 2.0 means ATR doubled).
 /// * `adx_threshold` - The minimum ADX value required for a trending market.
 pub fn volatility_guard(
-    atr_values: &Vec<f64>,
-    adx_values: &Vec<f64>,
+    atr_values: &[f64],
+    adx_values: &[f64],
     atr_multiplier: f64,
     adx_threshold: f64,
 ) -> GuardResult {
@@ -113,16 +124,18 @@ pub fn volatility_guard(
 /// A combined wrapper that runs both the news and volatility guards.
 /// If any guard returns a "blocked" result, the combined result is blocked.
 pub fn combined_guard(
+    symbol: &str,
     current_timestamp: i64,
-    upcoming_events: &Vec<NewsEvent>,
+    upcoming_events: &[NewsEvent],
     pre_event_block_minutes: i64,
     post_event_block_minutes: i64,
-    atr_values: &Vec<f64>,
-    adx_values: &Vec<f64>,
+    atr_values: &[f64],
+    adx_values: &[f64],
     atr_multiplier: f64,
     adx_threshold: f64,
 ) -> GuardResult {
     let news_guard_result = evaluate_news_guard(
+        symbol,
         current_timestamp,
         upcoming_events,
         pre_event_block_minutes,

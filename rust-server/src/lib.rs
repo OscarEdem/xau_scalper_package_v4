@@ -71,7 +71,13 @@ pub fn detect_inducement(highs: &[f64], lows: &[f64], closes: &[f64], lookback: 
     let &prev_low = lows[n - lookback..n - 1].iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
     let &prev_high = highs[n - lookback..n - 1].iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
 
-    if current_low < prev_low && current_close > prev_low { "bullish_inducement".to_string() }
-    else if current_high > prev_high && current_close < prev_high { "bearish_inducement".to_string() }
+    let range = current_high - current_low;
+    // Where did the candle close relative to its range? (0.0 = low, 1.0 = high)
+    let close_pos = if range > 0.0 { (current_close - current_low) / range } else { 0.5 };
+
+    // Bullish: Swept low, closed back inside, AND closed in upper 60% of candle (showing strength)
+    if current_low < prev_low && current_close > prev_low && close_pos > 0.4 { "bullish_inducement".to_string() }
+    // Bearish: Swept high, closed back inside, AND closed in lower 60% of candle (showing rejection)
+    else if current_high > prev_high && current_close < prev_high && close_pos < 0.6 { "bearish_inducement".to_string() }
     else { "none".to_string() }
 }

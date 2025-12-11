@@ -14,7 +14,7 @@ use tracing::info;
 
 #[derive(Deserialize, IntoParams)]
 pub struct FundamentalQuery {
-    pair: String,
+    symbol: String,
     /// "daily" or "weekly"
     #[serde(default = "default_period")]
     period: String,
@@ -32,14 +32,14 @@ pub async fn fundamental_analysis(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Query(q): Query<FundamentalQuery>,
 ) -> Json<serde_json::Value> {
-    let result = generate_fundamental_report(state, &q.pair, &q.period).await;
+    let result = generate_fundamental_report(state, &q.symbol, &q.period).await;
     Json(result)
 }
 
 /// Internal helper to generate fundamental analysis report
 pub async fn generate_fundamental_report(
     state: Arc<ApplicationStateWithTicks>,
-    pair: &str,
+    symbol: &str,
     period: &str,
 ) -> serde_json::Value {
     let all_events = state.inner.news_events.lock().unwrap().clone();
@@ -47,10 +47,18 @@ pub async fn generate_fundamental_report(
     let now = Utc::now();
     let end_of_day = now.with_hour(23).unwrap().with_minute(59).unwrap().with_second(59).unwrap();
 
+    // Extract base and quote from symbol (e.g., XAUUSD -> XAU, USD)
+    let base = if symbol.len() >= 3 { &symbol[0..3] } else { "" };
+    let quote = if symbol.len() >= 6 { &symbol[3..6] } else { "" };
+
     // Filter events based on the requested period
     let relevant_events: Vec<_> = all_events
         .into_iter()
         .filter(|event| {
+            // Filter by currency (Base OR Quote)
+            if event.currency != base && event.currency != quote {
+                return false;
+            }
             if period == "daily" {
                 event.timestamp >= now.timestamp() && event.timestamp <= end_of_day.timestamp()
             } else {
@@ -60,14 +68,33 @@ pub async fn generate_fundamental_report(
         })
         .collect();
 
+    // --- Extract Technical Levels from Session ---
+    let mut technical_levels_str = String::new();
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(symbol) {
+        let session = session_entry.value().lock().unwrap();
+        // We use the swing signal for macro-relevant levels
+        let (_, swing_signal) = session.get_latest_signals();
+        
+        if let Some(signal) = swing_signal {
+            if !signal.liquidity_zones.is_empty() {
+                technical_levels_str.push_str("\nPROVIDED TECHNICAL LEVELS (Swing):\n");
+                for zone in signal.liquidity_zones {
+                    let label = if zone.is_bullish.unwrap_or(false) { "Support" } else { "Resistance" };
+                    technical_levels_str.push_str(&format!("- {} Zone: {:.2}-{:.2}\n", label, zone.bottom, zone.top));
+                }
+            }
+        }
+    }
+
     // --- Caching Logic ---
-    // 1. Create a hash of the relevant events to see if they've changed.
+    // 1. Create a hash of the relevant events AND technical levels to see if they've changed.
     let mut hasher = DefaultHasher::new();
     relevant_events.hash(&mut hasher);
+    technical_levels_str.hash(&mut hasher);
     let events_hash = hasher.finish();
 
     // 2. Create a unique key for this request.
-    let cache_key = format!("{}_{}", pair, period);
+    let cache_key = format!("{}_{}", symbol, period);
 
     // 3. Check the cache.
     if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
@@ -83,7 +110,7 @@ pub async fn generate_fundamental_report(
     // If no events are found, return a default response instead of calling the AI.
     if relevant_events.is_empty() {
         return serde_json::json!({
-            "pair": pair,
+            "symbol": symbol,
             "period": period,
             "analysis": "No high-impact news events found for this period. Market likely driven by technicals.",
             "source_events_count": 0,
@@ -96,7 +123,15 @@ pub async fn generate_fundamental_report(
     // Embed the prompt at compile time
     const PROMPT: &str = include_str!("fundamental_report_prompt.txt");
 
-    let result = generate_analysis(pair, &events_json, PROMPT)
+    // Inject the requested period and technical levels into the prompt
+    let dynamic_prompt = format!(
+        "ANALYSIS HORIZON: {} OUTLOOK\n\n{}\n\n{}", 
+        period.to_uppercase(), 
+        PROMPT,
+        technical_levels_str
+    );
+
+    let result = generate_analysis(&state.inner.http_client, symbol, &events_json, &dynamic_prompt)
         .await
         .unwrap_or_else(|e| format!("Fundamental analysis failed: {}", e));
 
@@ -105,7 +140,7 @@ pub async fn generate_fundamental_report(
     state.inner.fundamental_analysis_cache.insert(cache_key, (events_hash, result.clone()));
 
     serde_json::json!({
-        "pair": pair,
+        "symbol": symbol,
         "period": period,
         "analysis": result,
         "source_events_count": relevant_events.len(),
