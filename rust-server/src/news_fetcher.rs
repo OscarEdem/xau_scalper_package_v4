@@ -1,4 +1,5 @@
 use crate::NewsEvent;
+use crate::macro_analysis::classification::classify_event;
 use chrono::{Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
@@ -62,7 +63,7 @@ pub fn parse_forexfactory_datetime_to_utc(date_str: &str) -> Option<i64> {
     // Determine offset: EDT is UTC-4, EST is UTC-5
     let is_dst = is_ny_dst(naive);
     let offset_hours = if is_dst { -4 } else { -5 };
-    let offset = FixedOffset::east_opt(offset_hours * 3600).unwrap();
+    let offset = FixedOffset::east_opt(offset_hours * 3600).unwrap_or(FixedOffset::east_opt(0).unwrap());
 
     // The naive time is in ET, so we interpret it with that offset
     let dt_with_tz = offset.from_local_datetime(&naive).single()?;
@@ -81,10 +82,23 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
     };
 
     let url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
-    let events: Vec<ForexFactoryEvent> = match client.get(url).send().await {
-        Ok(res) => res.json().await.unwrap_or_default(),
+    let response = match client.get(url).send().await {
+        Ok(res) => res,
         Err(e) => {
-            error!("Failed to fetch Forex Factory calendar: {}", e);
+            error!("Failed to connect to Forex Factory: {}", e);
+            return vec![];
+        }
+    };
+
+    if !response.status().is_success() {
+        error!("Forex Factory returned error status: {}", response.status());
+        return vec![];
+    }
+
+    let events: Vec<ForexFactoryEvent> = match response.json().await {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to parse Forex Factory JSON: {}", e);
             return vec![];
         }
     };
@@ -112,10 +126,7 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
             None => continue,
         };
 
-        // 6. Filter by time (>= now - 5 mins)
-        if timestamp < (now - 300) {
-            continue;
-        }
+        let category = classify_event(&event.title);
 
         relevant_events.push(NewsEvent {
             event: event.title,
@@ -126,6 +137,7 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
             forecast: event.forecast,
             previous: event.previous,
             actual: event.actual,
+            category,
         });
     }
 

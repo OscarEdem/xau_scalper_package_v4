@@ -27,6 +27,7 @@ rand_distr = "0.4"
 config = "0.13"
 prometheus = { version = "0.13", features = ["process"] }
 lazy_static = "1.4"
+toml = "0.8"
 
 [dependencies.anyhow]
 version = "1.0"

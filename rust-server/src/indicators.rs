@@ -3,6 +3,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, Hash, PartialEq, Eq)]
+pub enum MacroCategory {
+    MonetaryPolicy,
+    Inflation,
+    Labor,
+    Growth,
+    Risk,
+    Other,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema, IntoParams, Hash, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewsEvent {
@@ -14,6 +24,7 @@ pub struct NewsEvent {
     pub forecast: Option<String>,
     pub previous: Option<String>,
     pub actual: Option<String>,
+    pub category: MacroCategory, // NEW
 }
 
 

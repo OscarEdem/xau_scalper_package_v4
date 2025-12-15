@@ -1,47 +1,38 @@
 use crate::{EvalRequest, EvalResponse, PriceLevel};
 use ::uuid::Uuid;
-use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, calculate_dynamic_thickness, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}};
+use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, calculate_dynamic_thickness, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::ScalpSettings};
 use tracing::debug;
 use std::collections::HashMap;
-
-// Configuration Constants for easier tuning
-const MIN_DATA_LEN: usize = 60;
-const ATR_PERIOD: usize = 14;
-const KALMAN_PERIOD: usize = 20;
-const BASE_KALMAN_THRESHOLD: f64 = 0.12;
-const BASE_M1_SURGE_THRESHOLD: f64 = 0.9;
-const MIN_CONVICTION: f64 = 55.0;
-const MAX_LIMIT_DIST_ATR_MULT: f64 = 0.6;
 
 pub struct ScalpEngine;
 
 impl ScalpEngine {
-    pub fn evaluate<'a>(req: &EvalRequest<'a>, predictor_cache: &PredictorCache) -> EvalResponse {
+    pub fn evaluate<'a>(req: &EvalRequest<'a>, predictor_cache: &PredictorCache, settings: &ScalpSettings) -> EvalResponse {
         // ---- SAFETY: ensure enough data ----
         let m5_closes = &req.m5_closes;
         let m1_closes = &req.closes; // m1 for triggers
         let n_m5 = m5_closes.len();
         let n_m1 = m1_closes.len();
 
-        if n_m5 < MIN_DATA_LEN || n_m1 < MIN_DATA_LEN {
+        if n_m5 < settings.min_data_len || n_m1 < settings.min_data_len {
             return EvalResponse { reason: "Insufficient Data".to_string(), ..Default::default() };
         }
 
         // ---- Volatility: ATR on M5 (used to normalize thresholds) ----
-        let atr_vals = crate::atr(&req.m5_highs, &req.m5_lows, m5_closes, ATR_PERIOD);
+        let atr_vals = crate::atr(&req.m5_highs, &req.m5_lows, m5_closes, settings.atr_period);
         let last_atr = atr_vals.last().cloned().unwrap_or(1.0).max(0.0001);
 
         // ---- Guard: Check for high-risk news or volatility before proceeding ----
-        let adx_vals = adx(&req.m5_highs, &req.m5_lows, m5_closes, ATR_PERIOD);
+        let adx_vals = adx(&req.m5_highs, &req.m5_lows, m5_closes, settings.atr_period);
         let guard = news_guard::combined_guard(
             &req.symbol,
             req.last_m1_timestamp,
             &req.upcoming_events.clone().unwrap_or_default(),
-            30,   // pre-news block (minutes)
-            15,   // post-news block
+            settings.news_pre_event_block_minutes,
+            settings.news_post_event_block_minutes,
             &atr_vals,
             &adx_vals,
-            2.5, // ATR spike multiplier
+            settings.news_guard_atr_spike_multiplier,
             req.adx_threshold.unwrap_or(10.0) // ADX threshold (configurable)
         );
 
@@ -62,7 +53,7 @@ impl ScalpEngine {
         // ---- Kalman slope: compute and normalize by ATR ----
         let kf_q = req.kf_process_noise.unwrap_or(0.01);
         let kf_r = req.kf_measurement_noise.unwrap_or(0.1);
-        let (k_est, k_slope) = crate::kalman_slope(m5_closes, KALMAN_PERIOD, kf_q, kf_r);
+        let (k_est, k_slope) = crate::kalman_slope(m5_closes, settings.kalman_period, kf_q, kf_r);
 
         // Normalized slope: slope per ATR unit (makes threshold adaptive to regime)
         let norm_k_slope = k_slope / last_atr;
@@ -84,8 +75,8 @@ impl ScalpEngine {
 
         // ---- Dynamic thresholds (use percentiles or multiplicative factors rather than hard constants) ----
         // These constants are starting points; calibration should tune them.
-        let kalman_slope_threshold = BASE_KALMAN_THRESHOLD; // normalized slope units (slope/ATR)
-        let m1_surge_threshold = BASE_M1_SURGE_THRESHOLD; // normalized units (roughly 0.9 * m1_atr_equivalent)
+        let kalman_slope_threshold = settings.base_kalman_threshold; // normalized slope units (slope/ATR)
+        let m1_surge_threshold = settings.base_m1_surge_threshold; // normalized units (roughly 0.9 * m1_atr_equivalent)
         
         // Calculate baseline ATR from recent history (e.g., last 50 bars) to make it symbol-agnostic
         let avg_atr: f64 = if atr_vals.len() > 0 {
@@ -96,7 +87,8 @@ impl ScalpEngine {
         
         // If market extremely quiet relative to itself, scale thresholds down, else up
         let vol_ratio = if avg_atr > 0.0 { last_atr / avg_atr } else { 1.0 };
-        let vol_regime = vol_ratio.clamp(0.5, 3.0);
+        // Dampen the penalty in high volatility to capture opportunities (sqrt scaling)
+        let vol_regime = if vol_ratio > 1.0 { vol_ratio.sqrt() } else { vol_ratio }.clamp(0.5, 2.0);
 
         let kalman_slope_threshold = kalman_slope_threshold * vol_regime;
         let m1_surge_threshold = m1_surge_threshold * vol_regime;
@@ -121,12 +113,22 @@ impl ScalpEngine {
         let mut short_reasons = Vec::new();
         let mut short_score = 0.0;
 
+        // Dynamic Weighting: If local flow strongly opposes the bias, reduce the bias influence.
+        // This allows price action (the "now") to override the trend (the "past/background").
+        let mut htf_weight = settings.htf_bias_weight;
+        let mut ensemble_weight = settings.ensemble_weight;
+
+        if (bias > 0 && is_bear_flow) || (bias < 0 && is_bull_flow) {
+            htf_weight *= 0.5; // Penalize bias if immediate flow disagrees
+            ensemble_weight *= 0.5;
+        }
+
         // Bias weighting: if higher timeframe bias exists, give it weight
         if bias > 0 {
-            long_score += 0.2;
+            long_score += htf_weight;
             long_reasons.push("HTF Bullish Bias");
         } else if bias < 0 {
-            short_score += 0.2;
+            short_score += htf_weight;
             short_reasons.push("HTF Bearish Bias");
         }
 
@@ -141,20 +143,20 @@ impl ScalpEngine {
         debug!(bias = final_prediction_bias, "Scalp ensemble prediction calculated");
 
         if final_prediction_bias > 0.0 {
-            long_score += 0.15 * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble
+            long_score += ensemble_weight * (final_prediction_bias / last_atr).clamp(0.0, 1.5);
             long_reasons.push("Ensemble Bullish Bias");
         } else if final_prediction_bias < 0.0 {
-            short_score += 0.15 * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
+            short_score += ensemble_weight * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
             short_reasons.push("Ensemble Bearish Bias");
         }
 
         // Kalman flow contributes to continuation score
         if is_bull_flow {
-            long_score += kalman_score * 0.5;
+            long_score += kalman_score * 0.6; // Increased from 0.5 to prioritize Price Action
             long_reasons.push("Bullish M5 Flow");
         }
         if is_bear_flow {
-            short_score += kalman_score * 0.5;
+            short_score += kalman_score * 0.6; // Increased from 0.5 to prioritize Price Action
             short_reasons.push("Bearish M5 Flow");
         }
 
@@ -168,20 +170,31 @@ impl ScalpEngine {
             short_reasons.push("M1 Bearish Surge");
         }
 
-        // Inducement (reversal) adds weight
+        // ---- NEW: Confluence Boost ----
+        // If M5 Flow (Trend) and M1 Surge (Timing) align, add a bonus to conviction.
+        if is_bull_flow && is_bull_m1 {
+            long_score += settings.flow_surge_confluence_boost; 
+            long_reasons.push("Flow+Surge Confluence");
+        }
+        if is_bear_flow && is_bear_m1 {
+            short_score += settings.flow_surge_confluence_boost;
+            short_reasons.push("Flow+Surge Confluence");
+        }
+
+        // Inducement (reversal) adds weight (using settings.inducement_weight)
         if inducement.as_str() == "bullish_inducement" {
-            long_score += 0.6 * inducement_score; // inducement_score is 1.0 here
+            long_score += settings.inducement_weight * inducement_score; // inducement_score is 1.0 here
             long_reasons.push("Bullish Inducement");
             short_score *= 0.5; // Reduce opposing score
         } else if inducement.as_str() == "bearish_inducement" {
-            short_score += 0.6 * inducement_score; // inducement_score is 1.0 here
+            short_score += settings.inducement_weight * inducement_score; // inducement_score is 1.0 here
             short_reasons.push("Bearish Inducement");
             long_score *= 0.5; // Reduce opposing score
         }
 
         // Map raw scores [0..~1.5] to conviction % using a conservative scaler
-        let conv_long = (1.0 / (1.0 + (-6.0 * (long_score - 0.6)).exp())) * 100.0; // logistic mapping
-        let conv_short = (1.0 / (1.0 + (-6.0 * (short_score - 0.6)).exp())) * 100.0;
+        let conv_long = (1.0 / (1.0 + (-settings.logistic_scale * (long_score - settings.logistic_offset)).exp())) * 100.0; // logistic mapping
+        let conv_short = (1.0 / (1.0 + (-settings.logistic_scale * (short_score - settings.logistic_offset)).exp())) * 100.0;
 
         // ---- NEW: Data Population for Visualization (Moved Up) ----
         // 1. Imbalance Zones (FVGs) on M5
@@ -210,7 +223,7 @@ impl ScalpEngine {
         };
 
         // Decide side and final reason if above minimum conviction threshold
-        let min_conv_to_trade = MIN_CONVICTION; // tuned conservatively
+        let min_conv_to_trade = settings.min_conviction; // tuned conservatively
         let (mut entry_type, conviction, mut reason) = if conv_long >= min_conv_to_trade && conv_long > conv_short {
             ("long".to_string(), conv_long, long_reasons.join(" + "))
         } else if conv_short >= min_conv_to_trade && conv_short > conv_long {
@@ -238,7 +251,7 @@ impl ScalpEngine {
             ("market".to_string(), req.current_price)
         } else {
             // Use kalman estimate as the preferred limit, but enforce max distance and expiry
-            let max_limit_distance = last_atr * MAX_LIMIT_DIST_ATR_MULT; // don't place stale/unsafe limit orders too far
+            let max_limit_distance = last_atr * settings.max_limit_dist_atr_mult; // don't place stale/unsafe limit orders too far
             let desired_limit = k_est;
             let distance = (desired_limit - req.current_price).abs();
             if distance <= max_limit_distance {
@@ -252,10 +265,10 @@ impl ScalpEngine {
 
         // ---- SL/TP using ATR, but with sanity caps ----
         // SL multiplier dynamic: tighter for inducement, wider for flow trades
-        let sl_mult = if inducement_score > 0.0 { 1.0 } else { 2.0 };
+        let sl_mult = if inducement_score > 0.0 { settings.sl_atr_multiplier_inducement } else { settings.sl_atr_multiplier_flow };
         // For scalp, use modest targets (1.25x and 2.5x ATR)
-        let tp1_mult = 1.25;
-        let tp2_mult = 2.5;
+        let tp1_mult = settings.risk_reward_ratio_tp1;
+        let tp2_mult = settings.risk_reward_ratio_tp2;
 
         let (sl, tp1, tp2) = if entry_type == "none" {
             (0.0, 0.0, 0.0)
@@ -307,8 +320,8 @@ impl ScalpEngine {
             conviction_score: Some(conviction),
             recommended_order_type,
             limit_order_price: entry_price,
-            expiration_seconds: Some(180),
-            time_stop_seconds: 3600, // 1 Hour time stop for scalps
+            expiration_seconds: Some(settings.limit_order_expiration),
+            time_stop_seconds: settings.time_stop_seconds, // 1 Hour time stop for scalps
             imbalance_zones: fvg_zones,
             liquidity_zones,
             sweep_detected,

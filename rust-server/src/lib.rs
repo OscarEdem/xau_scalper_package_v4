@@ -1,7 +1,9 @@
 pub mod indicators;
+pub mod config;
 pub mod engines;
 pub mod news_fetcher;
 pub mod session;
+pub mod macro_analysis;
 pub use indicators::*;
 pub use session::*;
 

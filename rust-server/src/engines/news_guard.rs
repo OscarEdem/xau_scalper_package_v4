@@ -1,7 +1,9 @@
 use crate::NewsEvent;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// The result of a guard evaluation, indicating if trading is allowed.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct GuardResult {
     pub allowed: bool,
     pub reason: Option<String>,

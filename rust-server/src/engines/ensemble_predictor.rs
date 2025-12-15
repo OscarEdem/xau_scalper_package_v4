@@ -37,7 +37,13 @@ pub fn calculate_bias(
 
     for (model_type, p) in predictors {
         let pred_price = p.predict(closes, future_periods).unwrap_or(current_price);
-        let confidence = p.confidence().unwrap_or(0.0);
+        let mut confidence = p.confidence().unwrap_or(0.0);
+
+        // Custom Weighting: Boost LSTM influence relative to GBM/Heston
+        if model_type == "lstm" {
+            confidence *= 2.0; // Double the weight of the LSTM model
+        }
+
         let predicted_change = pred_price - current_price;
         weighted_prediction_sum += predicted_change * confidence;
         total_confidence += confidence;

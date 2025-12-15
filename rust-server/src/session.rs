@@ -1,16 +1,19 @@
 use crate::{
     engines::{scalp::ScalpEngine, swing::SwingEngine},
     engines::predictor_cache::PredictorCache,
+    config::TradingSettings,
     EvalRequest, EvalResponse,
 };
 use dashmap::DashMap;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tracing::info;
+use serde::{Serialize, Deserialize};
+use tokio::sync::Mutex;
 
 /// Represents the dominant trend direction determined by the SwingEngine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrendDirection {
     Up,
     Down,
@@ -29,7 +32,7 @@ impl From<&str> for TrendDirection {
 
 /// Handles trade execution logic: Cooldowns, Anti-Spam, Pyramiding, and Reversals.
 /// Decouples the "decision to notify" from the "session state".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionManager {
     pub last_notified_signal_id: Option<String>,
     pub last_notified_direction: String, // "long", "short", "none"
@@ -98,10 +101,17 @@ impl ExecutionManager {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReEntryContext {
+    direction: String,
+    level: f64,
+    timestamp: i64,
+}
+
 /// Manages the state for a single trading symbol (e.g., "XAUUSD").
 /// A TradingSession is created for each symbol the system trades. It holds all
 /// necessary data buffers, open positions, and latest signals for that symbol.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TradingSession {
     pub symbol: String,
     /// Configuration flag for cross-engine filtering.
@@ -109,7 +119,6 @@ pub struct TradingSession {
     pub filter_scalp_by_swing: bool,
     /// The predictor model to use for this session (e.g., "gbm", "lstm").
     pub predictor_model: String,
-    pub max_buffer_size: usize,
 
     // --- State Data ---
     last_evaluation_timestamp: i64,
@@ -141,18 +150,19 @@ pub struct TradingSession {
     // --- Engine Outputs & Positions ---
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
+    
+    pending_re_entry: Option<ReEntryContext>,
 
     pub execution: ExecutionManager,
     pub swing_execution: ExecutionManager,
 }
 
 impl TradingSession {
-    pub fn new(symbol: String, filter_scalp_by_swing: bool, max_buffer_size: usize) -> Self {
+    pub fn new(symbol: String, filter_scalp_by_swing: bool, initial_buffer_size: usize) -> Self {
         Self {
             symbol,
             filter_scalp_by_swing,
             predictor_model: "gbm".to_string(), // Default to GBM
-            max_buffer_size,
             last_evaluation_timestamp: 0,
             last_m1_timestamp: 0,
             last_m5_timestamp: 0,
@@ -161,22 +171,23 @@ impl TradingSession {
             last_h4_timestamp: 0,
             last_d1_timestamp: 0,
             swing_trend: TrendDirection::Sideways,
-            m1_closes: VecDeque::with_capacity(max_buffer_size),
-            m5_closes: VecDeque::with_capacity(max_buffer_size),
-            m5_highs: VecDeque::with_capacity(max_buffer_size),
-            m5_lows: VecDeque::with_capacity(max_buffer_size),
-            m30_closes: VecDeque::with_capacity(max_buffer_size),
-            h1_closes: VecDeque::with_capacity(max_buffer_size),
-            h1_highs: VecDeque::with_capacity(max_buffer_size),
-            h1_opens: VecDeque::with_capacity(max_buffer_size),
-            h1_lows: VecDeque::with_capacity(max_buffer_size),
-            h4_closes: VecDeque::with_capacity(max_buffer_size),
-            h4_highs: VecDeque::with_capacity(max_buffer_size),
-            h4_lows: VecDeque::with_capacity(max_buffer_size),
-            d1_opens: VecDeque::with_capacity(max_buffer_size),
-            d1_closes: VecDeque::with_capacity(max_buffer_size),
+            m1_closes: VecDeque::with_capacity(initial_buffer_size),
+            m5_closes: VecDeque::with_capacity(initial_buffer_size),
+            m5_highs: VecDeque::with_capacity(initial_buffer_size),
+            m5_lows: VecDeque::with_capacity(initial_buffer_size),
+            m30_closes: VecDeque::with_capacity(initial_buffer_size),
+            h1_closes: VecDeque::with_capacity(initial_buffer_size),
+            h1_highs: VecDeque::with_capacity(initial_buffer_size),
+            h1_opens: VecDeque::with_capacity(initial_buffer_size),
+            h1_lows: VecDeque::with_capacity(initial_buffer_size),
+            h4_closes: VecDeque::with_capacity(initial_buffer_size),
+            h4_highs: VecDeque::with_capacity(initial_buffer_size),
+            h4_lows: VecDeque::with_capacity(initial_buffer_size),
+            d1_opens: VecDeque::with_capacity(initial_buffer_size),
+            d1_closes: VecDeque::with_capacity(initial_buffer_size),
             latest_scalp_signal: None,
             latest_swing_signal: None,
+            pending_re_entry: None,
             execution: ExecutionManager::new(true), // Scalp: Allow pyramiding
             swing_execution: ExecutionManager::new(false), // Swing: No pyramiding (First signal only)
         }
@@ -186,7 +197,7 @@ impl TradingSession {
     /// It updates internal buffers and then runs both trading engines.
     /// Note: req is now EvalRequest<'static> (owned) coming from the API.
     /// Returns a list of signals that should be notified.
-    pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache) -> Vec<EvalResponse> {
+    pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
         // 1. Update data buffers with the latest candle data from the request.
@@ -194,17 +205,18 @@ impl TradingSession {
         // Guard against duplicate ticks: Only update if timestamp advanced OR it's a full sync (>10 items).
         
         // M1 Update
-        if req.last_m1_timestamp > self.last_m1_timestamp || req.closes.len() > 10 {
-            Self::update_buffer(&mut self.m1_closes, &req.closes, self.max_buffer_size);
+        // Increased sync threshold to 100 to prevent wiping history on small catch-up batches
+        if req.last_m1_timestamp > self.last_m1_timestamp || req.closes.len() > settings.sync_threshold {
+            Self::update_buffer(&mut self.m1_closes, &req.closes, settings.max_buffer_size);
             self.last_m1_timestamp = req.last_m1_timestamp;
         }
 
         // M5 Update
         if let Some(ts) = req.last_m5_timestamp {
-            if ts > self.last_m5_timestamp || req.m5_closes.len() > 10 {
-                Self::update_buffer(&mut self.m5_closes, &req.m5_closes, self.max_buffer_size);
-                Self::update_buffer(&mut self.m5_highs, &req.m5_highs, self.max_buffer_size);
-                Self::update_buffer(&mut self.m5_lows, &req.m5_lows, self.max_buffer_size);
+            if ts > self.last_m5_timestamp || req.m5_closes.len() > settings.sync_threshold {
+                Self::update_buffer(&mut self.m5_closes, &req.m5_closes, settings.max_buffer_size);
+                Self::update_buffer(&mut self.m5_highs, &req.m5_highs, settings.max_buffer_size);
+                Self::update_buffer(&mut self.m5_lows, &req.m5_lows, settings.max_buffer_size);
                 self.last_m5_timestamp = ts;
             }
         } else if !req.m5_closes.is_empty() {
@@ -213,8 +225,8 @@ impl TradingSession {
 
         // M30 Update
         if let Some(ts) = req.last_m30_timestamp {
-            if ts > self.last_m30_timestamp || req.m30_closes.len() > 10 {
-                Self::update_buffer(&mut self.m30_closes, &req.m30_closes, self.max_buffer_size);
+            if ts > self.last_m30_timestamp || req.m30_closes.len() > settings.sync_threshold {
+                Self::update_buffer(&mut self.m30_closes, &req.m30_closes, settings.max_buffer_size);
                 self.last_m30_timestamp = ts;
             }
         } else if !req.m30_closes.is_empty() {
@@ -223,11 +235,11 @@ impl TradingSession {
         
         // H1 Update
         if let Some(ts) = req.last_h1_timestamp {
-            if ts > self.last_h1_timestamp || req.h1_closes.as_ref().map_or(false, |v| v.len() > 10) {
-                if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v, self.max_buffer_size); }
-                if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v, self.max_buffer_size); }
-                if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v, self.max_buffer_size); }
-                if let Some(v) = &req.h1_lows { Self::update_buffer(&mut self.h1_lows, v, self.max_buffer_size); }
+            if ts > self.last_h1_timestamp || req.h1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+                if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h1_lows { Self::update_buffer(&mut self.h1_lows, v, settings.max_buffer_size); }
                 self.last_h1_timestamp = ts;
             }
         } else if req.h1_closes.as_ref().map_or(false, |v| !v.is_empty()) {
@@ -236,10 +248,10 @@ impl TradingSession {
         
         // H4 Update
         if let Some(ts) = req.last_h4_timestamp {
-            if ts > self.last_h4_timestamp || req.h4_closes.as_ref().map_or(false, |v| v.len() > 10) {
-                if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v, self.max_buffer_size); }
-                if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v, self.max_buffer_size); }
-                if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v, self.max_buffer_size); }
+            if ts > self.last_h4_timestamp || req.h4_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+                if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v, settings.max_buffer_size); }
                 self.last_h4_timestamp = ts;
             }
         } else if req.h4_closes.as_ref().map_or(false, |v| !v.is_empty()) {
@@ -248,9 +260,9 @@ impl TradingSession {
         
         // D1 Update
         if let Some(ts) = req.last_d1_timestamp {
-            if ts > self.last_d1_timestamp || req.d1_closes.as_ref().map_or(false, |v| v.len() > 10) {
-                if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v, self.max_buffer_size); }
-                if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v, self.max_buffer_size); }
+            if ts > self.last_d1_timestamp || req.d1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+                if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v, settings.max_buffer_size); }
+                if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v, settings.max_buffer_size); }
                 self.last_d1_timestamp = ts;
             }
         } else if req.d1_closes.as_ref().map_or(false, |v| !v.is_empty()) {
@@ -275,63 +287,16 @@ impl TradingSession {
         let mut swing_signal = {
             let mut swing_req = self.build_engine_request("swing", req.current_price);
             swing_req.upcoming_events = req.upcoming_events.clone();
-            SwingEngine::evaluate(&swing_req, predictor_cache)
+            SwingEngine::evaluate(&swing_req, predictor_cache, &settings.swing)
         };
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
 
         // Latching Logic & Trade Management
-        if let Some(existing) = &self.latest_swing_signal {
-            if existing.signal_id == swing_signal.signal_id {
-                // 1. Latch Entry
-                swing_signal.entry_price = existing.entry_price;
-                swing_signal.limit_order_price = existing.limit_order_price;
-                swing_signal.recommended_order_type = existing.recommended_order_type.clone();
+        self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp);
 
-                // 2. SL Management (Lock & Trail)
-                let current_price = req.current_price;
-                let mut managed_sl = existing.sl_price; // Start with locked SL
-
-                // Preserve Initial SL in debug_info for the frontend
-                let initial_sl = existing.debug_info.as_ref()
-                    .and_then(|d| d.get("initial_sl"))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{:.2}", existing.sl_price));
-
-                if swing_signal.debug_info.is_none() {
-                    swing_signal.debug_info = Some(HashMap::new());
-                }
-                if let Some(d) = &mut swing_signal.debug_info {
-                    d.insert("initial_sl".to_string(), initial_sl);
-                }
-
-                if swing_signal.entry_type == "long" {
-                    // Invalidation: If price dropped below existing SL, kill signal
-                    if current_price < managed_sl {
-                        swing_signal.entry_type = "none".to_string();
-                        swing_signal.reason = format!("Invalidated (Hit SL): {:.2} < {:.2}", current_price, managed_sl);
-                    } else {
-                        // Trailing: Move SL up if targets reached
-                        if current_price > swing_signal.tp1_price { managed_sl = managed_sl.max(swing_signal.entry_price); }
-                        if current_price > swing_signal.tp2_price { managed_sl = managed_sl.max(swing_signal.tp1_price); }
-                        // Lock: Ensure SL never drops
-                        swing_signal.sl_price = managed_sl.max(swing_signal.sl_price);
-                    }
-                } else if swing_signal.entry_type == "short" {
-                    // Invalidation
-                    if current_price > managed_sl {
-                        swing_signal.entry_type = "none".to_string();
-                        swing_signal.reason = format!("Invalidated (Hit SL): {:.2} > {:.2}", current_price, managed_sl);
-                    } else {
-                        // Trailing
-                        if current_price < swing_signal.tp1_price { managed_sl = managed_sl.min(swing_signal.entry_price); }
-                        if current_price < swing_signal.tp2_price { managed_sl = managed_sl.min(swing_signal.tp1_price); }
-                        // Lock: Ensure SL never rises
-                        swing_signal.sl_price = managed_sl.min(swing_signal.sl_price);
-                    }
-                }
-            }
-        }
+        // --- Check for Re-Entry Trigger (Bounce off BE) ---
+        self.check_swing_reentry(&mut swing_signal, req.current_price, req.last_m1_timestamp, &settings.swing);
 
         // Swing Execution Logic (Anti-Flicker & First-Signal Only)
         let current_time = req.last_m1_timestamp;
@@ -357,7 +322,7 @@ impl TradingSession {
             scalp_req.upcoming_events = req.upcoming_events.clone();
             scalp_req.predictor_model = Some(predictor_model);
 
-            ScalpEngine::evaluate(&scalp_req, predictor_cache)
+            ScalpEngine::evaluate(&scalp_req, predictor_cache, &settings.scalp)
         };
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
@@ -365,7 +330,9 @@ impl TradingSession {
         // This is where the scalp signal can be suppressed if it conflicts with the swing trend.
         if self.filter_scalp_by_swing {
             let scalp_trend = TrendDirection::from(scalp_signal.entry_type.as_str());
-            if self.swing_trend != TrendDirection::Sideways && scalp_trend != self.swing_trend {
+            if self.swing_trend != TrendDirection::Sideways 
+                && scalp_trend != TrendDirection::Sideways 
+                && scalp_trend != self.swing_trend {
                 info!(
                     symbol = %self.symbol,
                     "Scalp signal ({:?}) conflicts with swing trend ({:?}). Adding caution warning.",
@@ -410,14 +377,176 @@ impl TradingSession {
         notifications
     }
 
+    fn manage_active_swing_trade(&mut self, swing_signal: &mut EvalResponse, current_price: f64, timestamp: i64) {
+        if let Some(existing) = &self.latest_swing_signal {
+            // Only latch if the existing signal is still active. If it was invalidated, treat fresh signal as new.
+            if existing.signal_id == swing_signal.signal_id && existing.entry_type != "none" {
+                // 1. Latch Entry
+                swing_signal.entry_price = existing.entry_price;
+                swing_signal.limit_order_price = existing.limit_order_price;
+                swing_signal.recommended_order_type = existing.recommended_order_type.clone();
+
+                // Latch TPs to prevent them from floating with current price.
+                // This ensures trailing logic (which compares current_price vs TP1) works consistently.
+                swing_signal.tp1_price = existing.tp1_price;
+                swing_signal.tp2_price = existing.tp2_price;
+                swing_signal.tp3_price = existing.tp3_price;
+
+                // 2. SL Management (Lock & Trail)
+                let mut managed_sl = existing.sl_price; // Start with locked SL
+
+                // --- NEW: Persistence for High/Low Watermark ---
+                // Track best price to ensure trailing triggers even if price retraces immediately.
+                let mut best_price = current_price;
+                if let Some(info) = &existing.debug_info {
+                    if let Some(val_str) = info.get("best_price") {
+                        if let Ok(val) = val_str.parse::<f64>() {
+                            best_price = val;
+                        }
+                    }
+                }
+
+                // Preserve Initial SL in debug_info for the frontend
+                let initial_sl = existing.debug_info.as_ref()
+                    .and_then(|d| d.get("initial_sl"))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:.5}", existing.sl_price));
+                
+                let initial_sl_val = initial_sl.parse::<f64>().unwrap_or(existing.sl_price);
+
+                if swing_signal.debug_info.is_none() {
+                    swing_signal.debug_info = Some(HashMap::new());
+                }
+                if let Some(d) = &mut swing_signal.debug_info {
+                    d.insert("initial_sl".to_string(), initial_sl);
+                    
+                    // Update and store watermark
+                    if swing_signal.entry_type == "long" {
+                        best_price = best_price.max(current_price);
+                    } else {
+                        best_price = best_price.min(current_price);
+                    }
+                    d.insert("best_price".to_string(), format!("{:.5}", best_price));
+                }
+
+                if swing_signal.entry_type == "long" {
+                    // Invalidation: If price dropped below existing SL, kill signal
+                    if current_price < managed_sl {
+                        swing_signal.entry_type = "none".to_string();
+                        // Distinguish between Initial SL hit and Trailing/BE hit
+                        if managed_sl > initial_sl_val + 0.00001 {
+                            swing_signal.reason = format!("Stopped at Breakeven/Trail: {:.2} < {:.2}", current_price, managed_sl);
+                            // Enable Re-Entry Watch
+                            self.pending_re_entry = Some(ReEntryContext {
+                                direction: "long".to_string(),
+                                level: managed_sl,
+                                timestamp,
+                            });
+                        } else {
+                            swing_signal.reason = format!("Invalidated (Hit SL): {:.2} < {:.2}", current_price, managed_sl);
+                        }
+                        // Reset execution memory to allow re-entry if structure holds
+                        self.swing_execution.last_notified_signal_id = None;
+                    } else {
+                        // Trailing: Move SL up if targets reached
+                        if best_price >= swing_signal.tp1_price { managed_sl = managed_sl.max(swing_signal.entry_price); }
+                        if best_price >= swing_signal.tp2_price { managed_sl = managed_sl.max(swing_signal.tp1_price); }
+                        // Lock: Ensure SL never drops
+                        swing_signal.sl_price = managed_sl.max(swing_signal.sl_price);
+                    }
+                } else if swing_signal.entry_type == "short" {
+                    // Invalidation
+                    if current_price > managed_sl {
+                        swing_signal.entry_type = "none".to_string();
+                        // Distinguish between Initial SL hit and Trailing/BE hit
+                        if managed_sl < initial_sl_val - 0.00001 {
+                            swing_signal.reason = format!("Stopped at Breakeven/Trail: {:.2} > {:.2}", current_price, managed_sl);
+                            // Enable Re-Entry Watch
+                            self.pending_re_entry = Some(ReEntryContext {
+                                direction: "short".to_string(),
+                                level: managed_sl,
+                                timestamp,
+                            });
+                        } else {
+                            swing_signal.reason = format!("Invalidated (Hit SL): {:.2} > {:.2}", current_price, managed_sl);
+                        }
+                        // Reset execution memory to allow re-entry if structure holds
+                        self.swing_execution.last_notified_signal_id = None;
+                    } else {
+                        // Trailing
+                        if best_price <= swing_signal.tp1_price { managed_sl = managed_sl.min(swing_signal.entry_price); }
+                        if best_price <= swing_signal.tp2_price { managed_sl = managed_sl.min(swing_signal.tp1_price); }
+                        // Lock: Ensure SL never rises
+                        swing_signal.sl_price = managed_sl.min(swing_signal.sl_price);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_swing_reentry(&mut self, swing_signal: &mut EvalResponse, current_price: f64, timestamp: i64, settings: &crate::config::SwingSettings) {
+        // Safety: Do not trigger re-entry if the engine is explicitly blocked (News/Volatility)
+        let is_blocked = swing_signal.reason.starts_with("Blocked");
+        if swing_signal.entry_type == "none" && !is_blocked {
+            if let Some(ctx) = &self.pending_re_entry {
+                let elapsed = timestamp - ctx.timestamp;
+                // Expire after configured time
+                if elapsed > settings.reentry_expiration_seconds {
+                    self.pending_re_entry = None;
+                } else {
+                    let bounce_threshold = settings.reentry_bounce_threshold;
+                    let invalidation_threshold = settings.reentry_invalidation_threshold;
+
+                    if ctx.direction == "long" {
+                        if current_price < ctx.level * (1.0 - invalidation_threshold) {
+                            self.pending_re_entry = None; // Failed support
+                        } else if current_price > ctx.level * (1.0 + bounce_threshold) {
+                            // Trigger Re-Entry
+                            swing_signal.entry_type = "long".to_string();
+                            swing_signal.entry_price = current_price;
+                            swing_signal.reason = "Re-Entry: Price bounced off Breakeven/Support".to_string();
+                            swing_signal.signal_id = format!("{}-reentry-{}", self.symbol, timestamp);
+                            // Set SL/TP for re-entry (tight SL below bounce)
+                            swing_signal.sl_price = ctx.level * (1.0 - settings.reentry_sl_pct); // SL just below BE
+                            swing_signal.tp1_price = current_price * (1.0 + settings.reentry_tp1_pct);
+                            swing_signal.tp2_price = current_price * (1.0 + settings.reentry_tp2_pct);
+                            swing_signal.classification = "swing_reentry".to_string();
+                            swing_signal.conviction_score = Some(60.0); // Default conviction for re-entry
+                            
+                            self.pending_re_entry = None; // Consumed
+                        }
+                    } else if ctx.direction == "short" {
+                        if current_price > ctx.level * (1.0 + invalidation_threshold) {
+                            self.pending_re_entry = None; // Failed resistance
+                        } else if current_price < ctx.level * (1.0 - bounce_threshold) {
+                            // Trigger Re-Entry
+                            swing_signal.entry_type = "short".to_string();
+                            swing_signal.entry_price = current_price;
+                            swing_signal.reason = "Re-Entry: Price bounced off Breakeven/Resistance".to_string();
+                            swing_signal.signal_id = format!("{}-reentry-{}", self.symbol, timestamp);
+                            swing_signal.sl_price = ctx.level * (1.0 + settings.reentry_sl_pct);
+                            swing_signal.tp1_price = current_price * (1.0 - settings.reentry_tp1_pct);
+                            swing_signal.tp2_price = current_price * (1.0 - settings.reentry_tp2_pct);
+                            swing_signal.classification = "swing_reentry".to_string();
+                            swing_signal.conviction_score = Some(60.0);
+
+                            self.pending_re_entry = None; // Consumed
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Helper to update a buffer.
     /// If `new_data` is large (> 10 items), it replaces the buffer (Sync).
     /// If `new_data` is small, it appends to the buffer and maintains MAX_BUFFER_SIZE (Incremental).
     fn update_buffer(buffer: &mut VecDeque<f64>, new_data: &[f64], max_len: usize) {
         if new_data.is_empty() { return; }
 
-        if new_data.len() > 10 {
-            // Assume full sync
+        // Heuristic: Only treat as "Full Sync" (replace) if data is substantial (>100 items).
+        // Smaller batches are treated as incremental catch-ups to preserve history.
+        if new_data.len() > 100 {
             buffer.clear();
             // Cap at MAX_BUFFER_SIZE to prevent unbounded growth
             let start = new_data.len().saturating_sub(max_len);
@@ -515,24 +644,33 @@ impl TradingSession {
 #[derive(Clone)]
 pub struct SessionManager {
     pub sessions: Arc<DashMap<String, Arc<Mutex<TradingSession>>>>,
-    pub max_buffer_size: usize,
+    pub settings: Arc<RwLock<TradingSettings>>,
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
-        Self { sessions: Arc::new(DashMap::new()), max_buffer_size: 500 }
+        // This default is rarely used as we load from config, but good for tests
+        let settings = TradingSettings::default();
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)) }
     }
 }
 
 impl SessionManager {
-    pub fn new(max_buffer_size: usize) -> Self {
-        Self { sessions: Arc::new(DashMap::new()), max_buffer_size }
+    pub fn new(settings: TradingSettings) -> Self {
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)) }
     }
 
     pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> Arc<Mutex<TradingSession>> {
         self.sessions.entry(symbol.to_string()).or_insert_with(|| {
             info!("Creating new trading session for symbol: {}", symbol);
-            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, self.max_buffer_size)))
+            let settings = self.settings.read().unwrap();
+            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, settings.max_buffer_size)))
         }).clone()
+    }
+
+    pub async fn update_settings(&self, new_settings: TradingSettings) {
+        // 1. Update global settings for future sessions
+        *self.settings.write().unwrap() = new_settings.clone();
+        info!("Global settings updated. All active sessions will use new settings on next tick.");
     }
 }
