@@ -247,19 +247,22 @@ impl ScalpEngine {
         // If inducement present, prefer market entry (reversal). Otherwise, use limit near kalman estimate.
         let (recommended_order_type, entry_price) = if entry_type == "none" {
             ("none".to_string(), 0.0)
-        } else if inducement_score > 0.0 {
-            ("market".to_string(), req.current_price)
         } else {
-            // Use kalman estimate as the preferred limit, but enforce max distance and expiry
-            let max_limit_distance = last_atr * settings.max_limit_dist_atr_mult; // don't place stale/unsafe limit orders too far
-            let desired_limit = k_est;
-            let distance = (desired_limit - req.current_price).abs();
-            if distance <= max_limit_distance {
-                let order_side = if entry_type == "long" { "buy" } else { "sell" };
-                (format!("limit_{}", order_side), desired_limit)
+            let suffix = entry_type.clone(); // "long" or "short"
+            
+            if inducement_score > 0.0 {
+                (format!("market_{}", suffix), req.current_price)
             } else {
-                // If kalman estimate is too far, fallback to market to avoid missed fills
-                ("market".to_string(), req.current_price)
+                // Use kalman estimate as the preferred limit, but enforce max distance and expiry
+                let max_limit_distance = last_atr * settings.max_limit_dist_atr_mult;
+                let desired_limit = k_est;
+                let distance = (desired_limit - req.current_price).abs();
+                if distance <= max_limit_distance {
+                    (format!("limit_{}", suffix), desired_limit)
+                } else {
+                    // If kalman estimate is too far, fallback to market to avoid missed fills
+                    (format!("market_{}", suffix), req.current_price)
+                }
             }
         };
 

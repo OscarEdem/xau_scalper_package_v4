@@ -1,9 +1,9 @@
 use crate::NewsEvent;
 use crate::macro_analysis::classification::classify_event;
-use chrono::{Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{Datelike, DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Represents the structure of a single event from the Forex Factory JSON endpoint.
 #[derive(Deserialize, Debug)]
@@ -20,9 +20,9 @@ struct ForexFactoryEvent {
 /// Maps ForexFactory country codes to ISO currency codes.
 pub fn map_country_to_currency(country: &str) -> Option<String> {
     match country.to_uppercase().as_str() {
-        "US" | "USA" | "USD" => Some("USD".to_string()),
-        "EU" | "EMU" | "EUR" | "DE" | "FR" | "IT" | "ES" => Some("EUR".to_string()),
-        "GB" | "UK" | "GBP" | "GREAT BRITAIN" => Some("GBP".to_string()),
+        "US" | "USA" | "USD" | "UNITED STATES" => Some("USD".to_string()),
+        "EU" | "EMU" | "EUR" | "DE" | "FR" | "IT" | "ES" | "EUROZONE" => Some("EUR".to_string()),
+        "GB" | "UK" | "GBP" | "GREAT BRITAIN" | "UNITED KINGDOM" => Some("GBP".to_string()),
         "CA" | "CAN" | "CAD" | "CANADA" => Some("CAD".to_string()),
         "AU" | "AUS" | "AUD" | "AUSTRALIA" => Some("AUD".to_string()),
         "NZ" | "NZD" | "NEW ZEALAND" => Some("NZD".to_string()),
@@ -55,9 +55,15 @@ fn is_ny_dst(dt: NaiveDateTime) -> bool {
 
 /// Parses ForexFactory datetime (ET) and converts it to UTC timestamp.
 pub fn parse_forexfactory_datetime_to_utc(date_str: &str) -> Option<i64> {
+    // 1. Try parsing as RFC3339 / ISO 8601 with offset first (e.g., "2025-12-14T16:30:00-05:00")
+    if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
+        return Some(dt.with_timezone(&Utc).timestamp());
+    }
+
     // Try parsing standard formats
     let naive = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S"))
+        .or_else(|_| NaiveDateTime::parse_from_str(date_str, "%m-%d-%Y %H:%M:%S"))
         .ok()?;
 
     // Determine offset: EDT is UTC-4, EST is UTC-5
@@ -82,18 +88,41 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
     };
 
     let url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
-    let response = match client.get(url).send().await {
-        Ok(res) => res,
-        Err(e) => {
-            error!("Failed to connect to Forex Factory: {}", e);
+    
+    let mut attempt = 0;
+    let max_retries = 3;
+    let mut response = None;
+
+    while attempt < max_retries {
+        match client.get(url).send().await {
+            Ok(res) => {
+                if res.status().is_success() {
+                    response = Some(res);
+                    break;
+                } else if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let wait_secs = 30 * (attempt + 1);
+                    error!("Forex Factory returned 429 Too Many Requests. Retrying in {} seconds...", wait_secs);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs as u64)).await;
+                } else {
+                    error!("Forex Factory returned error status: {}. Retrying...", res.status());
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+            Err(e) => {
+                error!("Failed to connect to Forex Factory: {}. Retrying...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+        attempt += 1;
+    }
+
+    let response = match response {
+        Some(r) => r,
+        None => {
+            error!("Failed to fetch news events after {} attempts.", max_retries);
             return vec![];
         }
     };
-
-    if !response.status().is_success() {
-        error!("Forex Factory returned error status: {}", response.status());
-        return vec![];
-    }
 
     let events: Vec<ForexFactoryEvent> = match response.json().await {
         Ok(e) => e,
@@ -111,7 +140,10 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
         // 3. Map country to currency
         let currency = match map_country_to_currency(&event.country) {
             Some(c) => c,
-            None => continue,
+            None => {
+                debug!("Skipping event '{}' due to unknown country: '{}'", event.title, event.country);
+                continue;
+            }
         };
 
         // 4. Filter by Impact (High or Medium only)
@@ -123,7 +155,10 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
         // 5. Timezone correction
         let timestamp = match parse_forexfactory_datetime_to_utc(&event.date) {
             Some(ts) => ts,
-            None => continue,
+            None => {
+                debug!("Skipping event '{}' due to date parse failure: '{}'", event.title, event.date);
+                continue;
+            }
         };
 
         let category = classify_event(&event.title);

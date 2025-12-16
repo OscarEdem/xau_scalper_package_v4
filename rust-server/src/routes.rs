@@ -16,20 +16,6 @@ use std::sync::Arc;
 use tracing::info;
 
 #[derive(Deserialize, IntoParams)]
-pub struct FundamentalQuery {
-    symbol: String,
-    /// "daily" or "weekly"
-    #[serde(default = "default_period")]
-    period: String,
-    #[serde(default)]
-    force_refresh: bool,
-}
-
-fn default_period() -> String {
-    "daily".to_string()
-}
-
-#[derive(Deserialize, IntoParams)]
 pub struct SymbolQuery {
     symbol: String,
     #[serde(default)]
@@ -59,18 +45,6 @@ pub async fn weekly_analysis(
 ) -> Json<serde_json::Value> {
     // Weekly: Uses all high-impact events in last 7 days + upcoming
     let result = generate_fundamental_report(state, &q.symbol, "weekly", q.force_refresh).await;
-    Json(result)
-}
-
-#[utoipa::path(
-    get, path = "/analysis/fundamental", params(FundamentalQuery),
-    responses((status = 200, description = "Returns a fundamental analysis report from the AI based on upcoming news events"))
-)]
-pub async fn fundamental_analysis(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Query(q): Query<FundamentalQuery>,
-) -> Json<serde_json::Value> {
-    let result = generate_fundamental_report(state, &q.symbol, &q.period, q.force_refresh).await;
     Json(result)
 }
 
@@ -208,13 +182,25 @@ pub async fn generate_fundamental_report(
         .await;
 
     let mut result: serde_json::Value = match llm_response {
-        Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_else(|e| {
-            serde_json::json!({
-                "error": "Failed to parse LLM JSON",
-                "details": e.to_string(),
-                "raw": json_str
+        Ok(json_str) => {
+            // Attempt to clean the response if it contains markdown code blocks or extra text
+            let cleaned_json = if let Some(start) = json_str.find('{') {
+                if let Some(end) = json_str.rfind('}') {
+                    &json_str[start..=end]
+                } else {
+                    &json_str
+                }
+            } else {
+                &json_str
+            };
+            serde_json::from_str(cleaned_json).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "error": "Failed to parse LLM JSON",
+                    "details": e.to_string(),
+                    "raw": json_str
+                })
             })
-        }),
+        },
         Err(e) => serde_json::json!({
             "error": format!("Fundamental analysis failed: {}", e)
         }),

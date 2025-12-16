@@ -145,15 +145,18 @@ impl SwingEngine {
         // Otherwise, default to market execution.
         let (recommended_order_type, execution_price) = if entry_type == "none" {
             ("none".to_string(), 0.0)
-        } else if reason.contains("FVG") {
-             if let Some(price) = get_fvg_limit_price(&fvg_zones, req.current_price, &entry_type, "optimal") {
-                 let side = if entry_type == "long" { "buy" } else { "sell" };
-                 (format!("limit_{}", side), price)
-             } else {
-                 ("market".to_string(), req.current_price)
-             }
         } else {
-             ("market".to_string(), req.current_price)
+            let suffix = entry_type.clone(); // "long" or "short"
+            
+            if reason.contains("FVG") {
+                 if let Some(price) = get_fvg_limit_price(&fvg_zones, req.current_price, &entry_type, "optimal") {
+                     (format!("limit_{}", suffix), price)
+                 } else {
+                     (format!("market_{}", suffix), req.current_price)
+                 }
+            } else {
+                 (format!("market_{}", suffix), req.current_price)
+            }
         };
 
         // --- 8. Risk Model ---

@@ -15,11 +15,10 @@ use utoipa::{OpenApi};
 use utoipa_swagger_ui::SwaggerUi; pub use xau_scalper_server::{news_fetcher::fetch_calendar_events};
 use tokio::fs; // Use tokio's async fs module
 pub use xau_scalper_server::{
-    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession
+    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory
 };
 use tokio::sync::Mutex;
 
-#[path = "LLM/mod.rs"]
 pub mod llm;
 mod routes;
 mod background;
@@ -45,7 +44,6 @@ use crate::state::*;
         handlers::trading::get_all_latest_signals_handler,
         handlers::trading::get_signals_handler,
         handlers::system::save_push_token_handler,
-        routes::fundamental_analysis,
         routes::daily_analysis,
         routes::weekly_analysis,
         handlers::system::get_loaded_models_handler,
@@ -58,7 +56,7 @@ use crate::state::*;
         handlers::trading::get_news_guard_status_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, GuardResult, MacroOutlook, Bias)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, GuardResult, MacroOutlook, Bias, MacroCategory)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -191,7 +189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/news-guard/:symbol", get(handlers::trading::get_news_guard_status_handler))
         .route("/models/loaded", get(handlers::system::get_loaded_models_handler))
         // --- Analysis Endpoints ---
-        .route("/analysis/fundamental", get(routes::fundamental_analysis))
         .route("/daily-analysis", get(routes::daily_analysis))
         .route("/weekly-analysis", get(routes::weekly_analysis))
         // Provide the state to all handlers
