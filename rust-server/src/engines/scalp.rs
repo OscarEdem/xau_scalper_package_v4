@@ -107,7 +107,7 @@ impl ScalpEngine {
         let mut asia_range_cache = None;
         
         if session == "london_open" {
-            if let Some((asia_high, asia_low)) = Self::get_asia_range(&req.m5_highs, &req.m5_lows, req.last_m1_timestamp) {
+            if let Some((asia_high, asia_low)) = Self::get_asia_range(&req.m5_highs, &req.m5_lows, req.m5_timestamps.as_deref(), req.last_m1_timestamp) {
                 asia_range_cache = Some((asia_high, asia_low));
                 if req.current_price > asia_high && m1_closes.last().unwrap_or(&0.0) < &asia_high {
                     london_hunt_signal = "bearish_hunt";
@@ -227,6 +227,7 @@ impl ScalpEngine {
             time_stop_seconds: settings.time_stop_seconds,
             imbalance_zones: fvg_zones,
             liquidity_zones,
+            order_blocks: vec![],
             sweep_detected,
             volatility_regime: if decision.vol_regime_val > 1.5 { "high".to_string() } else if decision.vol_regime_val < 0.8 { "low".to_string() } else { "normal".to_string() },
             debug_info: Some(decision.debug_info),
@@ -270,13 +271,22 @@ impl ScalpEngine {
             let mut triggered = false;
             
             if req.current_price >= upper_fence && is_parabolic {
-                decision.entry_type = "short".to_string();
-                decision.reason = format!("Fade Short: Price {:.2} >= Upper Fence {:.2} + Parabolic", req.current_price, upper_fence);
-                triggered = true;
+                // Fix C: Safer Fade Trigger (Check for rejection candle)
+                let m1_close = *req.closes.last().unwrap_or(&0.0);
+                let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
+                if m1_close < prev_m1_close {
+                    decision.entry_type = "short".to_string();
+                    decision.reason = format!("Fade Short: Parabolic Rejection at Upper Fence");
+                    triggered = true;
+                }
             } else if req.current_price <= lower_fence && is_parabolic {
-                decision.entry_type = "long".to_string();
-                decision.reason = format!("Fade Long: Price {:.2} <= Lower Fence {:.2} + Parabolic", req.current_price, lower_fence);
-                triggered = true;
+                let m1_close = *req.closes.last().unwrap_or(&0.0);
+                let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
+                if m1_close > prev_m1_close {
+                    decision.entry_type = "long".to_string();
+                    decision.reason = format!("Fade Long: Parabolic Rejection at Lower Fence");
+                    triggered = true;
+                }
             }
 
             if triggered {
@@ -359,6 +369,8 @@ impl ScalpEngine {
             let is_bear_flow = norm_k_slope < -(kalman_slope_threshold * settings.flow_threshold_mult);
             let is_bull_m1 = norm_m1_surge > (m1_surge_threshold * settings.flow_threshold_mult);
             let is_bear_m1 = norm_m1_surge < -(m1_surge_threshold * settings.flow_threshold_mult);
+            let is_bear_m1_surge = norm_m1_surge < -(m1_surge_threshold); // M1 crashing
+            let is_bull_m1_surge = norm_m1_surge > (m1_surge_threshold); // M1 spiking
 
             let mut long_reasons = Vec::new();
             let mut long_score = 0.0;
@@ -397,19 +409,28 @@ impl ScalpEngine {
             if is_bull_flow {
                 long_score += kalman_score * settings.kalman_weight;
                 long_reasons.push("Bullish M5 Flow");
+
+                // Fix B: Pullback Buy Logic
+                if is_bear_m1_surge {
+                    long_score += m1_score * settings.m1_surge_weight * 1.5;
+                    long_reasons.push("Discount Entry (Bearish M1 Surge in Bull Trend)");
+                } else if is_bull_m1 {
+                    long_score += m1_score * settings.m1_surge_weight;
+                    long_reasons.push("M1 Momentum Alignment");
+                }
             }
             if is_bear_flow {
                 short_score += kalman_score * settings.kalman_weight;
                 short_reasons.push("Bearish M5 Flow");
-            }
 
-            if is_bull_m1 {
-                long_score += m1_score * settings.m1_surge_weight;
-                long_reasons.push("M1 Bullish Surge");
-            }
-            if is_bear_m1 {
-                short_score += m1_score * settings.m1_surge_weight;
-                short_reasons.push("M1 Bearish Surge");
+                // Fix B: Pullback Sell Logic
+                if is_bull_m1_surge {
+                    short_score += m1_score * settings.m1_surge_weight * 1.5;
+                    short_reasons.push("Premium Entry (Bullish M1 Surge in Bear Trend)");
+                } else if is_bear_m1 {
+                    short_score += m1_score * settings.m1_surge_weight;
+                    short_reasons.push("M1 Momentum Alignment");
+                }
             }
 
             if is_bull_flow && is_bull_m1 {
@@ -583,7 +604,7 @@ impl ScalpEngine {
         }
     }
 
-    fn get_asia_range(highs: &[f64], lows: &[f64], current_ts: i64) -> Option<(f64, f64)> {
+    fn get_asia_range(highs: &[f64], lows: &[f64], timestamps: Option<&[i64]>, current_ts: i64) -> Option<(f64, f64)> {
         let day_start = current_ts - (current_ts % 86400);
         let asia_end = day_start + 7 * 3600;
         
@@ -591,14 +612,27 @@ impl ScalpEngine {
         let mut min_l = f64::MAX;
         let mut found = false;
 
-        for (i, &h) in highs.iter().enumerate().rev() {
-            let bar_ts = current_ts - ((highs.len() - 1 - i) as i64 * 300);
-            if bar_ts >= day_start && bar_ts < asia_end {
-                max_h = max_h.max(h);
-                min_l = min_l.min(lows[i]);
-                found = true;
+        if let Some(ts_vec) = timestamps {
+            // Fix A: Robust Asia Range with explicit timestamps
+            for (i, &ts) in ts_vec.iter().enumerate() {
+                if i >= highs.len() || i >= lows.len() { continue; }
+                if ts >= day_start && ts < asia_end {
+                    max_h = max_h.max(highs[i]);
+                    min_l = min_l.min(lows[i]);
+                    found = true;
+                }
             }
-            if bar_ts < day_start { break; }
+        } else {
+            // Fallback to index-based calculation if timestamps missing
+            for (i, &h) in highs.iter().enumerate().rev() {
+                let bar_ts = current_ts - ((highs.len() - 1 - i) as i64 * 300);
+                if bar_ts >= day_start && bar_ts < asia_end {
+                    max_h = max_h.max(h);
+                    min_l = min_l.min(lows[i]);
+                    found = true;
+                }
+                if bar_ts < day_start { break; }
+            }
         }
         
         if found { Some((max_h, min_l)) } else { None }

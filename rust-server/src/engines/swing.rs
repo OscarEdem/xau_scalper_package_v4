@@ -35,6 +35,13 @@ struct Displacement {
     is_bullish: bool,
     is_bearish: bool,
     strength: f64, // 0-100 score
+    is_reversal: bool, // NEW: true if CHoCH, false if BOS
+}
+
+pub struct FractalGuardResult {
+    pub is_fighting_trend: bool,
+    pub penalty_score: f64,
+    pub warning: Option<String>,
 }
 
 pub struct SwingEngine;
@@ -82,7 +89,7 @@ impl SwingEngine {
         let htf_bias_score = Self::htf_bias_engine(req, settings);
 
         // --- 3. Market Structure Engine ---
-        let structure = Self::market_structure_engine(h1_highs, h1_lows, h1_closes, settings);
+        let structure = Self::market_structure_engine(h1_highs, h1_lows, h1_closes, req.current_price, settings);
         if structure.external_high.1 == 0.0 {
             return EvalResponse { reason: "Not enough structure found".to_string(), ..Default::default() };
         }
@@ -126,9 +133,30 @@ impl SwingEngine {
         debug!(h1_bias, d1_bias, final_bias = final_prediction_bias, "Swing ensemble prediction calculated");
 
         // --- 6. Confluence Scoring ---
-        let (long_score, short_score, reason_long, reason_short) = Self::confluence_scoring_engine(
+        let (mut long_score, mut short_score, mut reason_long, mut reason_short) = Self::confluence_scoring_engine(
             htf_bias_score, &liquidity, &displacement, &fvg_zones, &order_blocks, req.current_price, last_atr, final_prediction_bias, settings
         );
+
+        // --- NEW: Fractal Guard Integration ---
+        if long_score > 0.0 {
+            let guard = Self::fractal_guard("long", req.m15_highs.as_deref(), req.m15_lows.as_deref(), req.m15_closes.as_deref(), req.current_price, settings);
+            if guard.is_fighting_trend {
+                long_score = (long_score - guard.penalty_score).max(0.0);
+                if let Some(w) = guard.warning {
+                    reason_long = format!("{} [WARN: {}]", reason_long, w);
+                }
+            }
+        }
+
+        if short_score > 0.0 {
+            let guard = Self::fractal_guard("short", req.m15_highs.as_deref(), req.m15_lows.as_deref(), req.m15_closes.as_deref(), req.current_price, settings);
+            if guard.is_fighting_trend {
+                short_score = (short_score - guard.penalty_score).max(0.0);
+                if let Some(w) = guard.warning {
+                    reason_short = format!("{} [WARN: {}]", reason_short, w);
+                }
+            }
+        }
 
         // --- 7. Execution Logic ---
         let conviction_threshold = settings.conviction_threshold; // Lowered to capture Context-only trades (HTF + AI)
@@ -201,9 +229,6 @@ impl SwingEngine {
             });
         }
 
-        // Merge Order Blocks into liquidity zones
-        liquidity_zones.extend(order_blocks);
-
         // Determine Sweep Detected String
         let sweep_detected = if liquidity.is_sfp_bullish {
             "low_sweep".to_string()
@@ -250,6 +275,7 @@ impl SwingEngine {
             time_stop_seconds: settings.time_stop_seconds, // 24 Hours: Close trade if stagnant
             imbalance_zones: fvg_zones,
             liquidity_zones,
+            order_blocks,
             sweep_detected,
             volatility_regime: if last_atr > (avg_atr * 1.5) { "high".to_string() } else { "normal".to_string() },
             debug_info: Some(debug_info),
@@ -275,11 +301,22 @@ impl SwingEngine {
         } else { 0.0 };
 
         // Weighted average: Daily bias is more significant.
-        (daily_bias_val * settings.htf_bias_daily_weight) + (h4_bias_val * settings.htf_bias_h4_weight)
+        let mut bias = (daily_bias_val * settings.htf_bias_daily_weight) + (h4_bias_val * settings.htf_bias_h4_weight);
+
+        // Fix C: Recalculate HTF Bias with "Current State"
+        let current_d1_open = req.d1_opens.as_ref().and_then(|v| v.last()).cloned().unwrap_or(0.0);
+        if current_d1_open > 0.0 {
+            if req.current_price < current_d1_open {
+                bias -= 0.5; // Red day penalizes bullish bias / helps bearish bias
+            } else {
+                bias += 0.5; // Green day helps bullish bias / penalizes bearish bias
+            }
+        }
+        bias
     }
 
     /// Identifies key swing points and structural breaks.
-    fn market_structure_engine(highs: &[f64], lows: &[f64], closes: &[f64], settings: &SwingSettings) -> MarketStructure {
+    fn market_structure_engine(highs: &[f64], lows: &[f64], closes: &[f64], current_price: f64, settings: &SwingSettings) -> MarketStructure {
         let mut structure = MarketStructure::default();
         let (swing_highs, swing_lows) = find_swing_points(highs, lows, settings.swing_lookback, settings.swing_neighbors);
 
@@ -302,13 +339,16 @@ impl SwingEngine {
         structure.internal_low = *recent_lows[0];
         structure.external_low = *recent_lows[1];
 
+        // Fix: Determine trend based on sequence (Older vs Newer) BEFORE sorting
+        // recent_highs is [Older, Newer]. So internal=Older, external=Newer.
+        let is_uptrend = structure.external_high.1 > structure.internal_high.1 && structure.external_low.1 > structure.internal_low.1;
+        let is_downtrend = structure.external_high.1 < structure.internal_high.1 && structure.external_low.1 < structure.internal_low.1;
+
         // Sort to ensure external is truly the max/min
         if structure.internal_high.1 > structure.external_high.1 { std::mem::swap(&mut structure.internal_high, &mut structure.external_high); }
         if structure.internal_low.1 < structure.external_low.1 { std::mem::swap(&mut structure.internal_low, &mut structure.external_low); }
 
         let current_close = *closes.last().unwrap();
-        let is_uptrend = structure.internal_high.1 > structure.external_high.1 && structure.internal_low.1 > structure.external_low.1;
-        let is_downtrend = structure.internal_high.1 < structure.external_high.1 && structure.internal_low.1 < structure.external_low.1;
 
         // BOS: Breaking structure in the direction of the trend
         if is_uptrend && current_close > structure.external_high.1 { structure.is_bos_bullish = true; }
@@ -317,6 +357,15 @@ impl SwingEngine {
         // CHoCH: Breaking structure against the trend
         if is_uptrend && current_close < structure.internal_low.1 { structure.is_choch_bearish = true; }
         if is_downtrend && current_close > structure.internal_high.1 { structure.is_choch_bullish = true; }
+
+        // Fix A: Live Structure Degradation
+        // If we are technically in an uptrend, but price is currently below the key low
+        if is_uptrend && current_price < structure.internal_low.1 {
+            structure.is_bos_bullish = false; // Force neutrality/bearish lean
+        }
+        if is_downtrend && current_price > structure.internal_high.1 {
+            structure.is_bos_bearish = false;
+        }
 
         structure
     }
@@ -330,19 +379,26 @@ impl SwingEngine {
         let current_close = req.h1_closes.as_ref().unwrap()[n - 1];
 
         let vol_expansion = atr_pulse(atr_vals, 20, 1.5);
+        let range = current_high - current_low;
+        let close_pos = if range > 0.0 { (current_close - current_low) / range } else { 0.5 };
 
         // Bullish SFP: Wick takes external low, body closes above it.
         if current_low < structure.external_low.1 && current_close > structure.external_low.1 {
-            analysis.is_sfp_bullish = true;
-            analysis.sfp_confidence += 50.0;
-            if vol_expansion { analysis.sfp_confidence += 30.0; }
+            // Fix B: Filter SFPs against Momentum (must close in upper half)
+            if close_pos > 0.5 {
+                analysis.is_sfp_bullish = true;
+                analysis.sfp_confidence += 50.0;
+                if vol_expansion { analysis.sfp_confidence += 30.0; }
+            }
         }
 
         // Bearish SFP: Wick takes external high, body closes below it.
         if current_high > structure.external_high.1 && current_close < structure.external_high.1 {
-            analysis.is_sfp_bearish = true;
-            analysis.sfp_confidence += 50.0;
-            if vol_expansion { analysis.sfp_confidence += 30.0; }
+            if close_pos < 0.5 {
+                analysis.is_sfp_bearish = true;
+                analysis.sfp_confidence += 50.0;
+                if vol_expansion { analysis.sfp_confidence += 30.0; }
+            }
         }
         analysis
     }
@@ -361,15 +417,29 @@ impl SwingEngine {
             14
         ).last().cloned().unwrap_or(1.0);
 
-        if structure.is_bos_bullish || structure.is_choch_bullish {
+        if structure.is_bos_bullish {
             disp.is_bullish = true;
+            disp.is_reversal = false;
             if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; } // Strong body
             let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
             if rsi_val > settings.displacement_rsi_threshold_bull { disp.strength += settings.displacement_rsi_bonus; } // Momentum confirmation
+        } else if structure.is_choch_bullish {
+            disp.is_bullish = true;
+            disp.is_reversal = true;
+            if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; }
+            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
+            if rsi_val > settings.displacement_rsi_threshold_bull { disp.strength += settings.displacement_rsi_bonus; }
         }
 
-        if structure.is_bos_bearish || structure.is_choch_bearish {
+        if structure.is_bos_bearish {
             disp.is_bearish = true;
+            disp.is_reversal = false;
+            if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; }
+            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
+            if rsi_val < settings.displacement_rsi_threshold_bear { disp.strength += settings.displacement_rsi_bonus; }
+        } else if structure.is_choch_bearish {
+            disp.is_bearish = true;
+            disp.is_reversal = true;
             if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; }
             let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
             if rsi_val < settings.displacement_rsi_threshold_bear { disp.strength += settings.displacement_rsi_bonus; }
@@ -416,11 +486,19 @@ impl SwingEngine {
         // 3. Displacement Strength (Weight: 30)
         if displacement.is_bullish {
             long_score += displacement.strength * settings.displacement_weight_mult; // Increased weight
-            reason_long.push("Bullish Displacement");
+            if displacement.is_reversal {
+                reason_long.push("Bullish Reversal (CHoCH)");
+            } else {
+                reason_long.push("Bullish Continuation (BOS)");
+            }
         }
         if displacement.is_bearish {
             short_score += displacement.strength * settings.displacement_weight_mult; // Increased weight
-            reason_short.push("Bearish Displacement");
+            if displacement.is_reversal {
+                reason_short.push("Bearish Reversal (CHoCH)");
+            } else {
+                reason_short.push("Bearish Continuation (BOS)");
+            }
         }
 
         // 4. FVG Alignment (Weight: 20)
@@ -491,5 +569,81 @@ impl SwingEngine {
             let tp2 = entry_price - risk * settings.risk_reward_ratio_tp2;
             (sl, tp1, tp2)
         }
+    }
+
+    /// Checks M15 structure to prevent entering against immediate momentum.
+    /// Returns a penalty to subtract from your conviction score.
+    pub fn fractal_guard(
+        entry_type: &str,
+        m15_highs: Option<&[f64]>,
+        m15_lows: Option<&[f64]>,
+        m15_closes: Option<&[f64]>,
+        current_price: f64,
+        settings: &SwingSettings,
+    ) -> FractalGuardResult {
+        if !settings.fractal_guard_enabled {
+             return FractalGuardResult { is_fighting_trend: false, penalty_score: 0.0, warning: None };
+        }
+
+        let (Some(highs), Some(lows), Some(closes)) = (m15_highs, m15_lows, m15_closes) else {
+            return FractalGuardResult { is_fighting_trend: false, penalty_score: 0.0, warning: Some("Missing M15 Data".to_string()) };
+        };
+
+        if highs.len() < 50 {
+             return FractalGuardResult { is_fighting_trend: false, penalty_score: 0.0, warning: None };
+        }
+
+        let ltf_settings = SwingSettings {
+            swing_lookback: settings.m15_swing_lookback,
+            swing_neighbors: 2,
+            ..settings.clone()
+        };
+        
+        let ltf_structure = Self::market_structure_engine(highs, lows, closes, current_price, &ltf_settings);
+        let current_close = *closes.last().unwrap_or(&0.0);
+        
+        let mut result = FractalGuardResult {
+            is_fighting_trend: false,
+            penalty_score: 0.0,
+            warning: None,
+        };
+
+        // Determine M15 Trend using indices (External is always Extreme)
+        // External High is Max. If Index(Ext) > Index(Int), Max is Newer => Higher High.
+        // External Low is Min. If Index(Ext) > Index(Int), Min is Newer => Lower Low.
+        let is_higher_high = ltf_structure.external_high.0 > ltf_structure.internal_high.0;
+        let is_lower_high = !is_higher_high;
+        
+        let is_lower_low = ltf_structure.external_low.0 > ltf_structure.internal_low.0;
+        let is_higher_low = !is_lower_low;
+
+        let is_ltf_downtrend = is_lower_high && is_lower_low;
+        let is_ltf_uptrend = is_higher_high && is_higher_low;
+
+        match entry_type {
+            "long" => {
+                // DANGER: H1 says Long, but M15 is making Lower Lows (Downtrend) or breaking down
+                let is_breaking_down = current_close < ltf_structure.internal_low.1;
+
+                if is_ltf_downtrend || is_breaking_down {
+                    result.is_fighting_trend = true;
+                    result.penalty_score = settings.fractal_penalty_score;
+                    result.warning = Some("M15 Trend is Bearish (Falling Knife)".to_string());
+                }
+            },
+            "short" => {
+                // DANGER: H1 says Short, but M15 is making Higher Highs (Uptrend) or breaking up
+                let is_breaking_up = current_close > ltf_structure.internal_high.1;
+
+                if is_ltf_uptrend || is_breaking_up {
+                    result.is_fighting_trend = true;
+                    result.penalty_score = settings.fractal_penalty_score;
+                    result.warning = Some("M15 Trend is Bullish (Step in front of train)".to_string());
+                }
+            },
+            _ => {}
+        }
+
+        result
     }
 }

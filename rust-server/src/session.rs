@@ -142,6 +142,7 @@ pub struct TradingSession {
     last_evaluation_timestamp: i64,
     last_m1_timestamp: i64,
     last_m5_timestamp: i64,
+    last_m15_timestamp: i64,
     last_m30_timestamp: i64,
     last_h1_timestamp: i64,
     last_h4_timestamp: i64,
@@ -154,6 +155,10 @@ pub struct TradingSession {
     m5_closes: VecDeque<f64>,
     m5_highs: VecDeque<f64>,
     m5_lows: VecDeque<f64>,
+    m5_timestamps: VecDeque<i64>,
+    m15_closes: VecDeque<f64>,
+    m15_highs: VecDeque<f64>,
+    m15_lows: VecDeque<f64>,
     m30_closes: VecDeque<f64>,
     h1_closes: VecDeque<f64>,
     h1_highs: VecDeque<f64>,
@@ -184,6 +189,7 @@ impl TradingSession {
             last_evaluation_timestamp: 0,
             last_m1_timestamp: 0,
             last_m5_timestamp: 0,
+            last_m15_timestamp: 0,
             last_m30_timestamp: 0,
             last_h1_timestamp: 0,
             last_h4_timestamp: 0,
@@ -193,6 +199,10 @@ impl TradingSession {
             m5_closes: VecDeque::with_capacity(initial_buffer_size),
             m5_highs: VecDeque::with_capacity(initial_buffer_size),
             m5_lows: VecDeque::with_capacity(initial_buffer_size),
+            m5_timestamps: VecDeque::with_capacity(initial_buffer_size),
+            m15_closes: VecDeque::with_capacity(initial_buffer_size),
+            m15_highs: VecDeque::with_capacity(initial_buffer_size),
+            m15_lows: VecDeque::with_capacity(initial_buffer_size),
             m30_closes: VecDeque::with_capacity(initial_buffer_size),
             h1_closes: VecDeque::with_capacity(initial_buffer_size),
             h1_highs: VecDeque::with_capacity(initial_buffer_size),
@@ -238,10 +248,36 @@ impl TradingSession {
                 Self::update_buffer(&mut self.m5_closes, &req.m5_closes, settings.max_buffer_size);
                 Self::update_buffer(&mut self.m5_highs, &req.m5_highs, settings.max_buffer_size);
                 Self::update_buffer(&mut self.m5_lows, &req.m5_lows, settings.max_buffer_size);
+                
+                // Handle timestamps
+                if let Some(ts_vec) = &req.m5_timestamps {
+                    Self::update_buffer_i64(&mut self.m5_timestamps, ts_vec, settings.max_buffer_size);
+                } else {
+                    // Backfill if missing (Assume 300s intervals ending at last_m5_timestamp)
+                    let count = req.m5_closes.len();
+                    let mut generated = Vec::with_capacity(count);
+                    for i in 0..count {
+                        generated.push(ts - ((count - 1 - i) as i64 * 300));
+                    }
+                    Self::update_buffer_i64(&mut self.m5_timestamps, &generated, settings.max_buffer_size);
+                }
+
                 self.last_m5_timestamp = ts;
             }
         } else if !req.m5_closes.is_empty() {
             tracing::warn!(symbol = %self.symbol, "Received M5 data but no last_m5_timestamp. Ignoring update.");
+        }
+
+        // M15 Update
+        if let Some(ts) = req.last_m15_timestamp {
+            if (ts > 0 && ts > self.last_m15_timestamp) || req.m15_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+                if let Some(v) = &req.m15_closes { Self::update_buffer(&mut self.m15_closes, v, settings.max_buffer_size); }
+                if let Some(v) = &req.m15_highs { Self::update_buffer(&mut self.m15_highs, v, settings.max_buffer_size); }
+                if let Some(v) = &req.m15_lows { Self::update_buffer(&mut self.m15_lows, v, settings.max_buffer_size); }
+                self.last_m15_timestamp = ts;
+            }
+        } else if req.m15_closes.as_ref().map_or(false, |v| !v.is_empty()) {
+            tracing::warn!(symbol = %self.symbol, "Received M15 data but no last_m15_timestamp. Ignoring update.");
         }
 
         // M30 Update
@@ -622,6 +658,22 @@ impl TradingSession {
         }
     }
 
+    fn update_buffer_i64(buffer: &mut VecDeque<i64>, new_data: &[i64], max_len: usize) {
+        if new_data.is_empty() { return; }
+        if new_data.len() > 100 {
+            buffer.clear();
+            let start = new_data.len().saturating_sub(max_len);
+            buffer.extend(new_data[start..].iter().cloned());
+        } else {
+            for &val in new_data {
+                buffer.push_back(val);
+                if buffer.len() > max_len {
+                    buffer.pop_front();
+                }
+            }
+        }
+    }
+
     /// Builds an `EvalRequest` for a specific engine using the session's data.
     /// Uses Zero-Copy (Cow::Borrowed) to avoid allocations.
     fn build_engine_request<'a>(&'a mut self, mode: &str, current_price: f64) -> EvalRequest<'a> {
@@ -630,7 +682,12 @@ impl TradingSession {
         let m5_closes = self.m5_closes.make_contiguous();
         let m5_highs = self.m5_highs.make_contiguous();
         let m5_lows = self.m5_lows.make_contiguous();
+        let m5_timestamps = if !self.m5_timestamps.is_empty() { Some(Cow::Borrowed(self.m5_timestamps.make_contiguous() as &[i64])) } else { None };
         let m30_closes = self.m30_closes.make_contiguous();
+
+        let m15_closes = if !self.m15_closes.is_empty() { Some(Cow::Borrowed(self.m15_closes.make_contiguous() as &[f64])) } else { None };
+        let m15_highs = if !self.m15_highs.is_empty() { Some(Cow::Borrowed(self.m15_highs.make_contiguous() as &[f64])) } else { None };
+        let m15_lows = if !self.m15_lows.is_empty() { Some(Cow::Borrowed(self.m15_lows.make_contiguous() as &[f64])) } else { None };
         
         // For Option fields, we map them
         let h1_closes = if !self.h1_closes.is_empty() { Some(Cow::Borrowed(self.h1_closes.make_contiguous() as &[f64])) } else { None };
@@ -656,6 +713,10 @@ impl TradingSession {
             m5_closes: Cow::Borrowed(m5_closes),
             m5_highs: Cow::Borrowed(m5_highs),
             m5_lows: Cow::Borrowed(m5_lows),
+            m5_timestamps,
+            m15_closes,
+            m15_highs,
+            m15_lows,
             m30_closes: Cow::Borrowed(m30_closes),
             h1_closes,
             h1_highs,
@@ -669,6 +730,7 @@ impl TradingSession {
             mode: Cow::Owned(mode.to_string()), // Mode is usually small string
             current_price, 
             last_m1_timestamp: self.last_evaluation_timestamp,
+            last_m15_timestamp: Some(self.last_m15_timestamp),
             ..Default::default() // Fills in optional params
         }
     }

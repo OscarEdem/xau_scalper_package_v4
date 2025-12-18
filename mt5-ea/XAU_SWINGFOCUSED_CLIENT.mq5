@@ -41,11 +41,19 @@ input double AtrMultStart  = 1.5;             // ATR Multiplier for Start
 input double AtrMultDist   = 1.0;             // ATR Multiplier for Distance
 input double AtrMultStep   = 0.1;             // ATR Multiplier for Step
 input double TrailingStartPips = 20.0;        // Pips profit to start trailing
-input double TrailingDistPips  = 70;        // Distance from price 
+input double TrailingDistPips  = 70;        // Distance from price
 input double TrailingStepPips  = 2.0;         // Minimum step to modify SL
 input double BreakEvenTriggerPips = 15.0;     // Pips profit to move to BE
 input double BreakEvenOffsetPips  = 1.0;      // Pips to lock in at BE
-input bool   UseStagnationSL   = st    /N
+input bool   UseStagnationSL   = false;       // Tighten SL if trade stalls
+input int    StagnationSeconds = 60;         // Seconds before tightening SL (1 min)
+input double StagnationRiskReducePct = 20.0;  // % of risk to remove (0-100)
+input bool   UseDynamicStagnation = true;     // Scale stagnation time by ATR
+input double StagnationTimeMult   = 2.0;      // Multiplier for ATR-based time
+input int    LimitOrderExpirationSeconds = 240; // Auto-delete pending orders after X seconds
+input bool   CloseOnDisconnect = false;       // If true, closes all trades on server timeout
+
+// --- THEME & SIZING HELPERS ---
 color THEME_BG      = C'0,0,0';       // Solid Black
 color THEME_BORDER  = C'212,175,55';  // Gold accent
 color THEME_TEXT    = C'230,230,230';
@@ -55,28 +63,32 @@ color THEME_MUTED   = C'140,140,140';
 #define FONT_FACE     "Segoe UI"
 
 // --- Global Structures ---
-struct ServerSignal {
-   string action;
-   string entryType;
-   string reason;
-   double slPrice;
-   double tp1Price;
-   double limitPrice;
-   string recommendedOrderType;
-   double conviction;
-   long   expiration;
-   ulong  ticketToManage;
-   double newSlPrice;
-   string fundamentalBias;
-   string rrStr;
-   bool   isNew;
-   string jsonResponse; // Store raw JSON for drawing zones
-};
+struct ServerSignal
+  {
+   string            action;
+   string            entryType;
+   string            reason;
+   double            slPrice;
+   double            tp1Price;
+   double            limitPrice;
+   string            recommendedOrderType;
+   double            conviction;
+   long              expiration;
+   ulong             ticketToManage;
+   double            newSlPrice;
+   string            fundamentalBias;
+   string            rrStr;
+   bool              isNew;
+   string            jsonResponse; // Store raw JSON for drawing zones
+  };
 
 // --- Global Variables ---
 CTrade trade;
 char result[];
 bool g_ShowZones = true;
+bool g_ShowLiq = true;
+bool g_ShowFVG = true;
+bool g_ShowOB = true;
 bool g_ShowArrows = true;
 bool g_compactMode = false;
 bool g_ForceMarketOrders = false; // New toggle for limit->market conversion
@@ -128,6 +140,7 @@ int CountPendingOrders(ENUM_ORDER_TYPE type);
 void CreateSignalArrow(long chart_ID, string name, datetime time, double price, int arrow_code, color clr);
 void DrawServerLiquidityZones(long chart_ID, string json_response);
 void DrawServerImbalances(long chart_ID, string json_response);
+void DrawServerOrderBlocks(long chart_ID, string json_response);
 void CreateChartLabel(long chart_ID, string name, datetime time, double price, string text, color clr, int anchor);
 void CreateLabel(const long chart_ID, const string name, const int x, const int y, const string text, const color text_color, int font_size=10, string font=FONT_FACE);
 void CreateDashboardRow(long chart_ID, string key, string value, int x_key, int x_val, int y, color clr_key, color clr_val);
@@ -163,12 +176,12 @@ int OnInit()
    g_UserScalpMode = ScalpMode;
    g_UserTrailingSL = UseTrailingSL;
    g_UserStagnationSeconds = StagnationSeconds;
-   
-   // Initialize State
+
+// Initialize State
    g_SignalState.action = "hold";
    g_SignalState.isNew = false;
    g_LastHeartbeat = TimeCurrent();
-   
+
    EventSetTimer(UpdateIntervalSeconds);
    UpdateDashboard("hold", "Connecting...", "-", "-", 0.0, AccountInfoDouble(ACCOUNT_BALANCE), 0.0, 0.0, 0.0, "Neutral", "-");
    return(INIT_SUCCEEDED);
@@ -182,6 +195,7 @@ void OnDeinit(const int reason)
    EventKillTimer();
    ObjectsDeleteAll(0, "XauBridge_");
    ObjectsDeleteAll(0, "XauBridge_Arrow_");
+   ObjectsDeleteAll(0, "XauBridge_SrvOB_");
    ChartRedraw();
   }
 
@@ -190,9 +204,10 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
   {
-   // Prevent re-entry if the previous request is somehow stuck
-   if(g_IsRequestPending) return;
-   
+// Prevent re-entry if the previous request is somehow stuck
+   if(g_IsRequestPending)
+      return;
+
    g_IsRequestPending = true;
    FetchServerData();
    g_IsRequestPending = false;
@@ -203,25 +218,27 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
   {
-   // 1. Check Circuit Breaker (CRITICAL SAFETY)
+// 1. Check Circuit Breaker (CRITICAL SAFETY)
    CheckConnectivity();
-   
+
    if(g_CircuitBreakerTripped)
      {
       // In emergency mode, we ONLY manage existing stops or close out.
-      if(CloseOnDisconnect) CloseAllTrades();
-      else ManageTrailingSL(); // Fallback to local trailing
-      
+      if(CloseOnDisconnect)
+         CloseAllTrades();
+      else
+         ManageTrailingSL(); // Fallback to local trailing
+
       // Update Dashboard to show disconnected state
       UpdateDashboard("hold", "DISCONNECTED", "-", "-", 0.0, AccountInfoDouble(ACCOUNT_BALANCE), 0.0, 0.0, 0.0, "Safety Mode", "-");
-      return; 
+      return;
      }
 
 // Manage Trailing SL
    ManageTrailingSL();
    ManagePendingOrders();
 
-   // 3. Process New Signals
+// 3. Process New Signals
    if(g_SignalState.isNew)
      {
       ProcessSignal();
@@ -236,15 +253,15 @@ void OnTick()
          if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
             current_pl += PositionGetDouble(POSITION_PROFIT);
         }
-      
+
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double spread_pts = (ask - bid) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      
-      UpdateDashboard(g_SignalState.entryType, g_SignalState.reason, 
-                      g_SignalState.tp1Price > 0 ? DoubleToString(g_SignalState.tp1Price, _Digits) : "-", 
-                      g_SignalState.slPrice > 0 ? DoubleToString(g_SignalState.slPrice, _Digits) : "-", 
-                      spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, 
+
+      UpdateDashboard(g_SignalState.entryType, g_SignalState.reason,
+                      g_SignalState.tp1Price > 0 ? DoubleToString(g_SignalState.tp1Price, _Digits) : "-",
+                      g_SignalState.slPrice > 0 ? DoubleToString(g_SignalState.slPrice, _Digits) : "-",
+                      spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl,
                       0.0, g_SignalState.conviction, g_SignalState.fundamentalBias, g_SignalState.rrStr);
      }
   }
@@ -254,24 +271,24 @@ void OnTick()
 //+------------------------------------------------------------------+
 void FetchServerData()
   {
-   char post_data[]; 
-   char get_result[]; 
-   string get_headers; 
+   char post_data[];
+   char get_result[];
+   string get_headers;
    string url = ServerUrl + "/signals/" + _Symbol;
-   
+
    ResetLastError();
-   // TIMEOUT REDUCED to 2000ms. If server is slow, we skip this beat rather than hanging.
+// TIMEOUT REDUCED to 2000ms. If server is slow, we skip this beat rather than hanging.
    int res = WebRequest("GET", url, NULL, 2000, post_data, get_result, get_headers);
-   
+
    if(res == 200)
      {
       string response_str = CharArrayToString(get_result);
-      
+
       // Update Heartbeat
       g_LastHeartbeat = TimeCurrent();
-      
+
       // Parse Logic
-      g_SignalState.jsonResponse = response_str;
+      g_SignalState.jsonResponse = GetJsonObject(response_str, "swingSignal");
       g_SignalState.entryType = GetNestedJsonValue(response_str, "scalpSignal", "entryType", true);
       g_SignalState.reason = GetNestedJsonValue(response_str, "scalpSignal", "reason", true);
       g_SignalState.slPrice = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "slPrice", false));
@@ -281,7 +298,7 @@ void FetchServerData()
       g_SignalState.expiration = (long)StringToInteger(GetNestedJsonValue(response_str, "scalpSignal", "expirationSeconds", false));
       g_SignalState.conviction = StringToDouble(GetNestedJsonValue(response_str, "scalpSignal", "convictionScore", false));
       g_SignalState.fundamentalBias = GetJsonValue(response_str, "bias", true);
-      
+
       g_SignalState.action = GetNestedJsonValue(response_str, "swingSignal", "action", true);
       g_SignalState.ticketToManage = (ulong)StringToInteger(GetNestedJsonValue(response_str, "swingSignal", "ticketToManage", false));
       g_SignalState.newSlPrice = StringToDouble(GetNestedJsonValue(response_str, "swingSignal", "slPrice", false));
@@ -304,21 +321,24 @@ void FetchServerData()
          if(StringFind(g_SignalState.entryType, "long") >= 0)
            {
             g_SignalState.slPrice += adj; // Move SL Up
-            if(g_SignalState.slPrice >= bid) g_SignalState.slPrice = bid - (20.0 * point_val); 
+            if(g_SignalState.slPrice >= bid)
+               g_SignalState.slPrice = bid - (20.0 * point_val);
            }
-         else if(StringFind(g_SignalState.entryType, "short") >= 0)
-           {
-            g_SignalState.slPrice -= adj; // Move SL Down
-            if(g_SignalState.slPrice <= ask) g_SignalState.slPrice = ask + (20.0 * point_val); 
-           }
+         else
+            if(StringFind(g_SignalState.entryType, "short") >= 0)
+              {
+               g_SignalState.slPrice -= adj; // Move SL Down
+               if(g_SignalState.slPrice <= ask)
+                  g_SignalState.slPrice = ask + (20.0 * point_val);
+              }
         }
 
-      g_SignalState.isNew = true; 
+      g_SignalState.isNew = true;
      }
    else
      {
       Print("Network Error: ", res, " Last Error: ", GetLastError());
-      // We do NOT update g_LastHeartbeat here. 
+      // We do NOT update g_LastHeartbeat here.
       // This will eventually trip the circuit breaker in OnTick.
      }
   }
@@ -329,7 +349,7 @@ void FetchServerData()
 void CheckConnectivity()
   {
    long time_since_update = TimeCurrent() - g_LastHeartbeat;
-   
+
    if(time_since_update > SafetyTimeoutSeconds)
      {
       if(!g_CircuitBreakerTripped)
@@ -359,7 +379,7 @@ void ProcessSignal()
    double spread_raw = ask - bid;
    double spread_pts = spread_raw / point_val;
 
-   // Unpack state for easier usage
+// Unpack state for easier usage
    string action = g_SignalState.action;
    string reason = g_SignalState.reason;
    string entry_type = g_SignalState.entryType;
@@ -376,74 +396,78 @@ void ProcessSignal()
    string fundamental_bias = g_SignalState.fundamentalBias;
    string rr_str = "-";
 
-      // Calculate Pips for Display
-      if(StringFind(entry_type, "long") >= 0 && sl_price > 0)
+// Calculate Pips for Display
+   if(StringFind(entry_type, "long") >= 0 && sl_price > 0)
+     {
+      sl_pips = DoubleToString((ask - sl_price) / (point_val * 10.0), 1);
+      tp_pips = DoubleToString((tp1_price - ask) / (point_val * 10.0), 1);
+      double r = MathAbs(ask - sl_price);
+      double rw = MathAbs(tp1_price - ask);
+      if(r > 0)
+         rr_str = DoubleToString(rw/r, 2) + "R";
+     }
+   else
+      if(StringFind(entry_type, "short") >= 0 && sl_price > 0)
         {
-         sl_pips = DoubleToString((ask - sl_price) / (point_val * 10.0), 1);
-         tp_pips = DoubleToString((tp1_price - ask) / (point_val * 10.0), 1);
-         double r = MathAbs(ask - sl_price);
-         double rw = MathAbs(tp1_price - ask);
+         sl_pips = DoubleToString((sl_price - bid) / (point_val * 10.0), 1);
+         tp_pips = DoubleToString((bid - tp1_price) / (point_val * 10.0), 1);
+         double r = MathAbs(sl_price - bid);
+         double rw = MathAbs(bid - tp1_price);
          if(r > 0)
             rr_str = DoubleToString(rw/r, 2) + "R";
         }
-      else
-         if(StringFind(entry_type, "short") >= 0 && sl_price > 0)
-           {
-            sl_pips = DoubleToString((sl_price - bid) / (point_val * 10.0), 1);
-            tp_pips = DoubleToString((bid - tp1_price) / (point_val * 10.0), 1);
-            double r = MathAbs(sl_price - bid);
-            double rw = MathAbs(bid - tp1_price);
-            if(r > 0)
-               rr_str = DoubleToString(rw/r, 2) + "R";
-           }
 
-      // Update Visuals
-      if(g_ShowZones)
+// Update Visuals
+   if(g_ShowZones)
+     {
+      if(g_ShowFVG) DrawServerImbalances(0, g_SignalState.jsonResponse);
+      if(g_ShowLiq) DrawServerLiquidityZones(0, g_SignalState.jsonResponse);
+      if(g_ShowOB) DrawServerOrderBlocks(0, g_SignalState.jsonResponse);
+     }
+
+// Draw Arrows on Signal Change (Simple check based on time/existence)
+   MqlRates rates[];
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 1, rates) > 0)
+     {
+      string arrow_name = "XauBridge_Arrow_" + TimeToString(rates[0].time);
+      double ref_price_long = ask;
+      double ref_price_short = bid;
+      color arrow_color_long = ColorMarketBuy;
+      color arrow_color_short = ColorMarketSell;
+
+      if(recommended_order_type == "limit_long" && limit_price > 0)
         {
-         DrawServerImbalances(0, g_SignalState.jsonResponse);
-         DrawServerLiquidityZones(0, g_SignalState.jsonResponse);
+         ref_price_long = limit_price;
+         arrow_color_long = ColorLimitBuy;
+        }
+      if(recommended_order_type == "limit_short" && limit_price > 0)
+        {
+         ref_price_short = limit_price;
+         arrow_color_short = ColorLimitSell;
         }
 
-      // Draw Arrows on Signal Change (Simple check based on time/existence)
-      MqlRates rates[];
-      if(CopyRates(_Symbol, PERIOD_M1, 0, 1, rates) > 0)
+      if(g_ShowArrows)
         {
-         string arrow_name = "XauBridge_Arrow_" + TimeToString(rates[0].time);
-         double ref_price_long = ask;
-         double ref_price_short = bid;
-         color arrow_color_long = ColorMarketBuy;
-         color arrow_color_short = ColorMarketSell;
-
-         if(recommended_order_type == "limit_long" && limit_price > 0) {
-            ref_price_long = limit_price;
-            arrow_color_long = ColorLimitBuy;
-         }
-         if(recommended_order_type == "limit_short" && limit_price > 0) {
-            ref_price_short = limit_price;
-            arrow_color_short = ColorLimitSell;
-         }
-
-         if(g_ShowArrows)
+         // Check for existing arrow and update if direction changed (e.g. Short -> Long flip on same bar)
+         if(ObjectFind(0, arrow_name) >= 0)
            {
-            // Check for existing arrow and update if direction changed (e.g. Short -> Long flip on same bar)
-            if(ObjectFind(0, arrow_name) >= 0)
-              {
-               long existing_code = ObjectGetInteger(0, arrow_name, OBJPROP_ARROWCODE);
-               // If signal is long but existing arrow is short (234), delete it
-               if(StringFind(entry_type, "long") >= 0 && existing_code == 234)
-                  ObjectDelete(0, arrow_name);
-               // If signal is short but existing arrow is long (233), delete it
-               else if(StringFind(entry_type, "short") >= 0 && existing_code == 233)
-                  ObjectDelete(0, arrow_name);
-              }
-
-            if(StringFind(entry_type, "long") >= 0 && ObjectFind(0, arrow_name) < 0)
-               CreateSignalArrow(0, arrow_name, rates[0].time, ref_price_long - 100*point_val, 233, arrow_color_long);
+            long existing_code = ObjectGetInteger(0, arrow_name, OBJPROP_ARROWCODE);
+            // If signal is long but existing arrow is short (234), delete it
+            if(StringFind(entry_type, "long") >= 0 && existing_code == 234)
+               ObjectDelete(0, arrow_name);
+            // If signal is short but existing arrow is long (233), delete it
             else
-               if(StringFind(entry_type, "short") >= 0 && ObjectFind(0, arrow_name) < 0)
-                  CreateSignalArrow(0, arrow_name, rates[0].time, ref_price_short + 100*point_val, 234, arrow_color_short);
+               if(StringFind(entry_type, "short") >= 0 && existing_code == 233)
+                  ObjectDelete(0, arrow_name);
            }
+
+         if(StringFind(entry_type, "long") >= 0 && ObjectFind(0, arrow_name) < 0)
+            CreateSignalArrow(0, arrow_name, rates[0].time, ref_price_long - 100*point_val, 233, arrow_color_long);
+         else
+            if(StringFind(entry_type, "short") >= 0 && ObjectFind(0, arrow_name) < 0)
+               CreateSignalArrow(0, arrow_name, rates[0].time, ref_price_short + 100*point_val, 234, arrow_color_short);
         }
+     }
 
 // 3. Trade Management (SL Update / Close)
    if(action == "close" && ticket_to_manage > 0)
@@ -469,7 +493,7 @@ void ProcessSignal()
 // Calculate Entry Count based on Conviction
    int entry_count = CalculateEntryCount((int)conviction_score);
 
-   // SAFETY: If entry type is not explicitly long or short, or is blocked, force count to 0
+// SAFETY: If entry type is not explicitly long or short, or is blocked, force count to 0
    if(entry_price == 0.0 || entry_type == "none" || StringFind(entry_type, "blocked") >= 0)
       entry_count = 0;
 
@@ -486,12 +510,14 @@ void ProcessSignal()
          double max_p = 0.0;
          for(int i=0; i<copied; i++)
            {
-            if(ticks[i].bid < min_p) min_p = ticks[i].bid;
-            if(ticks[i].bid > max_p) max_p = ticks[i].bid;
+            if(ticks[i].bid < min_p)
+               min_p = ticks[i].bid;
+            if(ticks[i].bid > max_p)
+               max_p = ticks[i].bid;
            }
          vel_range = (max_p - min_p) / (point_val * 10.0);
         }
-      
+
       if(vel_range < MinVelocityPips)
         {
          reason = "Low Volatility (" + DoubleToString(vel_range, 1) + ")";
@@ -541,9 +567,9 @@ void ProcessSignal()
          current_pl += PositionGetDouble(POSITION_PROFIT);
      }
 
-   // Update global state strings for dashboard (which is drawn in OnTick)
+// Update global state strings for dashboard (which is drawn in OnTick)
    g_SignalState.rrStr = rr_str;
-   // Note: Dashboard drawing happens in OnTick using these values
+// Note: Dashboard drawing happens in OnTick using these values
    UpdateDashboard(entry_type, reason, tp_pips, sl_pips, spread_pts, AccountInfoDouble(ACCOUNT_BALANCE), current_pl, (double)entry_count, conviction_score, fundamental_bias, rr_str);
 
 // Execution
@@ -686,10 +712,10 @@ int CalculateEntryCount(int conviction)
    if(conviction < min_conviction)
       return 0;
 
-   // Map conviction 50-100 to 1-g_UserMaxEntries
+// Map conviction 50-100 to 1-g_UserMaxEntries
    double ratio = (double)(conviction - min_conviction) / 50.0; // 0.0 to 1.0
    int count = 1 + (int)MathRound(ratio * (g_UserMaxEntries - 1));
-   
+
    return MathMin(count, g_UserMaxEntries);
   }
 
@@ -791,6 +817,50 @@ void CreateSignalArrow(long chart_ID, string name, datetime time, double price, 
       ObjectSetInteger(chart_ID, name, OBJPROP_COLOR, clr);
       ObjectSetInteger(chart_ID, name, OBJPROP_WIDTH, 1);
       ObjectSetInteger(chart_ID, name, OBJPROP_ANCHOR, (arrow_code == 233) ? ANCHOR_TOP : ANCHOR_BOTTOM);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void DrawServerOrderBlocks(long chart_ID, string json_response)
+  {
+   int start_key = StringFind(json_response, "\"orderBlocks\":[");
+   if(start_key < 0)
+      return;
+   int start_arr = start_key + StringLen("\"orderBlocks\":[");
+   int end_arr = StringFind(json_response, "]", start_arr);
+   if(end_arr == -1)
+      return;
+   string arr_content = StringSubstr(json_response, start_arr, end_arr - start_arr);
+
+   int current_pos = 0;
+   while(current_pos < StringLen(arr_content))
+     {
+      int obj_start = StringFind(arr_content, "{", current_pos);
+      if(obj_start < 0)
+         break;
+      int obj_end = StringFind(arr_content, "}", obj_start);
+      if(obj_end < 0)
+         break;
+      string obj_json = StringSubstr(arr_content, obj_start, obj_end - obj_start + 1);
+
+      double top = StringToDouble(GetJsonValue(obj_json, "top", false));
+      bool is_bullish = (GetJsonValue(obj_json, "isBullish", false) == "true");
+      string name = "XauBridge_SrvOB_" + DoubleToString(top, 2);
+
+      if(ObjectFind(chart_ID, name) < 0)
+        {
+         ObjectCreate(chart_ID, name, OBJ_RECTANGLE, 0, TimeCurrent() - PeriodSeconds() * 500, top, TimeCurrent() + PeriodSeconds() * 100, StringToDouble(GetJsonValue(obj_json, "bottom", false)));
+         color zone_color = is_bullish ? C'100,149,237' : C'255,160,122';
+         ObjectSetInteger(chart_ID, name, OBJPROP_COLOR, zone_color);
+         ObjectSetInteger(chart_ID, name, OBJPROP_FILL, true);
+         ObjectSetInteger(chart_ID, name, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(chart_ID, name, OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(chart_ID, name, OBJPROP_BACK, true);
+         CreateChartLabel(chart_ID, name+"_Lbl", TimeCurrent(), top, is_bullish?"Bullish OB":"Bearish OB", zone_color, ANCHOR_LEFT_LOWER);
+        }
+      current_pos = obj_end + 1;
      }
   }
 
@@ -968,7 +1038,9 @@ void DrawDashboard()
 
    if(g_ShowSettings)
      {
-      DrawSettings(chart_ID, x_pos, y_pos, panelW, panelH);
+      int settingsH = ui(440);
+      ObjectSetInteger(chart_ID, panelBorder, OBJPROP_YSIZE, settingsH);
+      DrawSettings(chart_ID, x_pos, y_pos, panelW, settingsH);
       return;
      }
 
@@ -1068,7 +1140,8 @@ void DrawDashboard()
 
       color stag_color = THEME_TEXT;
       if(g_DashStagnationCountdown != "-" && g_DashStagnationCountdown != "OFF" && g_DashStagnationCountdown != "Safe")
-         if(StringFind(g_DashStagnationCountdown, "00:") == 0) stag_color = THEME_ACCENT2;
+         if(StringFind(g_DashStagnationCountdown, "00:") == 0)
+            stag_color = THEME_ACCENT2;
       CreateDashboardRow(chart_ID, "Stag. Timer", g_DashStagnationCountdown, left_x, right_x, cur_y, THEME_MUTED, stag_color);
       cur_y += ui(28);
 
@@ -1132,20 +1205,21 @@ void CreateDashboardRow(long chart_ID, string key, string value, int x_key, int 
 //+------------------------------------------------------------------+
 void CreateControlRow(long chart_ID, string key, string value, int x, int y, string btnMinus, string btnPlus)
   {
-   // Label
+// Label
    CreateLabel(chart_ID, "XauBridge_"+key, x, y, key + ": " + value, THEME_TEXT, ui(10));
-   
+
    int btnW = ui(20);
    int btnH = ui(18);
    int x_btns = x + ui(160);
 
-   // Minus Button
-   if(ObjectFind(chart_ID, btnMinus) < 0) {
+// Minus Button
+   if(ObjectFind(chart_ID, btnMinus) < 0)
+     {
       ObjectCreate(chart_ID, btnMinus, OBJ_BUTTON, 0, 0, 0);
       ObjectSetInteger(chart_ID, btnMinus, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetString(chart_ID, btnMinus, OBJPROP_TEXT, "-");
       ObjectSetInteger(chart_ID, btnMinus, OBJPROP_ZORDER, 101);
-   }
+     }
    ObjectSetInteger(chart_ID, btnMinus, OBJPROP_XDISTANCE, x_btns);
    ObjectSetInteger(chart_ID, btnMinus, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(chart_ID, btnMinus, OBJPROP_XSIZE, btnW);
@@ -1153,13 +1227,14 @@ void CreateControlRow(long chart_ID, string key, string value, int x, int y, str
    ObjectSetInteger(chart_ID, btnMinus, OBJPROP_BGCOLOR, C'60,60,60');
    ObjectSetInteger(chart_ID, btnMinus, OBJPROP_COLOR, C'255,255,255');
 
-   // Plus Button
-   if(ObjectFind(chart_ID, btnPlus) < 0) {
+// Plus Button
+   if(ObjectFind(chart_ID, btnPlus) < 0)
+     {
       ObjectCreate(chart_ID, btnPlus, OBJ_BUTTON, 0, 0, 0);
       ObjectSetInteger(chart_ID, btnPlus, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetString(chart_ID, btnPlus, OBJPROP_TEXT, "+");
       ObjectSetInteger(chart_ID, btnPlus, OBJPROP_ZORDER, 101);
-   }
+     }
    ObjectSetInteger(chart_ID, btnPlus, OBJPROP_XDISTANCE, x_btns + btnW + ui(5));
    ObjectSetInteger(chart_ID, btnPlus, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(chart_ID, btnPlus, OBJPROP_XSIZE, btnW);
@@ -1174,12 +1249,13 @@ void CreateControlRow(long chart_ID, string key, string value, int x, int y, str
 void CreateToggleRow(long chart_ID, string key, bool value, int x, int y, string btnName)
   {
    CreateLabel(chart_ID, "XauBridge_Set_"+key, x, y, key, THEME_TEXT, ui(10));
-   
-   if(ObjectFind(chart_ID, btnName) < 0) {
+
+   if(ObjectFind(chart_ID, btnName) < 0)
+     {
       ObjectCreate(chart_ID, btnName, OBJ_BUTTON, 0, 0, 0);
       ObjectSetInteger(chart_ID, btnName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(chart_ID, btnName, OBJPROP_ZORDER, 102);
-   }
+     }
    ObjectSetInteger(chart_ID, btnName, OBJPROP_XDISTANCE, x + ui(160));
    ObjectSetInteger(chart_ID, btnName, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(chart_ID, btnName, OBJPROP_XSIZE, ui(60));
@@ -1194,7 +1270,7 @@ void CreateToggleRow(long chart_ID, string key, bool value, int x, int y, string
 //+------------------------------------------------------------------+
 void DrawSettings(long chart_ID, int x, int y, int w, int h)
   {
-   // Clear main dashboard elements that might overlap
+// Clear main dashboard elements that might overlap
    ObjectDelete(chart_ID, "XauBridge_Signal");
    ObjectDelete(chart_ID, "XauBridge_Reason");
    ObjectDelete(chart_ID, "XauBridge_Reason2");
@@ -1232,10 +1308,17 @@ void DrawSettings(long chart_ID, int x, int y, int w, int h)
    cur_y += ui(25);
    CreateControlRow(chart_ID, "Stag. Secs", IntegerToString(g_UserStagnationSeconds), left_x, cur_y, "XauBridge_SetStagMinus", "XauBridge_SetStagPlus");
    cur_y += ui(25);
-   
-   // Back Button
+   CreateToggleRow(chart_ID, "Show Liquidity", g_ShowLiq, left_x, cur_y, "XauBridge_SetLiq");
+   cur_y += ui(25);
+   CreateToggleRow(chart_ID, "Show FVG", g_ShowFVG, left_x, cur_y, "XauBridge_SetFVG");
+   cur_y += ui(25);
+   CreateToggleRow(chart_ID, "Show OrderBlocks", g_ShowOB, left_x, cur_y, "XauBridge_SetOB");
+   cur_y += ui(25);
+
+// Back Button
    string btnBack = "XauBridge_SetBack";
-   if(ObjectFind(chart_ID, btnBack) < 0) {
+   if(ObjectFind(chart_ID, btnBack) < 0)
+     {
       ObjectCreate(chart_ID, btnBack, OBJ_BUTTON, 0, 0, 0);
       ObjectSetInteger(chart_ID, btnBack, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(chart_ID, btnBack, OBJPROP_ZORDER, 102);
@@ -1243,15 +1326,16 @@ void DrawSettings(long chart_ID, int x, int y, int w, int h)
       ObjectSetInteger(chart_ID, btnBack, OBJPROP_BGCOLOR, C'60,60,60');
       ObjectSetInteger(chart_ID, btnBack, OBJPROP_COLOR, C'255,255,255');
       ObjectSetInteger(chart_ID, btnBack, OBJPROP_FONTSIZE, ui(9));
-   }
+     }
    ObjectSetInteger(chart_ID, btnBack, OBJPROP_XDISTANCE, x + w - ui(100) - ui(10));
    ObjectSetInteger(chart_ID, btnBack, OBJPROP_YDISTANCE, y + h - ui(32));
    ObjectSetInteger(chart_ID, btnBack, OBJPROP_XSIZE, ui(100));
    ObjectSetInteger(chart_ID, btnBack, OBJPROP_YSIZE, ui(24));
 
-   // Reset Button
+// Reset Button
    string btnReset = "XauBridge_SetReset";
-   if(ObjectFind(chart_ID, btnReset) < 0) {
+   if(ObjectFind(chart_ID, btnReset) < 0)
+     {
       ObjectCreate(chart_ID, btnReset, OBJ_BUTTON, 0, 0, 0);
       ObjectSetInteger(chart_ID, btnReset, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(chart_ID, btnReset, OBJPROP_ZORDER, 102);
@@ -1259,7 +1343,7 @@ void DrawSettings(long chart_ID, int x, int y, int w, int h)
       ObjectSetInteger(chart_ID, btnReset, OBJPROP_BGCOLOR, C'178,34,34'); // Firebrick
       ObjectSetInteger(chart_ID, btnReset, OBJPROP_COLOR, C'255,255,255');
       ObjectSetInteger(chart_ID, btnReset, OBJPROP_FONTSIZE, ui(9));
-   }
+     }
    ObjectSetInteger(chart_ID, btnReset, OBJPROP_XDISTANCE, x + ui(15));
    ObjectSetInteger(chart_ID, btnReset, OBJPROP_YDISTANCE, y + h - ui(32));
    ObjectSetInteger(chart_ID, btnReset, OBJPROP_XSIZE, ui(80));
@@ -1495,7 +1579,7 @@ void ManageTrailingSL()
    long min_rem_time = -1;
    bool trailing_active = g_UserTrailingSL;
 
-   // Clean up old stagnation lines to handle closed trades
+// Clean up old stagnation lines to handle closed trades
    ObjectsDeleteAll(0, "XauBridge_StagLine_");
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1539,7 +1623,8 @@ void ManageTrailingSL()
             // Time = (Distance / Speed) * Mult. Speed = ATR/60.
             double expected_seconds = (be_trigger / g_ServerATR) * 60.0;
             limit_seconds = (int)(expected_seconds * StagnationTimeMult);
-            if(limit_seconds < 30) limit_seconds = 30; // Minimum 30s
+            if(limit_seconds < 30)
+               limit_seconds = 30; // Minimum 30s
            }
 
          // Countdown Logic for Dashboard
@@ -1597,14 +1682,14 @@ void ManageTrailingSL()
             if(UseStagnationSL)
               {
                datetime open_time = (datetime)PositionGetInteger(POSITION_TIME);
-               
+
                // Visual: Draw projected SL line
                double current_risk_val = open_price - current_sl;
                if(current_risk_val > 0)
                  {
                   double new_risk_val = current_risk_val * (1.0 - (StagnationRiskReducePct / 100.0));
                   double projected_sl = open_price - new_risk_val;
-                  
+
                   string line_name = "XauBridge_StagLine_" + IntegerToString(ticket);
                   if(ObjectFind(0, line_name) < 0)
                     {
@@ -1624,24 +1709,33 @@ void ManageTrailingSL()
                if(TimeCurrent() - open_time > limit_seconds && profit_level <= 0) // Only trigger if not in profit
                  {
                   // Calculate reduced risk distance
-                  double current_risk = open_price - current_sl; // Buy Risk
+                  double current_risk = open_price - current_sl;
                   if(current_risk > 0)
                     {
-                     double new_risk = current_ris_k
+                     double new_risk = current_risk * (1.0 - (StagnationRiskReducePct / 100.0));
+                     double new_sl = open_price - new_risk;
 
-                     // Check if price passed it (Close Immediately)
-                     if(current_price <= new_sl)
-                       {:icurrent_price, " passed New SL ", new_sl);
-                        trade.PositionClose(ticket);
-                        
-                        trade.PositionModify(ticket, new_sl, current_tp);
+                     // Only modify if tightening and price allows
+                     if(new_sl > current_sl + point)
+                       {
+                        // Ensure we don't place SL above current price (immediate stop out)
+                        if(new_sl < current_price - (SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * point))
+                           trade.PositionModify(ticket, new_sl, current_tp);
                        }
                     }
+                 }
+              }
+           }
          else
-            if(type == ofit_level = open_price - current_price;
+            if(type == POSITION_TYPE_SELL)
+              {
+               double profit_level = open_price - current_price;
 
                // 1. Break Even Logic
-(pr                 {pe_fsl == 0 || current_sl > be_price + point) // Move to BE if not already there
+               if(profit_level > be_trigger)
+                 {
+                  double be_price = open_price - be_offset;
+                  if(current_sl == 0 || current_sl > be_price + point) // Move to BE if not already there
                     {
                      if(trade.PositionModify(ticket, be_price, current_tp))
                         current_sl = be_price;
@@ -1667,7 +1761,7 @@ void ManageTrailingSL()
                     {
                      double new_risk_val = current_risk_val * (1.0 - (StagnationRiskReducePct / 100.0));
                      double projected_sl = open_price + new_risk_val;
-                     
+
                      string line_name = "XauBridge_StagLine_" + IntegerToString(ticket);
                      if(ObjectFind(0, line_name) < 0)
                        {
@@ -1686,35 +1780,42 @@ void ManageTrailingSL()
 
                   if(TimeCurrent() - open_time > limit_seconds && profit_level <= 0) // Only trigger if not in profit
                     {
-                     double current_risk = current_sl - open_price; // Sell Risk
+                     double current_risk = current_sl - open_price;
                      if(current_risk > 0)
                        {
                         double new_risk = current_risk * (1.0 - (StagnationRiskReducePct / 100.0));
                         double new_sl = open_price + new_risk;
 
-                        // Check if price passed it (Close Immediately)
-                        if(current_price >= new_sl)
+                        if(current_sl == 0 || new_sl < current_sl - point)
                           {
-                           Print("Stagnation Close (Sell): Price ", current_price, " passed New SL ", new_sl);
-                           trade.PositionClose(ticket);
-                        else if(current_sl == 0 || new_sl < current_sl - point)
-                          {
-                           trade.PositionModify(ticket, new_sl, current_tp);
+                           // Ensure we don't place SL below current price
+                           if(new_sl > current_price + (SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * point))
+                              trade.PositionModify(ticket, new_sl, current_tp);
                           }
-
+                       }
+                    }
                  }
               }
         }
+     }
+
+// Update Global Dashboard Variable
    if(UseStagnationSL && trailing_active)
-     {)
+     {
+      if(min_rem_time != -1)
         {
-         if(min_rem_time <= 0) g_DashStagnationCountdown = "Triggering...";
+         if(min_rem_time <= 0)
+            g_DashStagnationCountdown = "Triggering...";
          else
            {
-n_rem_time%60) : IntegerToString(min_rem_time%60);
+            string m_str = (min_rem_time/60 < 10) ? "0"+IntegerToString(min_rem_time/60) : IntegerToString(min_rem_time/60);
+            string s_str = (min_rem_time%60 < 10) ? "0"+IntegerToString(min_rem_time%60) : IntegerToString(min_rem_time%60);
             g_DashStagnationCountdown = m_str + ":" + s_str;
            }
         }
+      else
+         g_DashStagnationCountdown = "Safe";
+     }
    else
       g_DashStagnationCountdown = "OFF";
   }
@@ -1785,7 +1886,14 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
            {
             ObjectsDeleteAll(0,"XauBridge_SrvFVG_");
             ObjectsDeleteAll(0,"XauBridge_SrvLiq_");
+           ObjectsDeleteAll(0,"XauBridge_SrvOB_");
            }
+       else
+         {
+          if(g_ShowFVG) DrawServerImbalances(0, g_SignalState.jsonResponse);
+          if(g_ShowLiq) DrawServerLiquidityZones(0, g_SignalState.jsonResponse);
+          if(g_ShowOB) DrawServerOrderBlocks(0, g_SignalState.jsonResponse);
+         }
          ChartRedraw();
         }
       if(sparam=="XauBridge_ArrowToggle")
@@ -1818,57 +1926,98 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          ChartRedraw();
         }
       // Lot Size Controls
-      if(sparam=="XauBridge_LotPlus") {
+      if(sparam=="XauBridge_LotPlus")
+        {
          g_UserLotSize += 0.01;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_LotMinus") {
+        }
+      if(sparam=="XauBridge_LotMinus")
+        {
          g_UserLotSize -= 0.01;
-         if(g_UserLotSize < 0.01) g_UserLotSize = 0.01;
+         if(g_UserLotSize < 0.01)
+            g_UserLotSize = 0.01;
          DrawDashboard();
-      }
+        }
       // Max Entries Controls
-      if(sparam=="XauBridge_EntPlus") {
+      if(sparam=="XauBridge_EntPlus")
+        {
          g_UserMaxEntries++;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_EntMinus") {
+        }
+      if(sparam=="XauBridge_EntMinus")
+        {
          g_UserMaxEntries--;
-         if(g_UserMaxEntries < 1) g_UserMaxEntries = 1;
+         if(g_UserMaxEntries < 1)
+            g_UserMaxEntries = 1;
          DrawDashboard();
-      }
-      
+        }
+
       // Settings Panel Events
-      if(sparam=="XauBridge_SetBack") {
+      if(sparam=="XauBridge_SetBack")
+        {
          g_ShowSettings = false;
          ObjectsDeleteAll(0, "XauBridge_Set"); // Clean up settings UI
+         ObjectDelete(0, "XauBridge_Stag. Secs");
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_SetScalp") {
+        }
+      if(sparam=="XauBridge_SetScalp")
+        {
          g_UserScalpMode = !g_UserScalpMode;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_SetTrail") {
+        }
+      if(sparam=="XauBridge_SetTrail")
+        {
          g_UserTrailingSL = !g_UserTrailingSL;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_SetStagPlus") {
+        }
+     if(sparam=="XauBridge_SetLiq")
+       {
+        g_ShowLiq = !g_ShowLiq;
+        if(g_ShowLiq && g_ShowZones) DrawServerLiquidityZones(0, g_SignalState.jsonResponse);
+        else ObjectsDeleteAll(0, "XauBridge_SrvLiq_");
+        DrawDashboard();
+        ChartRedraw();
+       }
+     if(sparam=="XauBridge_SetFVG")
+       {
+        g_ShowFVG = !g_ShowFVG;
+        if(g_ShowFVG && g_ShowZones) DrawServerImbalances(0, g_SignalState.jsonResponse);
+        else ObjectsDeleteAll(0, "XauBridge_SrvFVG_");
+        DrawDashboard();
+        ChartRedraw();
+       }
+     if(sparam=="XauBridge_SetOB")
+       {
+        g_ShowOB = !g_ShowOB;
+        if(g_ShowOB && g_ShowZones) DrawServerOrderBlocks(0, g_SignalState.jsonResponse);
+        else ObjectsDeleteAll(0, "XauBridge_SrvOB_");
+        DrawDashboard();
+        ChartRedraw();
+       }
+      if(sparam=="XauBridge_SetStagPlus")
+        {
          g_UserStagnationSeconds += 10;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_SetStagMinus") {
+        }
+      if(sparam=="XauBridge_SetStagMinus")
+        {
          g_UserStagnationSeconds -= 10;
-         if(g_UserStagnationSeconds < 10) g_UserStagnationSeconds = 10;
+         if(g_UserStagnationSeconds < 10)
+            g_UserStagnationSeconds = 10;
          DrawDashboard();
-      }
-      if(sparam=="XauBridge_SetReset") {
+        }
+      if(sparam=="XauBridge_SetReset")
+        {
          g_UserScalpMode = ScalpMode;
          g_UserTrailingSL = UseTrailingSL;
          g_UserStagnationSeconds = StagnationSeconds;
          g_UserMaxEntries = MaxSignalEntries;
          g_UserLotSize = FixedLotSize;
+        g_ShowLiq = true;
+        g_ShowFVG = true;
+        g_ShowOB = true;
          DrawDashboard();
-      }
+        }
      }
   }
 //+------------------------------------------------------------------+

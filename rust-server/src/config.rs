@@ -237,6 +237,12 @@ pub struct SwingSettings {
     pub displacement_rsi_threshold_bear: f64,
     pub displacement_rsi_bonus: f64,
     pub fvg_lookback: usize,
+    #[serde(default = "default_fractal_guard_enabled")]
+    pub fractal_guard_enabled: bool,
+    #[serde(default = "default_m15_swing_lookback")]
+    pub m15_swing_lookback: usize,
+    #[serde(default = "default_fractal_penalty")]
+    pub fractal_penalty_score: f64,
 }
 
 impl Default for SwingSettings {
@@ -279,9 +285,16 @@ impl Default for SwingSettings {
             displacement_rsi_threshold_bear: 45.0,
             displacement_rsi_bonus: 30.0,
             fvg_lookback: 10,
+            fractal_guard_enabled: true,
+            m15_swing_lookback: 6,
+            fractal_penalty_score: 25.0,
         }
     }
 }
+
+fn default_fractal_guard_enabled() -> bool { true }
+fn default_m15_swing_lookback() -> usize { 6 }
+fn default_fractal_penalty() -> f64 { 25.0 }
 
 impl SwingSettings {
     pub fn validate(&self) -> Result<(), String> {

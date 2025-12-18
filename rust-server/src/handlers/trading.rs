@@ -5,6 +5,7 @@ use axum::{
 };
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use chrono::Utc;
 use xau_scalper_server::EvalRequest;
 use xau_scalper_server::engines::news_guard::GuardResult;
@@ -19,6 +20,7 @@ pub async fn tick_ingest_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     tick_json: String, // Axum can receive the raw body as a String
 ) -> StatusCode {
+    state.inner.metrics.http_requests.inc();
     let service = crate::services::trading::TradingService::new(state);
     service.broadcast_tick(tick_json);
     StatusCode::OK
@@ -144,6 +146,8 @@ pub async fn process_data_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<EvalRequest<'static>>,
 ) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
+    state.inner.metrics.http_requests.inc();
+
     let symbol = req.symbol.to_string();
 
     // 1. Access settings to get filter flag
@@ -159,6 +163,10 @@ pub async fn process_data_handler(
 
     // 4. Save to history (for /signals)
     if !signals.is_empty() {
+        let count = signals.len();
+        state.inner.total_signals_generated.fetch_add(count, Ordering::SeqCst);
+        state.inner.metrics.signal_counter.inc_by(count as f64);
+
         let mut history = state.inner.signal_history.lock().await;
         for signal in signals {
             let active_signal = ActiveSignal { symbol: symbol.clone(), signal };

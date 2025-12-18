@@ -49,6 +49,14 @@ pub struct EvalRequest<'a> {
     pub m5_highs: Cow<'a, [f64]>,
     #[schema(value_type = Vec<f64>)]
     pub m5_lows: Cow<'a, [f64]>,
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub m5_timestamps: Option<Cow<'a, [i64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub m15_closes: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub m15_highs: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub m15_lows: Option<Cow<'a, [f64]>>,
     #[schema(value_type = Vec<f64>)]
     pub m30_closes: Cow<'a, [f64]>,
     #[schema(value_type = Option<Vec<f64>>)]
@@ -116,6 +124,7 @@ pub struct EvalRequest<'a> {
     // Timestamp synchronization
     pub last_m1_timestamp: i64,
     pub last_m5_timestamp: Option<i64>,
+    pub last_m15_timestamp: Option<i64>,
     pub last_m30_timestamp: Option<i64>,
     pub last_h1_timestamp: Option<i64>,
     pub last_h4_timestamp: Option<i64>,
@@ -161,6 +170,7 @@ pub struct EvalResponse {
     pub sweep_detected: String, // "high_sweep", "low_sweep", "none"
     pub imbalance_zones: Vec<PriceLevel>,
     pub liquidity_zones: Vec<PriceLevel>,
+    pub order_blocks: Vec<PriceLevel>,
     pub vwap_bands: Option<VwapBands>,
     pub reason: String,
     pub classification: String, // "scalp" or "swing"
@@ -193,6 +203,7 @@ impl Default for EvalResponse {
             sweep_detected: "none".to_string(),
             imbalance_zones: vec![],
             liquidity_zones: vec![],
+            order_blocks: vec![],
             vwap_bands: None,
             reason: "No signal".to_string(),
             classification: "none".to_string(),
