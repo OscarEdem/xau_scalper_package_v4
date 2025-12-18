@@ -39,6 +39,7 @@ pub struct ExecutionManager {
     pub last_notified_time: i64,         // Unix timestamp
     pub last_notified_price: f64,
     pub pyramiding_enabled: bool,
+    pub last_notified_scalp_mode: Option<String>,
 }
 
 impl ExecutionManager {
@@ -49,6 +50,7 @@ impl ExecutionManager {
             last_notified_time: 0,
             last_notified_price: 0.0,
             pyramiding_enabled,
+            last_notified_scalp_mode: None,
         }
     }
 
@@ -62,6 +64,12 @@ impl ExecutionManager {
         // Check if this is the same signal ID we are already tracking
         if self.last_notified_signal_id.as_ref() == Some(&signal.signal_id) {
             // Keep it active, but don't re-notify
+            return false;
+        }
+
+        // --- Fade Mode Rule: No Re-entry ---
+        // If the last trade was a Fade, do not allow any re-entry in the same direction. Only a reversal is permitted.
+        if self.last_notified_scalp_mode.as_deref() == Some("fade") && signal.entry_type == self.last_notified_direction {
             return false;
         }
 
@@ -85,12 +93,21 @@ impl ExecutionManager {
                 _ => false,
             };
 
+        // --- Averaging Logic (Max Profit / Better Entry) ---
+        let averaging_threshold = 0.0005; // 0.05% better price triggers re-entry
+        let is_averaging_entry = self.pyramiding_enabled && !direction_changed
+            && match signal.entry_type.as_str() {
+                "long" => price_delta_pct < -averaging_threshold, // Price moved lower (better buy)
+                "short" => price_delta_pct > averaging_threshold, // Price moved higher (better sell)
+                _ => false,
+            };
+
         // --- Reversal Logic ---
         let is_rapid_reversal = direction_changed && time_diff < 180;
         let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
 
         // --- Decision ---
-        is_valid_reversal || (!direction_changed && cooldown_passed) || is_pyramiding_breakout
+        is_valid_reversal || (!direction_changed && cooldown_passed) || is_pyramiding_breakout || is_averaging_entry
     }
 
     pub fn update_state(&mut self, signal: &EvalResponse, current_time: i64) {
@@ -98,6 +115,7 @@ impl ExecutionManager {
         self.last_notified_direction = signal.entry_type.clone();
         self.last_notified_time = current_time;
         self.last_notified_price = signal.entry_price;
+        self.last_notified_scalp_mode = signal.scalp_mode.clone();
     }
 }
 
@@ -200,6 +218,9 @@ impl TradingSession {
     pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
         info!(symbol = %self.symbol, "Processing new data for session.");
 
+        // Update session configuration from global settings
+        self.filter_scalp_by_swing = settings.scalp.filter_scalp_by_swing;
+
         // 1. Update data buffers with the latest candle data from the request.
         // Smart update: If input is small (incremental), push back. If large (sync), replace.
         // Guard against duplicate ticks: Only update if timestamp advanced OR it's a full sync (>10 items).
@@ -213,7 +234,7 @@ impl TradingSession {
 
         // M5 Update
         if let Some(ts) = req.last_m5_timestamp {
-            if ts > self.last_m5_timestamp || req.m5_closes.len() > settings.sync_threshold {
+            if (ts > 0 && ts > self.last_m5_timestamp) || req.m5_closes.len() > settings.sync_threshold {
                 Self::update_buffer(&mut self.m5_closes, &req.m5_closes, settings.max_buffer_size);
                 Self::update_buffer(&mut self.m5_highs, &req.m5_highs, settings.max_buffer_size);
                 Self::update_buffer(&mut self.m5_lows, &req.m5_lows, settings.max_buffer_size);
@@ -225,7 +246,7 @@ impl TradingSession {
 
         // M30 Update
         if let Some(ts) = req.last_m30_timestamp {
-            if ts > self.last_m30_timestamp || req.m30_closes.len() > settings.sync_threshold {
+            if (ts > 0 && ts > self.last_m30_timestamp) || req.m30_closes.len() > settings.sync_threshold {
                 Self::update_buffer(&mut self.m30_closes, &req.m30_closes, settings.max_buffer_size);
                 self.last_m30_timestamp = ts;
             }
@@ -235,7 +256,7 @@ impl TradingSession {
         
         // H1 Update
         if let Some(ts) = req.last_h1_timestamp {
-            if ts > self.last_h1_timestamp || req.h1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+            if (ts > 0 && ts > self.last_h1_timestamp) || req.h1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
                 if let Some(v) = &req.h1_closes { Self::update_buffer(&mut self.h1_closes, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h1_highs { Self::update_buffer(&mut self.h1_highs, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h1_opens { Self::update_buffer(&mut self.h1_opens, v, settings.max_buffer_size); }
@@ -248,7 +269,7 @@ impl TradingSession {
         
         // H4 Update
         if let Some(ts) = req.last_h4_timestamp {
-            if ts > self.last_h4_timestamp || req.h4_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+            if (ts > 0 && ts > self.last_h4_timestamp) || req.h4_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
                 if let Some(v) = &req.h4_closes { Self::update_buffer(&mut self.h4_closes, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h4_highs { Self::update_buffer(&mut self.h4_highs, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h4_lows { Self::update_buffer(&mut self.h4_lows, v, settings.max_buffer_size); }
@@ -260,7 +281,7 @@ impl TradingSession {
         
         // D1 Update
         if let Some(ts) = req.last_d1_timestamp {
-            if ts > self.last_d1_timestamp || req.d1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
+            if (ts > 0 && ts > self.last_d1_timestamp) || req.d1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
                 if let Some(v) = &req.d1_opens { Self::update_buffer(&mut self.d1_opens, v, settings.max_buffer_size); }
                 if let Some(v) = &req.d1_closes { Self::update_buffer(&mut self.d1_closes, v, settings.max_buffer_size); }
                 self.last_d1_timestamp = ts;
@@ -292,8 +313,14 @@ impl TradingSession {
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
 
+        // Calculate current ATR for logging purposes
+        let h1_atr = crate::atr(&req.h1_highs.as_ref().unwrap_or(&Cow::Borrowed(&[])), 
+                                &req.h1_lows.as_ref().unwrap_or(&Cow::Borrowed(&[])), 
+                                &req.h1_closes.as_ref().unwrap_or(&Cow::Borrowed(&[])), 14)
+                                .last().cloned().unwrap_or(0.0);
+
         // Latching Logic & Trade Management
-        self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp);
+        self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp, h1_atr);
 
         // --- Check for Re-Entry Trigger (Bounce off BE) ---
         self.check_swing_reentry(&mut swing_signal, req.current_price, req.last_m1_timestamp, &settings.swing);
@@ -307,7 +334,21 @@ impl TradingSession {
         }
 
         // Update the session's swing trend based on the new signal.
-        self.swing_trend = TrendDirection::from(swing_signal.entry_type.as_str());
+        // If no active signal, use HTF bias from debug_info to determine trend for filtering.
+        self.swing_trend = match swing_signal.entry_type.as_str() {
+            "long" => TrendDirection::Up,
+            "short" => TrendDirection::Down,
+            _ => {
+                let bias = swing_signal.debug_info.as_ref()
+                    .and_then(|d| d.get("htf_bias_score"))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                
+                if bias > 0.25 { TrendDirection::Up }
+                else if bias < -0.25 { TrendDirection::Down }
+                else { TrendDirection::Sideways }
+            }
+        };
         self.latest_swing_signal = Some(swing_signal);
 
         // 3. Run the Scalp Engine (reuse base_req data)
@@ -377,7 +418,7 @@ impl TradingSession {
         notifications
     }
 
-    fn manage_active_swing_trade(&mut self, swing_signal: &mut EvalResponse, current_price: f64, timestamp: i64) {
+    fn manage_active_swing_trade(&mut self, swing_signal: &mut EvalResponse, current_price: f64, timestamp: i64, current_atr: f64) {
         if let Some(existing) = &self.latest_swing_signal {
             // Only latch if the existing signal is still active. If it was invalidated, treat fresh signal as new.
             if existing.signal_id == swing_signal.signal_id && existing.entry_type != "none" {
@@ -432,6 +473,16 @@ impl TradingSession {
                 if swing_signal.entry_type == "long" {
                     // Invalidation: If price dropped below existing SL, kill signal
                     if current_price < managed_sl {
+                        // Log SL Hit details
+                        let entry_atr = existing.debug_info.as_ref()
+                            .and_then(|d| d.get("entry_atr"))
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        
+                        let session_name = crate::engines::scalp::ScalpEngine::session_utc(timestamp);
+                        
+                        tracing::info!(symbol = %self.symbol, "SL HIT: Session={}, EntryATR={:.4}, ExitATR={:.4}, Price={:.2}, SL={:.2}", session_name, entry_atr, current_atr, current_price, managed_sl);
+
                         swing_signal.entry_type = "none".to_string();
                         // Distinguish between Initial SL hit and Trailing/BE hit
                         if managed_sl > initial_sl_val + 0.00001 {
@@ -457,6 +508,15 @@ impl TradingSession {
                 } else if swing_signal.entry_type == "short" {
                     // Invalidation
                     if current_price > managed_sl {
+                        // Log SL Hit details
+                        let entry_atr = existing.debug_info.as_ref()
+                            .and_then(|d| d.get("entry_atr"))
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let session_name = crate::engines::scalp::ScalpEngine::session_utc(timestamp);
+
+                        tracing::info!(symbol = %self.symbol, "SL HIT: Session={}, EntryATR={:.4}, ExitATR={:.4}, Price={:.2}, SL={:.2}", session_name, entry_atr, current_atr, current_price, managed_sl);
+
                         swing_signal.entry_type = "none".to_string();
                         // Distinguish between Initial SL hit and Trailing/BE hit
                         if managed_sl < initial_sl_val - 0.00001 {

@@ -26,12 +26,13 @@ pub mod state;
 pub mod handlers;
 pub mod services;
 
-use prometheus::{register_counter, register_gauge};
+use prometheus::{register_counter, register_counter_vec, register_gauge};
 use xau_scalper_server::config::Settings;
 use xau_scalper_server::config::{TradingSettings, ScalpSettings, SwingSettings};
 use xau_scalper_server::engines::news_guard::GuardResult;
 use xau_scalper_server::macro_analysis::types::{MacroOutlook, Bias};
 use crate::state::*;
+use crate::routes::ChatRequest;
 
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
@@ -46,6 +47,7 @@ use crate::state::*;
         handlers::system::save_push_token_handler,
         routes::daily_analysis,
         routes::weekly_analysis,
+        routes::chat_analysis_handler,
         handlers::system::get_loaded_models_handler,
         handlers::trading::get_signal_definitions_handler,
         handlers::system::metrics_handler,
@@ -56,7 +58,7 @@ use crate::state::*;
         handlers::trading::get_news_guard_status_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, GuardResult, MacroOutlook, Bias, MacroCategory)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -100,8 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_requests = register_counter!("xau_scalper_http_requests_total", "Total HTTP requests received")
         .map_err(|e| format!("Failed to register http_requests: {}", e))?;
 
+    let gemini_429_errors = register_counter!("xau_scalper_gemini_429_errors_total", "Total Gemini API 429 Too Many Requests errors")
+        .map_err(|e| format!("Failed to register gemini_429_errors: {}", e))?;
+
+    let gemini_success_model = register_counter_vec!("xau_scalper_gemini_success_model_total", "Total successful Gemini API requests by model", &["model"])
+        .map_err(|e| format!("Failed to register gemini_success_model: {}", e))?;
+
     let metrics = AppMetrics {
-        signal_counter, active_sessions, active_ws_clients, http_requests
+        signal_counter, active_sessions, active_ws_clients, http_requests, gemini_429_errors, gemini_success_model
     };
 
     // Initialize the shared state
@@ -114,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         news_events: Arc::new(Mutex::new(Vec::new())),
         fundamental_analysis_cache: Arc::new(DashMap::new()),
         ws_clients: Arc::new(AtomicUsize::new(0)),
+        chat_rate_limiter: Arc::new(DashMap::new()),
         server_start_time: Utc::now(),
         total_signals_generated: Arc::new(AtomicUsize::new(0)),
         http_client: reqwest::Client::builder()
@@ -172,14 +181,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/", get(handlers::system::health_check_handler))
         .route("/ws", get(handlers::ws::websocket_handler))
         .route("/metrics", get(handlers::system::metrics_handler))
         .route("/metrics/prometheus", get(handlers::system::prometheus_metrics_handler)) // NEW: Prometheus endpoint
         .route("/health", get(handlers::system::health_check_handler))
         .route("/data", post(handlers::trading::process_data_handler)) // For main analysis
         .route("/ticks", post(handlers::trading::tick_ingest_handler)) // NEW: For live ticks
-        .route("/signals/:symbol", get(handlers::trading::get_latest_signals_handler))
         .route("/signals/latest", get(handlers::trading::get_all_latest_signals_handler))
+        .route("/signals/:symbol", get(handlers::trading::get_latest_signals_handler))
         .route("/signals", get(handlers::trading::get_signals_handler))
         .route("/definitions/reasons", get(handlers::trading::get_signal_definitions_handler))
         // --- Add new routes for logging ---
@@ -191,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Analysis Endpoints ---
         .route("/daily-analysis", get(routes::daily_analysis))
         .route("/weekly-analysis", get(routes::weekly_analysis))
+        .route("/chat-analysis", post(routes::chat_analysis_handler))
         // Provide the state to all handlers
         .with_state(app_state_with_ticks);
 

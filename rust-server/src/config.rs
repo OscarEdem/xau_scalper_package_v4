@@ -83,6 +83,50 @@ pub struct ScalpSettings {
     pub news_pre_event_block_minutes: i64,
     pub news_post_event_block_minutes: i64,
     pub news_guard_atr_spike_multiplier: f64,
+    // Mode Classification Thresholds
+    pub momentum_kalman_threshold: f64,
+    pub momentum_m1_threshold: f64,
+
+    // Fade Strategy
+    pub fade_sma_period: usize,
+    pub fade_std_dev_mult: f64,
+    pub fade_parabolic_atr_mult: f64,
+    pub fade_sl_atr_mult: f64,
+    pub fade_tp1_atr_mult: f64,
+    pub fade_max_adx: f64,
+
+    // Momentum Strategy
+    pub momentum_risk_atr_mult: f64,
+    pub momentum_tp1_atr_mult: f64,
+    pub momentum_tp2_atr_mult: f64,
+
+    // Pullback Strategy
+    pub pullback_sl_atr_mult: f64,
+    pub pullback_tp1_atr_mult: f64,
+    pub pullback_tp2_atr_mult: f64,
+
+    // Safety & Scoring
+    pub min_sl_atr_mult: f64,
+    pub max_sl_atr_mult: f64,
+    pub kalman_weight: f64,
+    pub m1_surge_weight: f64,
+
+    // Session Toggles
+    #[serde(default)]
+    pub allow_asia_trading: bool,
+    #[serde(default)]
+    pub allow_london_open_momentum: bool,
+    #[serde(default)]
+    pub allow_ny_late_momentum: bool,
+    pub m1_roc_period: usize,
+    pub m1_atr_conversion_div: f64,
+    pub vol_regime_clamp_min: f64,
+    pub vol_regime_clamp_max: f64,
+    pub flow_threshold_mult: f64,
+    pub inducement_opposing_reduction: f64,
+    pub momentum_min_risk_atr: f64,
+    #[serde(default)]
+    pub filter_scalp_by_swing: bool,
 }
 
 impl Default for ScalpSettings {
@@ -103,13 +147,44 @@ impl Default for ScalpSettings {
             risk_reward_ratio_tp2: 2.5,
             sl_atr_multiplier_inducement: 1.0,
             sl_atr_multiplier_flow: 2.0,
-            logistic_scale: 6.0,
-            logistic_offset: 0.6,
+            logistic_scale: 2.93,
+            logistic_offset: 0.75,
             limit_order_expiration: 180,
             time_stop_seconds: 3600,
             news_pre_event_block_minutes: 30,
             news_post_event_block_minutes: 15,
             news_guard_atr_spike_multiplier: 2.5,
+            momentum_kalman_threshold: 0.7,
+            momentum_m1_threshold: 0.6,
+            
+            fade_sma_period: 20,
+            fade_std_dev_mult: 3.0,
+            fade_parabolic_atr_mult: 0.8,
+            fade_sl_atr_mult: 0.5,
+            fade_tp1_atr_mult: 1.0,
+            fade_max_adx: 30.0,
+            momentum_risk_atr_mult: 0.4,
+            momentum_tp1_atr_mult: 0.7,
+            momentum_tp2_atr_mult: 1.3,
+            pullback_sl_atr_mult: 0.15,
+            pullback_tp1_atr_mult: 0.5,
+            pullback_tp2_atr_mult: 1.0,
+            min_sl_atr_mult: 0.25,
+            max_sl_atr_mult: 2.5,
+            kalman_weight: 0.6,
+            m1_surge_weight: 0.35,
+            
+            allow_asia_trading: false,
+            allow_london_open_momentum: false,
+            allow_ny_late_momentum: false,
+            m1_roc_period: 3,
+            m1_atr_conversion_div: 5.0,
+            vol_regime_clamp_min: 0.5,
+            vol_regime_clamp_max: 2.0,
+            flow_threshold_mult: 0.5,
+            inducement_opposing_reduction: 0.5,
+            momentum_min_risk_atr: 0.35,
+            filter_scalp_by_swing: false,
         }
     }
 }
@@ -149,6 +224,19 @@ pub struct SwingSettings {
     pub news_pre_event_block_minutes: i64,
     pub news_post_event_block_minutes: i64,
     pub news_guard_atr_spike_multiplier: f64,
+    pub adx_period: usize,
+    pub atr_avg_lookback: usize,
+    pub swing_lookback: usize,
+    pub swing_neighbors: usize,
+    pub ensemble_h1_weight: f64,
+    pub ensemble_d1_weight: f64,
+    pub displacement_atr_mult: f64,
+    pub displacement_strength_bonus: f64,
+    pub displacement_rsi_period: usize,
+    pub displacement_rsi_threshold_bull: f64,
+    pub displacement_rsi_threshold_bear: f64,
+    pub displacement_rsi_bonus: f64,
+    pub fvg_lookback: usize,
 }
 
 impl Default for SwingSettings {
@@ -178,6 +266,19 @@ impl Default for SwingSettings {
             news_pre_event_block_minutes: 60,
             news_post_event_block_minutes: 30,
             news_guard_atr_spike_multiplier: 2.0,
+            adx_period: 14,
+            atr_avg_lookback: 50,
+            swing_lookback: 60,
+            swing_neighbors: 3,
+            ensemble_h1_weight: 0.7,
+            ensemble_d1_weight: 0.3,
+            displacement_atr_mult: 0.7,
+            displacement_strength_bonus: 50.0,
+            displacement_rsi_period: 14,
+            displacement_rsi_threshold_bull: 55.0,
+            displacement_rsi_threshold_bear: 45.0,
+            displacement_rsi_bonus: 30.0,
+            fvg_lookback: 10,
         }
     }
 }

@@ -10,7 +10,7 @@ use xau_scalper_server::EvalRequest;
 use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
-    ApplicationStateWithTicks, HistoricalSignal, LatestSignalsForSymbol,
+    ApplicationStateWithTicks, ActiveSignal, HistoricalSignal, LatestSignalsForSymbol,
     SignalDefinitionsResponse, SignalReasonInfo
 };
 
@@ -58,31 +58,36 @@ pub async fn get_signal_definitions_handler() -> Json<SignalDefinitionsResponse>
     }
 
     // Scalp Reasons
-    insert!("HTF Bullish Bias", "The Higher Timeframes (H1/H4) are trending Up.", "Trade with confidence. Aligning with the big trend increases win rate.");
-    insert!("HTF Bearish Bias", "The Higher Timeframes (H1/H4) are trending Down.", "Trade with confidence. Aligning with the big trend increases win rate.");
-    insert!("Ensemble Bullish Bias", "Our AI models (LSTM, GBM, Heston) collectively predict price rising.", "High Confidence. Mathematical models agree with the technicals.");
-    insert!("Ensemble Bearish Bias", "Our AI models (LSTM, GBM, Heston) collectively predict price falling.", "High Confidence. Mathematical models agree with the technicals.");
-    insert!("Bullish M5 Flow", "The 5-minute momentum (Kalman Filter) is sloping upwards.", "Momentum Entry. Price is currently moving in your favor.");
-    insert!("Bearish M5 Flow", "The 5-minute momentum (Kalman Filter) is sloping downwards.", "Momentum Entry. Price is currently moving in your favor.");
-    insert!("M1 Bullish Surge", "A sudden burst of buying volume/speed detected on the 1-minute chart.", "Precision Timing. This confirms the exact moment to enter.");
-    insert!("M1 Bearish Surge", "A sudden burst of selling volume/speed detected on the 1-minute chart.", "Precision Timing. This confirms the exact moment to enter.");
-    insert!("Bullish Inducement", "Price swept a recent low to trap sellers, then reversed up.", "Reversal Trade. Expect a fast move away from the trap. Use a tighter Stop Loss.");
-    insert!("Bearish Inducement", "Price swept a recent high to trap buyers, then reversed down.", "Reversal Trade. Expect a fast move away from the trap. Use a tighter Stop Loss.");
+    insert!("HTF Bullish Bias", "Higher Timeframe (H1/H4) structure and moving averages indicate a dominant uptrend.", "Look for long entries. Short trades are counter-trend and riskier.");
+    insert!("HTF Bearish Bias", "Higher Timeframe (H1/H4) structure and moving averages indicate a dominant downtrend.", "Look for short entries. Long trades are counter-trend and riskier.");
+    insert!("Ensemble Bullish Bias", "A consensus of Machine Learning models (LSTM, GBM, Heston) predicts a price increase.", "Statistical probability favors upside. Good confluence for long setups.");
+    insert!("Ensemble Bearish Bias", "A consensus of Machine Learning models (LSTM, GBM, Heston) predicts a price decrease.", "Statistical probability favors downside. Good confluence for short setups.");
+    insert!("Bullish M5 Flow", "The 5-minute Kalman Filter slope is positive, indicating immediate bullish momentum.", "Price is moving up now. Supports trend-following entries.");
+    insert!("Bearish M5 Flow", "The 5-minute Kalman Filter slope is negative, indicating immediate bearish momentum.", "Price is moving down now. Supports trend-following entries.");
+    insert!("M1 Bullish Surge", "A rapid acceleration of price and volume detected on the 1-minute chart.", "Micro-timing signal. Often marks the exact moment of a breakout or reversal.");
+    insert!("M1 Bearish Surge", "A rapid acceleration of selling pressure detected on the 1-minute chart.", "Micro-timing signal. Often marks the exact moment of a breakout or reversal.");
+    insert!("Flow+Surge Confluence", "Alignment of 5-minute momentum (Flow) and 1-minute acceleration (Surge).", "High-probability momentum entry. The trend and timing are synchronized.");
+    insert!("Bullish Inducement", "Price swept a recent low to trap sellers, then immediately reversed higher.", "Classic 'Stop Hunt' reversal. Enter long as trapped sellers are forced to cover.");
+    insert!("Bearish Inducement", "Price swept a recent high to trap buyers, then immediately reversed lower.", "Classic 'Stop Hunt' reversal. Enter short as trapped buyers are forced to sell.");
+    insert!("Fade Long", "Price has extended significantly below the mean (oversold) and is showing signs of exhaustion.", "Mean reversion trade. Expect a bounce back towards the average. Strict stop loss required.");
+    insert!("Fade Short", "Price has extended significantly above the mean (overbought) and is showing signs of exhaustion.", "Mean reversion trade. Expect a pullback towards the average. Strict stop loss required.");
+    insert!("London Open Stop-Hunt", "Price swept the Asian Session high/low during the London Open, a common institutional trap.", "High-probability reversal. Institutions are grabbing liquidity to fuel the real move.");
     insert!("Breakout_Add", "This is a 'Pyramiding' signal. The trend is strong, and we are adding to a winner.", "Add to Position. Only take this if your first trade is already in profit.");
 
     // Swing Reasons
-    insert!("Bullish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major support level but closed back above it.", "Strong Reversal. Institutions bought the lows. Target the next high.");
-    insert!("Bearish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major resistance level but closed back below it.", "Strong Reversal. Institutions sold the highs. Target the next low.");
-    insert!("Bullish Displacement", "A large, strong green candle broke market structure.", "Trend Start. This indicates 'Smart Money' has entered the market with intent.");
-    insert!("Bearish Displacement", "A large, strong red candle broke market structure.", "Trend Start. This indicates 'Smart Money' has entered the market with intent.");
-    insert!("Bullish FVG Support", "Price is reacting off a 'Fair Value Gap' (Imbalance) created by buyers.", "Limit Entry. These gaps often act as magnets and then trampolines for price.");
-    insert!("Bearish FVG Resistance", "Price is reacting off a 'Fair Value Gap' (Imbalance) created by sellers.", "Limit Entry. These gaps often act as magnets and then ceilings for price.");
+    insert!("Bullish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major support level but failed to close below it.", "Strong rejection. Buyers stepped in at value. Target the opposing liquidity.");
+    insert!("Bearish Liquidity Grab (SFP)", "Swing Failure Pattern. Price pierced a major resistance level but failed to close above it.", "Strong rejection. Sellers stepped in at value. Target the opposing liquidity.");
+    insert!("Bullish Displacement", "A high-volume, large-body candle that breaks through market structure upwards.", "Confirming sign of a trend change or continuation. 'Smart Money' is active.");
+    insert!("Bearish Displacement", "A high-volume, large-body candle that breaks through market structure downwards.", "Confirming sign of a trend change or continuation. 'Smart Money' is active.");
+    insert!("Bullish FVG Support", "Price is retesting a Fair Value Gap (inefficiency) created by a strong upward move.", "Limit entry zone. Price often fills these gaps before continuing the trend.");
+    insert!("Bearish FVG Resistance", "Price is retesting a Fair Value Gap (inefficiency) created by a strong downward move.", "Limit entry zone. Price often fills these gaps before continuing the trend.");
+    insert!("Re-Entry", "Price retraced to the breakeven/entry level of a valid setup and bounced.", "Second chance entry. Validates that the support/resistance level is holding.");
 
     // Blocking/Status
-    insert!("Blocked: Volatility Spike Detected", "The market is moving abnormally fast (ATR Spike).", "Safety First. Algorithms are paused to prevent getting stopped out by noise.");
+    insert!("Blocked: Volatility Spike Detected", "The market is moving abnormally fast (ATR Spike).", "Safety First. Algorithms are paused to prevent getting stopped out by noise/slippage.");
     insert!("Blocked: Low Trend Strength (ADX)", "The market is flat/ranging (ADX is very low).", "No Trade. Scalping strategies fail in flat markets. Wait for a breakout.");
     insert!("Filtered: Scalp signal conflicts with swing trend", "The Scalp engine wanted to trade, but the Swing trend is opposite.", "Trend Filter. We blocked a counter-trend trade to protect your capital.");
-    insert!("No Signal (low conviction)", "The setup appeared but didn't reach the required confidence score (e.g., < 45%).", "Patience. The setup wasn't 'A+' quality. Better to wait for a clearer setup.");
+    insert!("No Signal (low conviction)", "The setup appeared but didn't reach the required confidence score.", "Patience. The setup wasn't 'A+' quality. Better to wait for a clearer setup.");
     insert!("No Signal (SL sanity check failed)", "The calculated Stop Loss was either dangerously tight or way too wide.", "Risk Management. The risk profile for this specific candle setup was unsafe.");
 
     Json(SignalDefinitionsResponse { definitions })
@@ -139,8 +144,29 @@ pub async fn process_data_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<EvalRequest<'static>>,
 ) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
-    let service = crate::services::trading::TradingService::new(state);
-    service.process_eval_request(req).await?;
+    let symbol = req.symbol.to_string();
+
+    // 1. Access settings to get filter flag
+    let settings = state.inner.session_manager.settings.read().expect("Settings lock poisoned").clone();
+    let filter_scalp = settings.scalp.filter_scalp_by_swing;
+
+    // 2. Get or create session
+    let session_arc = state.inner.session_manager.get_or_create_session(&symbol, filter_scalp);
+    let mut session = session_arc.lock().await;
+
+    // 3. Process data (updates session state for /signals/{symbol} and /signals/latest)
+    let signals = session.on_data(req, &state.inner.predictor_cache, &settings);
+
+    // 4. Save to history (for /signals)
+    if !signals.is_empty() {
+        let mut history = state.inner.signal_history.lock().await;
+        for signal in signals {
+            let active_signal = ActiveSignal { symbol: symbol.clone(), signal };
+            let historical_signal = HistoricalSignal { signal: active_signal, created_at: Utc::now().timestamp() };
+            history.push_front(historical_signal);
+        }
+    }
+
     Ok((StatusCode::OK, Json("Data processed")))
 }
 

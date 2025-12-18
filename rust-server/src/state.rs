@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, broadcast};
 use dashmap::DashMap;
-use prometheus::{Counter, Gauge};
+use prometheus::{Counter, CounterVec, Gauge};
 use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager};
 use xau_scalper_server::config::Settings;
 
@@ -29,6 +29,8 @@ pub struct AppMetrics {
     pub active_sessions: Gauge,
     pub active_ws_clients: Gauge,
     pub http_requests: Counter,
+    pub gemini_429_errors: Counter,
+    pub gemini_success_model: CounterVec,
 }
 
 /// A more flexible state for the whole application, including the new SessionManager.
@@ -43,6 +45,8 @@ pub struct ApplicationState {
     pub fundamental_analysis_cache: Arc<DashMap<String, (u64, String)>>,
     pub ws_clients: Arc<AtomicUsize>,
     // NEW: Metrics
+    /// Rate limiter for chat requests: Key = IP/User/Symbol, Value = (count, window_start_timestamp)
+    pub chat_rate_limiter: Arc<DashMap<String, (u32, i64)>>,
     pub server_start_time: chrono::DateTime<chrono::Utc>,
     pub total_signals_generated: Arc<AtomicUsize>,
     pub http_client: reqwest::Client,

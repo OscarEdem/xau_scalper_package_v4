@@ -65,8 +65,8 @@ pub fn evaluate_news_guard(
             };
         }
 
-        // Check post-event window (event is in the past)
-        if time_to_event < 0 && time_to_event.abs() <= post_block {
+        // Check post-event window (event is in the past or happening now)
+        if time_to_event <= 0 && time_to_event.abs() <= post_block {
             return GuardResult {
                 allowed: false,
                 reason: Some(format!(

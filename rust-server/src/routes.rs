@@ -3,13 +3,14 @@ use xau_scalper_server::macro_analysis::builder::build_context;
 use xau_scalper_server::macro_analysis::types::TechnicalSignal;
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     Json,
 };
 use chrono::{Datelike, Timelike, Utc};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -20,6 +21,16 @@ pub struct SymbolQuery {
     symbol: String,
     #[serde(default)]
     force_refresh: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ChatRequest {
+    #[schema(example = "XAUUSD")]
+    pub symbol: String,
+    #[schema(example = "daily")]
+    pub period: String,
+    #[schema(example = "What are the key risks mentioned in the report?")]
+    pub query: String,
 }
 
 #[utoipa::path(
@@ -46,6 +57,75 @@ pub async fn weekly_analysis(
     // Weekly: Uses all high-impact events in last 7 days + upcoming
     let result = generate_fundamental_report(state, &q.symbol, "weekly", q.force_refresh).await;
     Json(result)
+}
+
+#[utoipa::path(
+    post, path = "/chat-analysis", request_body = ChatRequest,
+    responses(
+        (status = 200, description = "Returns the LLM response to the user query based on cached analysis", body = String),
+        (status = 404, description = "No analysis found for the given symbol and period. Please run analysis first."),
+        (status = 500, description = "Internal LLM error")
+    )
+)]
+pub async fn chat_analysis_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // --- Rate Limiting Logic ---
+    // Limit: 5 requests per minute per symbol (simple keying by symbol for now)
+    let limit_key = req.symbol.clone();
+    let window_size = 60; // seconds
+    let max_requests = 5;
+    let now = Utc::now().timestamp();
+
+    let mut allowed = false;
+    {
+        // DashMap entry API handles locking internally for the bucket
+        let mut entry = state.inner.chat_rate_limiter.entry(limit_key).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+
+        if now - *window_start > window_size {
+            // Reset window
+            *window_start = now;
+            *count = 1;
+            allowed = true;
+        } else if *count < max_requests {
+            // Increment count
+            *count += 1;
+            allowed = true;
+        }
+    }
+
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Validate period
+    if req.period != "daily" && req.period != "weekly" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let cache_key = format!("{}_{}", req.symbol, req.period);
+
+    // 1. Retrieve cached analysis
+    let cached_report = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
+        entry.value().1.clone()
+    } else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    // 2. Construct Prompt
+    let system_instruction = "You are a financial analyst assistant. The user is asking a follow-up question based on the provided Fundamental Analysis Report (RECENT DATA). Answer the question using the context provided. Be concise and professional.";
+    let full_prompt = format!("{}\n\nUSER QUESTION: {}", system_instruction, req.query);
+
+    // 3. Call LLM (Reusing existing generate_analysis which handles API key and context formatting)
+    match generate_analysis(&state.inner.http_client, &req.symbol, &cached_report, &full_prompt, &state.inner.metrics).await {
+        Ok(response) => Ok(Json(serde_json::json!({ "response": response }))),
+        Err(e) => {
+            tracing::error!("LLM Chat failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Internal helper to generate fundamental analysis report
@@ -178,7 +258,7 @@ pub async fn generate_fundamental_report(
 
     // --- LLM CALL ---
     // We pass the context as the data payload, and the system prompt as the instruction.
-    let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1)
+    let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1, &state.inner.metrics)
         .await;
 
     let mut result: serde_json::Value = match llm_response {

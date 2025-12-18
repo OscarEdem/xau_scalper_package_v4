@@ -165,7 +165,11 @@ pub struct EvalResponse {
     pub reason: String,
     pub classification: String, // "scalp" or "swing"
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scalp_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conviction_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_position_size: Option<f64>,
     // --- NEW: Fields for Limit Order Execution ---
     pub recommended_order_type: String, // "market", "limit_buy", "limit_sell"
     pub limit_order_price: f64,         // The exact price to place the limit
@@ -192,7 +196,9 @@ impl Default for EvalResponse {
             vwap_bands: None,
             reason: "No signal".to_string(),
             classification: "none".to_string(),
+            scalp_mode: None,
             conviction_score: None,
+            suggested_position_size: None,
             recommended_order_type: "none".to_string(),
             limit_order_price: 0.0,
             expiration_seconds: None,
@@ -769,4 +775,198 @@ pub fn chandelier_exit_low(lows: &[f64], atr_vals: &[f64], lookback: usize, atr_
     let lo = lows[n - lookback..n].iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let last_atr = atr_vals.last().cloned().unwrap_or(0.0);
     Some(lo + atr_mult * last_atr)
+}
+
+pub struct RawOrderBlock {
+    pub top: f64,
+    pub bottom: f64,
+    pub is_bullish: bool,
+    pub creation_index: usize,
+    pub bos_index: usize, // NEW: Track when the structure was actually broken
+    pub mitigated: bool,
+}
+
+/// Scans price history to find unmitigated Order Blocks.
+/// `lookback`: How far back to scan for swings (e.g., 100-200 candles).
+pub fn find_order_blocks(
+    highs: &[f64],
+    lows: &[f64],
+    _opens: &[f64], // Kept for signature compatibility if needed later
+    closes: &[f64],
+    lookback: usize, 
+) -> Vec<PriceLevel> {
+    let len = closes.len();
+    if len < 5 { return Vec::new(); }
+    
+    let start_idx = len.saturating_sub(lookback);
+    // Ensure we don't start at 0 because we access i-1
+    let start_idx = if start_idx == 0 { 1 } else { start_idx };
+
+    let mut ob_candidates: Vec<RawOrderBlock> = Vec::new();
+    
+    // 1. Identify Swings & Breaks
+    for i in start_idx..(len - 2) {
+        
+        // --- BULLISH OB LOGIC ---
+        let is_swing_low = lows[i] < lows[i-1] && lows[i] < lows[i+1];
+        
+        if is_swing_low {
+            // STEP 1: Find the Structural High to break.
+            // We scan backwards from i to find the highest point 
+            // before this low was formed (up to a limit, e.g., 20 candles).
+            let scan_limit = i.saturating_sub(20); 
+            let mut structural_high = highs[i-1];
+            
+            for k in (scan_limit..i).rev() {
+                if highs[k] > structural_high {
+                    structural_high = highs[k];
+                } else {
+                    // Simple heuristic: If we find a high followed by a significantly lower high, 
+                    // we might have found the swing point. 
+                    // For now, finding the max in the last 10-20 candles is robust enough.
+                }
+            }
+            
+            // STEP 2: Look forward for BOS of that Structural High
+            for j in (i + 1)..len {
+                if closes[j] > structural_high {
+                    // BOS Confirmed
+                    let ob_top = highs[i]; 
+                    let ob_bottom = lows[i];
+
+                    if !ob_candidates.iter().any(|ob| ob.creation_index == i) {
+                         ob_candidates.push(RawOrderBlock {
+                            top: ob_top,
+                            bottom: ob_bottom,
+                            is_bullish: true,
+                            creation_index: i,
+                            bos_index: j,
+                            mitigated: false,
+                        });
+                    }
+                    break; 
+                }
+            }
+        }
+
+        // --- BEARISH OB LOGIC ---
+        let is_swing_high = highs[i] > highs[i-1] && highs[i] > highs[i+1];
+        
+        if is_swing_high {
+            // Find Structural Low to break (Scan backwards)
+            let scan_limit = i.saturating_sub(20);
+            let mut structural_low = lows[i-1];
+            
+            for k in (scan_limit..i).rev() {
+                if lows[k] < structural_low {
+                    structural_low = lows[k];
+                }
+            }
+
+            for j in (i + 1)..len {
+                if closes[j] < structural_low {
+                    // BOS Confirmed
+                    let ob_top = highs[i];
+                    let ob_bottom = lows[i];
+
+                     if !ob_candidates.iter().any(|ob| ob.creation_index == i) {
+                        ob_candidates.push(RawOrderBlock {
+                            top: ob_top,
+                            bottom: ob_bottom,
+                            is_bullish: false,
+                            creation_index: i,
+                            bos_index: j,
+                            mitigated: false,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Check Mitigation (Has price returned to the block?)
+    let mut active_zones: Vec<PriceLevel> = Vec::new();
+    
+    for ob in ob_candidates.iter_mut() {
+        // Start checking from the candle AFTER the block was formed
+        // FIX: Start checking AFTER the structure break.
+        // Price action between creation(i) and BOS(j) is the "Impulse leg" and shouldn't mitigate the block.
+        let check_start = ob.bos_index + 1; 
+        
+        let mut broken = false;
+        let mut break_idx = 0;
+        
+        for k in check_start..len {
+            if ob.is_bullish {
+                // Invalidated: Price closes below bottom
+                if closes[k] < ob.bottom {
+                    ob.mitigated = true;
+                    broken = true;
+                    break_idx = k;
+                    break;
+                }
+                // Mitigated: Price touches the zone (re-entry)
+                if lows[k] <= ob.top {
+                    ob.mitigated = true;
+                    break;
+                }
+            } else { // Bearish
+                // Invalidated
+                if closes[k] > ob.top {
+                    ob.mitigated = true;
+                    broken = true;
+                    break_idx = k;
+                    break;
+                }
+                // Mitigated
+                if highs[k] >= ob.bottom {
+                    ob.mitigated = true;
+                    break;
+                }
+            }
+        }
+
+        // 3. Output only valid, unmitigated zones
+        if !ob.mitigated {
+            active_zones.push(PriceLevel {
+                top: ob.top,
+                bottom: ob.bottom,
+                is_bullish: Some(ob.is_bullish),
+            });
+        } else if broken {
+            // Breaker Block Logic:
+            // If an OB is broken, it flips polarity (Support <-> Resistance)
+            // We check if the breaker itself is still valid (not reclaimed)
+            let mut breaker_valid = true;
+            
+            for k in (break_idx + 1)..len {
+                if ob.is_bullish {
+                    // Was Bullish OB -> Now Bearish Breaker (Resistance)
+                    // Invalidated if price closes back above the top
+                    if closes[k] > ob.top {
+                        breaker_valid = false;
+                        break;
+                    }
+                } else {
+                    // Was Bearish OB -> Now Bullish Breaker (Support)
+                    // Invalidated if price closes back below the bottom
+                    if closes[k] < ob.bottom {
+                        breaker_valid = false;
+                        break;
+                    }
+                }
+            }
+
+            if breaker_valid {
+                active_zones.push(PriceLevel {
+                    top: ob.top,
+                    bottom: ob.bottom,
+                    is_bullish: Some(!ob.is_bullish), // Flip polarity
+                });
+            }
+        }
+    }
+
+    active_zones
 }

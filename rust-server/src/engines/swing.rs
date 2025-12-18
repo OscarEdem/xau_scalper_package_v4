@@ -1,6 +1,6 @@
 use crate::{EvalRequest, EvalResponse};
 use ::uuid::Uuid;
-use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, calculate_dynamic_thickness, get_daily_bias, get_trend_bias, rsi, get_fvg_limit_price, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::SwingSettings};
+use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, find_order_blocks, calculate_dynamic_thickness, get_daily_bias, get_trend_bias, rsi, get_fvg_limit_price, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::SwingSettings};
 use tracing::debug;
 use std::collections::HashMap;
 
@@ -54,12 +54,12 @@ impl SwingEngine {
         
         // Calculate baseline ATR for regime detection
         let avg_atr: f64 = if atr_vals.len() > 0 {
-            atr_vals.iter().skip(atr_vals.len().saturating_sub(50)).sum::<f64>() / 50.0_f64.min(atr_vals.len() as f64)
+            atr_vals.iter().skip(atr_vals.len().saturating_sub(settings.atr_avg_lookback)).sum::<f64>() / (settings.atr_avg_lookback as f64).min(atr_vals.len() as f64)
         } else {
             last_atr
         };
 
-        let adx_vals = adx(h1_highs, h1_lows, h1_closes, 14);
+        let adx_vals = adx(h1_highs, h1_lows, h1_closes, settings.adx_period);
 
         // --- Guard: Check for high-risk news or volatility before proceeding ---
         let guard = news_guard::combined_guard(
@@ -82,7 +82,7 @@ impl SwingEngine {
         let htf_bias_score = Self::htf_bias_engine(req, settings);
 
         // --- 3. Market Structure Engine ---
-        let structure = Self::market_structure_engine(h1_highs, h1_lows, h1_closes);
+        let structure = Self::market_structure_engine(h1_highs, h1_lows, h1_closes, settings);
         if structure.external_high.1 == 0.0 {
             return EvalResponse { reason: "Not enough structure found".to_string(), ..Default::default() };
         }
@@ -91,8 +91,18 @@ impl SwingEngine {
         let liquidity = Self::liquidity_analysis_engine(req, &structure, &atr_vals);
 
         // --- 5. Displacement & FVG Engine ---
-        let displacement = Self::displacement_engine(req, &structure);
-        let fvg_zones = find_imbalance_zones(h1_highs, h1_lows, 10);
+        let displacement = Self::displacement_engine(req, &structure, settings);
+        let fvg_zones = find_imbalance_zones(h1_highs, h1_lows, settings.fvg_lookback);
+
+        // --- 5b. Order Block Engine (NEW) ---
+        let h1_opens = req.h1_opens.as_ref().map(|v| v.as_ref()).unwrap_or(h1_closes.as_ref());
+        let order_blocks = find_order_blocks(
+            h1_highs,
+            h1_lows,
+            h1_opens,
+            h1_closes,
+            settings.swing_lookback * 4 // Look deeper into history for OBs
+        );
 
         // --- NEW: Ensemble Prediction Model Bias ---
         // Load all three models and combine their predictions using confidence weighting.
@@ -112,20 +122,20 @@ impl SwingEngine {
             1.0, // Swing prediction for next D1 period
         );
 
-        let final_prediction_bias = (h1_bias * 0.7) + (d1_bias * 0.3);
+        let final_prediction_bias = (h1_bias * settings.ensemble_h1_weight) + (d1_bias * settings.ensemble_d1_weight);
         debug!(h1_bias, d1_bias, final_bias = final_prediction_bias, "Swing ensemble prediction calculated");
 
         // --- 6. Confluence Scoring ---
         let (long_score, short_score, reason_long, reason_short) = Self::confluence_scoring_engine(
-            htf_bias_score, &liquidity, &displacement, &fvg_zones, req.current_price, last_atr, final_prediction_bias, settings
+            htf_bias_score, &liquidity, &displacement, &fvg_zones, &order_blocks, req.current_price, last_atr, final_prediction_bias, settings
         );
 
         // --- 7. Execution Logic ---
         let conviction_threshold = settings.conviction_threshold; // Lowered to capture Context-only trades (HTF + AI)
         let (entry_type, conviction_score, reason) = if long_score > short_score && long_score >= conviction_threshold {
-            ("long".to_string(), long_score, reason_long)
+            ("long".to_string(), long_score.min(100.0), reason_long)
         } else if short_score > long_score && short_score >= conviction_threshold {
-            ("short".to_string(), short_score, reason_short)
+            ("short".to_string(), short_score.min(100.0), reason_short)
         } else {
             let (leaning_reason, score) = if long_score >= short_score {
                 (reason_long, long_score)
@@ -191,6 +201,9 @@ impl SwingEngine {
             });
         }
 
+        // Merge Order Blocks into liquidity zones
+        liquidity_zones.extend(order_blocks);
+
         // Determine Sweep Detected String
         let sweep_detected = if liquidity.is_sfp_bullish {
             "low_sweep".to_string()
@@ -208,6 +221,7 @@ impl SwingEngine {
         debug_info.insert("ensemble_bias".to_string(), format!("{:.4}", final_prediction_bias));
         debug_info.insert("long_score".to_string(), format!("{:.2}", long_score));
         debug_info.insert("short_score".to_string(), format!("{:.2}", short_score));
+        debug_info.insert("entry_atr".to_string(), format!("{:.5}", last_atr));
 
         // --- Deterministic Signal ID ---
         // We generate a stable ID based on the structural level being traded.
@@ -239,6 +253,7 @@ impl SwingEngine {
             sweep_detected,
             volatility_regime: if last_atr > (avg_atr * 1.5) { "high".to_string() } else { "normal".to_string() },
             debug_info: Some(debug_info),
+            suggested_position_size: Some(1.0), // Standard size for swing
             ..Default::default()
         }
     }
@@ -264,9 +279,9 @@ impl SwingEngine {
     }
 
     /// Identifies key swing points and structural breaks.
-    fn market_structure_engine(highs: &[f64], lows: &[f64], closes: &[f64]) -> MarketStructure {
+    fn market_structure_engine(highs: &[f64], lows: &[f64], closes: &[f64], settings: &SwingSettings) -> MarketStructure {
         let mut structure = MarketStructure::default();
-        let (swing_highs, swing_lows) = find_swing_points(highs, lows, 60, 3);
+        let (swing_highs, swing_lows) = find_swing_points(highs, lows, settings.swing_lookback, settings.swing_neighbors);
 
         if swing_highs.len() < 2 || swing_lows.len() < 2 {
             return structure;
@@ -333,7 +348,7 @@ impl SwingEngine {
     }
 
     /// Validates the strength of a structural break.
-    fn displacement_engine<'a>(req: &EvalRequest<'a>, structure: &MarketStructure) -> Displacement {
+    fn displacement_engine<'a>(req: &EvalRequest<'a>, structure: &MarketStructure, settings: &SwingSettings) -> Displacement {
         let mut disp = Displacement::default();
         let n = req.h1_closes.as_ref().unwrap().len();
         let current_close = req.h1_closes.as_ref().unwrap()[n - 1];
@@ -348,16 +363,16 @@ impl SwingEngine {
 
         if structure.is_bos_bullish || structure.is_choch_bullish {
             disp.is_bullish = true;
-            if body_size > last_atr * 0.7 { disp.strength += 50.0; } // Strong body
-            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), 14).last().cloned().unwrap_or(50.0);
-            if rsi_val > 55.0 { disp.strength += 30.0; } // Momentum confirmation
+            if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; } // Strong body
+            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
+            if rsi_val > settings.displacement_rsi_threshold_bull { disp.strength += settings.displacement_rsi_bonus; } // Momentum confirmation
         }
 
         if structure.is_bos_bearish || structure.is_choch_bearish {
             disp.is_bearish = true;
-            if body_size > last_atr * 0.7 { disp.strength += 50.0; }
-            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), 14).last().cloned().unwrap_or(50.0);
-            if rsi_val < 45.0 { disp.strength += 30.0; }
+            if body_size > last_atr * settings.displacement_atr_mult { disp.strength += settings.displacement_strength_bonus; }
+            let rsi_val = rsi(req.h1_closes.as_ref().unwrap().as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
+            if rsi_val < settings.displacement_rsi_threshold_bear { disp.strength += settings.displacement_rsi_bonus; }
         }
         disp
     }
@@ -368,6 +383,7 @@ impl SwingEngine {
         liquidity: &LiquidityAnalysis,
         displacement: &Displacement,
         fvg_zones: &Vec<PriceLevel>,
+        order_blocks: &Vec<PriceLevel>,
         current_price: f64,
         last_atr: f64,
         final_prediction_bias: f64,
@@ -421,6 +437,21 @@ impl SwingEngine {
                 short_score += settings.fvg_weight;
                 reason_short.push("Bearish FVG Resistance");
             }
+        }
+
+        // 5. Order Block Alignment (Weight: 25)
+        if displacement.is_bullish {
+             if order_blocks.iter().any(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998) {
+                 long_score += 25.0;
+                 reason_long.push("Bullish Order Block Test");
+             }
+        }
+
+        if displacement.is_bearish {
+             if order_blocks.iter().any(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002) {
+                 short_score += 25.0;
+                 reason_short.push("Bearish Order Block Test");
+             }
         }
 
         if final_prediction_bias > 0.0 {
