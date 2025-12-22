@@ -47,7 +47,7 @@ pub struct FractalGuardResult {
 pub struct SwingEngine;
 
 impl SwingEngine {
-    pub fn evaluate<'a>(req: &EvalRequest<'a>, predictor_cache: &PredictorCache, settings: &SwingSettings) -> EvalResponse {
+    pub fn evaluate<'a>(req: &EvalRequest<'a>, predictor_cache: &PredictorCache, settings: &SwingSettings, risk_settings: &crate::config::RiskSettings) -> EvalResponse {
         // --- 0. Data Validation ---
         let (Some(h1_closes), Some(h1_highs), Some(h1_lows)) = (&req.h1_closes, &req.h1_highs, &req.h1_lows) else {
             return EvalResponse { reason: "Missing H1 Data".to_string(), ..Default::default() };
@@ -200,10 +200,26 @@ impl SwingEngine {
         // --- 8. Risk Model ---
         let (sl_price, tp1_price, tp2_price) = if entry_type != "none" {
             Self::risk_model(
-                &entry_type, &reason, execution_price, last_atr, h1_highs[n-1], h1_lows[n-1], settings
+                &entry_type, &reason, execution_price, last_atr, &structure, h1_highs[n-1], h1_lows[n-1], settings
             )
         } else {
             (0.0, 0.0, 0.0)
+        };
+
+        // --- NEW: Position Sizing ---
+        let suggested_position_size = if sl_price != 0.0 && execution_price != 0.0 {
+            let sl_distance = (execution_price - sl_price).abs();
+            if sl_distance > 0.0 {
+                let risk_amount_per_trade = risk_settings.account_equity * risk_settings.risk_per_trade_pct;
+                let risk_per_lot = sl_distance * risk_settings.xauusd_lot_point_value;
+                let lot_size = risk_amount_per_trade / risk_per_lot;
+                // Round to 2 decimal places, typical for lot sizes
+                Some((lot_size * 100.0).round() / 100.0)
+            } else {
+                Some(0.01) // Fallback to minimum lot size if SL is somehow zero
+            }
+        } else {
+            Some(0.0)
         };
 
         // --- 9. Data Population for Response ---
@@ -278,8 +294,8 @@ impl SwingEngine {
             order_blocks,
             sweep_detected,
             volatility_regime: if last_atr > (avg_atr * 1.5) { "high".to_string() } else { "normal".to_string() },
-            debug_info: Some(debug_info),
-            suggested_position_size: Some(1.0), // Standard size for swing
+            debug_info: Some(debug_info), 
+            suggested_position_size,
             ..Default::default()
         }
     }
@@ -549,20 +565,34 @@ impl SwingEngine {
         reason: &str,
         entry_price: f64,
         last_atr: f64,
+        structure: &MarketStructure,
         current_high: f64,
         current_low: f64,
         settings: &SwingSettings,
     ) -> (f64, f64, f64) {
         if entry_type == "long" {
-            // For SFP, SL goes below the liquidity wick. For BOS, below the breakout candle.
-            let sl_anchor = if reason.contains("SFP") { current_low } else { current_low };
+            // For SFP, SL goes below the liquidity wick (current_low).
+            // For Structure/Trend, SL goes below the structural low (external_low) to give swing room.
+            let sl_anchor = if reason.contains("SFP") { 
+                current_low 
+            } else { 
+                // Use structural low if valid (below entry), otherwise fallback to candle low
+                if structure.external_low.1 < entry_price { structure.external_low.1 } else { current_low }
+            };
+
             let sl = sl_anchor - (last_atr * settings.sl_atr_buffer); // Small buffer below the low
             let risk = (entry_price - sl).abs();
             let tp1 = entry_price + risk * settings.risk_reward_ratio_tp1; // Aim for 1:2 R:R
             let tp2 = entry_price + risk * settings.risk_reward_ratio_tp2; // Aim for 1:4 R:R
             (sl, tp1, tp2)
         } else { // "short"
-            let sl_anchor = if reason.contains("SFP") { current_high } else { current_high };
+            let sl_anchor = if reason.contains("SFP") { 
+                current_high 
+            } else { 
+                // Use structural high if valid (above entry)
+                if structure.external_high.1 > entry_price { structure.external_high.1 } else { current_high }
+            };
+
             let sl = sl_anchor + (last_atr * settings.sl_atr_buffer);
             let risk = (entry_price - sl).abs();
             let tp1 = entry_price - risk * settings.risk_reward_ratio_tp1;

@@ -28,7 +28,7 @@ pub mod services;
 
 use prometheus::{register_counter, register_counter_vec, register_gauge};
 use xau_scalper_server::config::Settings;
-use xau_scalper_server::config::{TradingSettings, ScalpSettings, SwingSettings};
+use xau_scalper_server::config::{TradingSettings, ScalpSettings, SwingSettings, RiskSettings};
 use xau_scalper_server::engines::news_guard::GuardResult;
 use xau_scalper_server::macro_analysis::types::{MacroOutlook, Bias};
 use crate::state::*;
@@ -58,7 +58,7 @@ use crate::routes::ChatRequest;
         handlers::trading::get_news_guard_status_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -112,9 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signal_counter, active_sessions, active_ws_clients, http_requests, gemini_429_errors, gemini_success_model
     };
 
+    // 1. Create a channel to broadcast live market data AND signals to WebSocket clients.
+    // Increased buffer size to 10,000 to prevent 'Lagged' errors during high volatility
+    // when mixing high-frequency ticks with critical signals.
+    let (tick_tx, _) = broadcast::channel::<String>(10000);
+
     // Initialize the shared state
     let shared_state = ApplicationState {
-        session_manager: SessionManager::new(config.trading.clone()),
+        session_manager: SessionManager::new(config.trading.clone(), tick_tx.clone()),
         predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::new(config.paths.models_dir.clone()),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
         // Use the tokens loaded from the file
@@ -146,7 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match fs::read_to_string(&path).await {
                     Ok(content) => {
                         match serde_json::from_str::<TradingSession>(&content) {
-                            Ok(session) => {
+                            Ok(mut session) => {
+                                session.broadcast_tx = Some(tick_tx.clone());
                                 tracing::info!("Loaded session for {} from disk.", session.symbol);
                                 shared_state.session_manager.sessions.insert(session.symbol.clone(), Arc::new(Mutex::new(session)));
                             },
@@ -160,9 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Phase 2: Real-time Data Gateway ---
-
-    // 1. Create a channel to broadcast live market data from MT5 to WebSocket clients.
-    let (tick_tx, _) = broadcast::channel::<String>(100);
 
     // Add the tick_tx channel to the application state so the handler can access it.
     let app_state_with_ticks = Arc::new(shared_state.with_ticks(tick_tx));

@@ -4,7 +4,14 @@ docker run --rm xau-scalper-v4:latest backtest --m1-file /app/m1_data_comma.csv 
 
 # from repo root
 cd rust-server
-cargo build --release
+cargo build --release 
+
+#python 
+.\venv\Scripts\Activate.ps1
+python xau_controller.py  
+
+#Docker containiazation
+
 
 
 Best Result (Optimized for Sharpe Ratio) ---

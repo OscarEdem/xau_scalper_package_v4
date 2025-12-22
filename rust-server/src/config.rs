@@ -16,10 +16,36 @@ pub struct ServerSettings {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+pub struct RiskSettings {
+    #[serde(default = "default_account_equity")]
+    pub account_equity: f64,
+    #[serde(default = "default_risk_per_trade_pct")]
+    pub risk_per_trade_pct: f64,
+    #[serde(default = "default_xauusd_lot_point_value")]
+    pub xauusd_lot_point_value: f64, // Value of a 1.0 price move for a 1.0 lot size trade. For XAUUSD, this is typically $100.
+}
+
+fn default_account_equity() -> f64 { 100000.0 }
+fn default_risk_per_trade_pct() -> f64 { 0.01 } // 1%
+fn default_xauusd_lot_point_value() -> f64 { 100.0 }
+
+impl Default for RiskSettings {
+    fn default() -> Self {
+        Self {
+            account_equity: default_account_equity(),
+            risk_per_trade_pct: default_risk_per_trade_pct(),
+            xauusd_lot_point_value: default_xauusd_lot_point_value(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct TradingSettings {
     pub max_buffer_size: usize,
     #[serde(default = "default_sync_threshold")]
     pub sync_threshold: usize,
+    #[serde(default)]
+    pub risk: RiskSettings,
     #[serde(default)]
     pub scalp: ScalpSettings,
     #[serde(default)]
@@ -42,6 +68,7 @@ impl Default for TradingSettings {
         Self {
             max_buffer_size: 500,
             sync_threshold: 100,
+            risk: Default::default(),
             scalp: Default::default(),
             swing: Default::default(),
         }
@@ -52,6 +79,9 @@ impl TradingSettings {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_buffer_size < 100 {
             return Err(format!("max_buffer_size must be at least 100, got {}", self.max_buffer_size));
+        }
+        if self.risk.risk_per_trade_pct <= 0.0 || self.risk.risk_per_trade_pct > 0.1 {
+             return Err(format!("risk_per_trade_pct should be between 0.0 and 0.1 (10%), got {}", self.risk.risk_per_trade_pct));
         }
         self.scalp.validate()?;
         self.swing.validate()?;
@@ -127,6 +157,10 @@ pub struct ScalpSettings {
     pub momentum_min_risk_atr: f64,
     #[serde(default)]
     pub filter_scalp_by_swing: bool,
+    #[serde(default = "default_push_notifications_enabled")]
+    pub push_notifications_enabled: bool,
+    #[serde(default = "default_push_notification_threshold")]
+    pub push_notification_threshold: f64,
 }
 
 impl Default for ScalpSettings {
@@ -185,6 +219,8 @@ impl Default for ScalpSettings {
             inducement_opposing_reduction: 0.5,
             momentum_min_risk_atr: 0.35,
             filter_scalp_by_swing: false,
+            push_notifications_enabled: true,
+            push_notification_threshold: 60.0,
         }
     }
 }
@@ -193,6 +229,9 @@ impl ScalpSettings {
     pub fn validate(&self) -> Result<(), String> {
         if self.min_conviction < 0.0 || self.min_conviction > 100.0 {
             return Err(format!("Scalp min_conviction must be between 0.0 and 100.0, got {}", self.min_conviction));
+        }
+        if self.push_notification_threshold < 0.0 || self.push_notification_threshold > 100.0 {
+            return Err(format!("Scalp push_notification_threshold must be between 0.0 and 100.0, got {}", self.push_notification_threshold));
         }
         Ok(())
     }
@@ -243,6 +282,10 @@ pub struct SwingSettings {
     pub m15_swing_lookback: usize,
     #[serde(default = "default_fractal_penalty")]
     pub fractal_penalty_score: f64,
+    #[serde(default = "default_push_notifications_enabled")]
+    pub push_notifications_enabled: bool,
+    #[serde(default = "default_push_notification_threshold")]
+    pub push_notification_threshold: f64,
 }
 
 impl Default for SwingSettings {
@@ -288,6 +331,8 @@ impl Default for SwingSettings {
             fractal_guard_enabled: true,
             m15_swing_lookback: 6,
             fractal_penalty_score: 25.0,
+            push_notifications_enabled: true,
+            push_notification_threshold: 60.0,
         }
     }
 }
@@ -295,11 +340,16 @@ impl Default for SwingSettings {
 fn default_fractal_guard_enabled() -> bool { true }
 fn default_m15_swing_lookback() -> usize { 6 }
 fn default_fractal_penalty() -> f64 { 25.0 }
+fn default_push_notifications_enabled() -> bool { true }
+fn default_push_notification_threshold() -> f64 { 60.0 }
 
 impl SwingSettings {
     pub fn validate(&self) -> Result<(), String> {
         if self.conviction_threshold < 0.0 || self.conviction_threshold > 100.0 {
             return Err(format!("Swing conviction_threshold must be between 0.0 and 100.0, got {}", self.conviction_threshold));
+        }
+        if self.push_notification_threshold < 0.0 || self.push_notification_threshold > 100.0 {
+            return Err(format!("Swing push_notification_threshold must be between 0.0 and 100.0, got {}", self.push_notification_threshold));
         }
         Ok(())
     }

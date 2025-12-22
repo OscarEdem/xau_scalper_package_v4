@@ -159,7 +159,7 @@ pub async fn process_data_handler(
     let mut session = session_arc.lock().await;
 
     // 3. Process data (updates session state for /signals/{symbol} and /signals/latest)
-    let signals = session.on_data(req, &state.inner.predictor_cache, &settings);
+    let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.session_manager.settings);
 
     // 4. Save to history (for /signals)
     if !signals.is_empty() {

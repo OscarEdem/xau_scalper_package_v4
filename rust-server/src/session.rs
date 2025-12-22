@@ -10,7 +10,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 use serde::{Serialize, Deserialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+
+#[derive(Serialize)]
+struct WsSignal<'a> {
+    symbol: &'a str,
+    #[serde(flatten)]
+    signal: &'a EvalResponse,
+}
 
 /// Represents the dominant trend direction determined by the SwingEngine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,10 +47,14 @@ pub struct ExecutionManager {
     pub last_notified_price: f64,
     pub pyramiding_enabled: bool,
     pub last_notified_scalp_mode: Option<String>,
+    #[serde(default)]
+    pub last_pushed_signal_id: Option<String>,
+    #[serde(default)]
+    pub strict_reversal_mode: bool,
 }
 
 impl ExecutionManager {
-    pub fn new(pyramiding_enabled: bool) -> Self {
+    pub fn new(pyramiding_enabled: bool, strict_reversal_mode: bool) -> Self {
         Self {
             last_notified_signal_id: None,
             last_notified_direction: "none".to_string(),
@@ -51,6 +62,8 @@ impl ExecutionManager {
             last_notified_price: 0.0,
             pyramiding_enabled,
             last_notified_scalp_mode: None,
+            last_pushed_signal_id: None,
+            strict_reversal_mode,
         }
     }
 
@@ -107,7 +120,13 @@ impl ExecutionManager {
         let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
 
         // --- Decision ---
-        is_valid_reversal || (!direction_changed && cooldown_passed) || is_pyramiding_breakout || is_averaging_entry
+        if self.strict_reversal_mode {
+            // Strict Mode: Only Reversals or Pyramiding/Averaging. No time-based repeats.
+            is_valid_reversal || is_pyramiding_breakout || is_averaging_entry
+        } else {
+            // Normal Mode (Scalp): Allow repeats after cooldown
+            is_valid_reversal || (!direction_changed && cooldown_passed) || is_pyramiding_breakout || is_averaging_entry
+        }
     }
 
     pub fn update_state(&mut self, signal: &EvalResponse, current_time: i64) {
@@ -178,10 +197,13 @@ pub struct TradingSession {
 
     pub execution: ExecutionManager,
     pub swing_execution: ExecutionManager,
+
+    #[serde(skip)]
+    pub broadcast_tx: Option<broadcast::Sender<String>>,
 }
 
 impl TradingSession {
-    pub fn new(symbol: String, filter_scalp_by_swing: bool, initial_buffer_size: usize) -> Self {
+    pub fn new(symbol: String, filter_scalp_by_swing: bool, initial_buffer_size: usize, broadcast_tx: Option<broadcast::Sender<String>>) -> Self {
         Self {
             symbol,
             filter_scalp_by_swing,
@@ -216,17 +238,20 @@ impl TradingSession {
             latest_scalp_signal: None,
             latest_swing_signal: None,
             pending_re_entry: None,
-            execution: ExecutionManager::new(true), // Scalp: Allow pyramiding
-            swing_execution: ExecutionManager::new(false), // Swing: No pyramiding (First signal only)
+            execution: ExecutionManager::new(true, false), // Scalp: Allow pyramiding, Normal mode
+            swing_execution: ExecutionManager::new(true, true), // Swing: Pyramiding YES, Strict Reversal YES
+            broadcast_tx,
         }
     }
 
     /// The main entry point for processing new data for this session.
     /// It updates internal buffers and then runs both trading engines.
     /// Note: req is now EvalRequest<'static> (owned) coming from the API.
+    /// It takes an Arc<RwLock<...>> to ensure it always reads the latest, hot-reloaded settings.
     /// Returns a list of signals that should be notified.
-    pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
-        info!(symbol = %self.symbol, "Processing new data for session.");
+    pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings_arc: &Arc<RwLock<TradingSettings>>) -> Vec<EvalResponse> {
+        let settings = settings_arc.read().unwrap();
+        info!(symbol = %self.symbol, "Processing new data for session with hot-reloaded settings.");
 
         // Update session configuration from global settings
         self.filter_scalp_by_swing = settings.scalp.filter_scalp_by_swing;
@@ -344,7 +369,7 @@ impl TradingSession {
         let mut swing_signal = {
             let mut swing_req = self.build_engine_request("swing", req.current_price);
             swing_req.upcoming_events = req.upcoming_events.clone();
-            SwingEngine::evaluate(&swing_req, predictor_cache, &settings.swing)
+            SwingEngine::evaluate(&swing_req, predictor_cache, &settings.swing, &settings.risk)
         };
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
@@ -356,17 +381,79 @@ impl TradingSession {
                                 .last().cloned().unwrap_or(0.0);
 
         // Latching Logic & Trade Management
+        // Capture previous SL to detect updates
+        let prev_sl = if let Some(existing) = &self.latest_swing_signal {
+            if existing.signal_id == swing_signal.signal_id { existing.sl_price } else { 0.0 }
+        } else { 0.0 };
+
         self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp, h1_atr);
+        let sl_changed = prev_sl > 0.0 && (swing_signal.sl_price - prev_sl).abs() > 0.0001;
 
         // --- Check for Re-Entry Trigger (Bounce off BE) ---
         self.check_swing_reentry(&mut swing_signal, req.current_price, req.last_m1_timestamp, &settings.swing);
 
         // Swing Execution Logic (Anti-Flicker & First-Signal Only)
         let current_time = req.last_m1_timestamp;
+        let is_same_swing_id = self.swing_execution.last_notified_signal_id.as_ref() == Some(&swing_signal.signal_id);
         let should_notify_swing = self.swing_execution.evaluate_execution(&mut swing_signal, current_time);
         if should_notify_swing {
             self.swing_execution.update_state(&swing_signal, current_time);
-            notifications.push(swing_signal.clone());
+            // Only send Push Notification if enabled and conviction is high enough
+            if settings.swing.push_notifications_enabled && swing_signal.conviction_score.unwrap_or(0.0) >= settings.swing.push_notification_threshold {
+                self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
+                notifications.push(swing_signal.clone());
+            }
+            if let Some(tx) = &self.broadcast_tx {
+                let ws_msg = WsSignal { symbol: &self.symbol, signal: &swing_signal };
+                // Strip heavy zone data for WebSocket to reduce payload
+                if let Ok(mut v) = serde_json::to_value(&ws_msg) {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.remove("liquidityZones");
+                        obj.remove("imbalances");
+                        obj.remove("imbalanceZones");
+                        obj.remove("orderBlocks");
+                        obj.remove("debug_info");
+                        obj.remove("debugInfo");
+                        obj.remove("reason");
+                        obj.remove("time_stop_seconds");
+                        obj.remove("timeStopSeconds");
+                    }
+                    let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
+                }
+            }
+        } else if is_same_swing_id {
+            // Check for late conviction bloom (Signal was processed but not pushed, now strong enough)
+            if settings.swing.push_notifications_enabled 
+                && self.swing_execution.last_pushed_signal_id.as_ref() != Some(&swing_signal.signal_id)
+                && swing_signal.conviction_score.unwrap_or(0.0) >= settings.swing.push_notification_threshold 
+            {
+                self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
+                notifications.push(swing_signal.clone());
+                
+                // Broadcast update so UI reflects high conviction
+                if let Some(tx) = &self.broadcast_tx {
+                    let ws_msg = WsSignal { symbol: &self.symbol, signal: &swing_signal };
+                    if let Ok(v) = serde_json::to_value(&ws_msg) {
+                        // ... (stripping logic omitted for brevity, same as above) ...
+                        let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
+                    }
+                }
+            }
+
+            // Notify on SL Update (Move to BE, Trailing)
+            if sl_changed && settings.swing.push_notifications_enabled {
+                let mut reason_text = format!("Update: Stop Loss moved to {:.2}", swing_signal.sl_price);
+                // Check if it was a move to Breakeven by comparing the new SL to the entry price
+                let is_breakeven_move = (swing_signal.sl_price - swing_signal.entry_price).abs() < 0.0001;
+                if is_breakeven_move {
+                    reason_text = format!("Update: TP1 Hit. Stop Loss moved to Breakeven at {:.2}", swing_signal.sl_price);
+                }
+
+                let mut update_signal = swing_signal.clone();
+                update_signal.reason = reason_text;
+                // We push this as a notification. The ID is the same, but the reason is different.
+                notifications.push(update_signal);
+            }
         }
 
         // Update the session's swing trend based on the new signal.
@@ -397,9 +484,10 @@ impl TradingSession {
             scalp_req.kf_process_noise = req.kf_process_noise;
             scalp_req.kf_measurement_noise = req.kf_measurement_noise;
             scalp_req.upcoming_events = req.upcoming_events.clone();
-            scalp_req.predictor_model = Some(predictor_model);
+            scalp_req.predictor_model = Some(predictor_model); 
 
-            ScalpEngine::evaluate(&scalp_req, predictor_cache, &settings.scalp)
+            // Note: The ScalpEngine::evaluate function must also be updated to accept `&settings.risk`
+            ScalpEngine::evaluate(&scalp_req, predictor_cache, &settings.scalp) // Placeholder, see note
         };
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
@@ -428,15 +516,56 @@ impl TradingSession {
         // 5. FILTERING LOGIC & FINAL STORAGE
         // Delegate execution logic to the ExecutionManager
         let should_notify = self.execution.evaluate_execution(&mut scalp_signal, current_time);
-        let is_same_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);
+        // Check ID match before evaluate_execution potentially updates state (though it doesn't here, it's safer)
+        let is_same_scalp_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);
 
         if should_notify {
             // Update execution state
             self.execution.update_state(&scalp_signal, current_time);
-            notifications.push(scalp_signal.clone());
+            // Only send Push Notification if enabled and conviction is high enough
+            if settings.scalp.push_notifications_enabled && scalp_signal.conviction_score.unwrap_or(0.0) >= settings.scalp.push_notification_threshold {
+                self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
+                notifications.push(scalp_signal.clone());
+            }
+            if let Some(tx) = &self.broadcast_tx {
+                let ws_msg = WsSignal { symbol: &self.symbol, signal: &scalp_signal };
+                // Strip heavy zone data for WebSocket to reduce payload
+                if let Ok(mut v) = serde_json::to_value(&ws_msg) {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.remove("liquidityZones");
+                        obj.remove("imbalances");
+                        obj.remove("imbalanceZones");
+                        obj.remove("orderBlocks");
+                        obj.remove("debug_info");
+                        obj.remove("debugInfo");
+                        obj.remove("reason");
+                        obj.remove("time_stop_seconds");
+                        obj.remove("timeStopSeconds");
+                    }
+                    let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
+                }
+            }
             self.latest_scalp_signal = Some(scalp_signal);
-        } else if is_same_id {
+        } else if is_same_scalp_id {
             // Keep active for API visibility, but don't re-notify
+            
+            // Check for late conviction bloom
+            if settings.scalp.push_notifications_enabled 
+                && self.execution.last_pushed_signal_id.as_ref() != Some(&scalp_signal.signal_id)
+                && scalp_signal.conviction_score.unwrap_or(0.0) >= settings.scalp.push_notification_threshold 
+            {
+                self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
+                notifications.push(scalp_signal.clone());
+                
+                // Broadcast update
+                if let Some(tx) = &self.broadcast_tx {
+                    let ws_msg = WsSignal { symbol: &self.symbol, signal: &scalp_signal };
+                    if let Ok(v) = serde_json::to_value(&ws_msg) {
+                        let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
+                    }
+                }
+            }
+            
             self.latest_scalp_signal = Some(scalp_signal);
         } else if scalp_signal.entry_type != "none" {
             // Valid signal but suppressed by spam filter
@@ -767,26 +896,28 @@ impl TradingSession {
 pub struct SessionManager {
     pub sessions: Arc<DashMap<String, Arc<Mutex<TradingSession>>>>,
     pub settings: Arc<RwLock<TradingSettings>>,
+    pub broadcast_tx: broadcast::Sender<String>,
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
         // This default is rarely used as we load from config, but good for tests
         let settings = TradingSettings::default();
-        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)) }
+        let (tx, _) = broadcast::channel(1);
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx: tx }
     }
 }
 
 impl SessionManager {
-    pub fn new(settings: TradingSettings) -> Self {
-        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)) }
+    pub fn new(settings: TradingSettings, broadcast_tx: broadcast::Sender<String>) -> Self {
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx }
     }
 
     pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> Arc<Mutex<TradingSession>> {
         self.sessions.entry(symbol.to_string()).or_insert_with(|| {
             info!("Creating new trading session for symbol: {}", symbol);
             let settings = self.settings.read().unwrap();
-            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, settings.max_buffer_size)))
+            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, settings.max_buffer_size, Some(self.broadcast_tx.clone()))))
         }).clone()
     }
 

@@ -60,15 +60,11 @@ impl TradingService {
             let session_arc = state_clone.inner.session_manager.get_or_create_session(&symbol, filter_scalp_by_swing);
             state_clone.inner.metrics.active_sessions.set(state_clone.inner.session_manager.sessions.len() as f64);
             
-            // Get settings snapshot for this execution
-            let settings_guard = state_clone.inner.session_manager.settings.read().expect("Settings lock poisoned");
-            let settings = &*settings_guard;
-
             // Lock the specific session using blocking_lock since we are in a blocking thread
             let mut session = session_arc.blocking_lock();
 
             // Process data (Heavy CPU work happens here)
-            let new_signals = session.on_data(req, &state_clone.inner.predictor_cache, settings);
+            let new_signals = session.on_data(req, &state_clone.inner.predictor_cache, &state_clone.inner.session_manager.settings);
 
             // Add to history
             let mut history = state_clone.inner.signal_history.blocking_lock();
