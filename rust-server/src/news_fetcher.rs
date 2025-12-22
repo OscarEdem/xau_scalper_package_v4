@@ -79,7 +79,7 @@ pub fn parse_forexfactory_datetime_to_utc(date_str: &str) -> Option<i64> {
 
 /// Fetches the entire economic calendar for the week, filtering only by impact.
 pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
-    let client = match Client::builder().user_agent("xau_scalper_ml/1.0").build() {
+    let client = match Client::builder().user_agent("Mozilla/5.0 (compatible; xau_scalper_ml/1.0)").build() {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to build reqwest client: {}", e);
@@ -100,7 +100,7 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
                     response = Some(res);
                     break;
                 } else if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let wait_secs = 30 * (attempt + 1);
+                    let wait_secs = 60 * (attempt + 1);
                     error!("Forex Factory returned 429 Too Many Requests. Retrying in {} seconds...", wait_secs);
                     tokio::time::sleep(std::time::Duration::from_secs(wait_secs as u64)).await;
                 } else {

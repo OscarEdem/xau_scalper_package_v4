@@ -78,13 +78,19 @@ pub fn spawn_news_fetch_task(state: Arc<ApplicationStateWithTicks>, mut shutdown
         *state.inner.news_events.lock().await = initial_events;
 
         loop {
-            // Then, fetch every 6 hours
+            // Adjust interval: If we have no news (failed fetch), retry sooner (e.g., 5 mins).
+            let fetch_interval_secs = if state.inner.news_events.lock().await.is_empty() {
+                300
+            } else {
+                6 * 3600
+            };
+
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("News fetch task shutting down.");
                     break;
                 }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)) => {}
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(fetch_interval_secs)) => {}
             }
 
             info!("Periodically fetching weekly news events from Forex Factory...");
