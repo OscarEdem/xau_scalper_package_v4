@@ -552,8 +552,8 @@ pub fn atr_pulse(atr_vals: &[f64], lookback: usize, factor: f64) -> bool {
     atr_vals[n - 1] > median * factor
 }
 
-/// Determines the trend bias based on an EMA.
-/// Returns 1 for bullish, -1 for bearish, 0 for neutral/insufficient data.
+/// Determines the trend bias based on an EMA.........................
+/// Returns 1 for bullish, -1 for bearish, 0 for neutral/insufficient data.............
 pub fn get_trend_bias(closes: &[f64], period: usize) -> i8 {
     let n = closes.len();
     if n < period + 2 {
