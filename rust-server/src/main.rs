@@ -79,6 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Settings::new().expect("Failed to load configuration");
     tracing::info!("Configuration loaded. Max buffer size: {}", config.trading.max_buffer_size);
 
+    // Log if we are using a persistent override so you know your API changes are active
+    let persistent_config_path = format!("{}/config.toml", config.paths.sessions_dir);
+    if fs::try_exists(&persistent_config_path).await.unwrap_or(false) {
+        tracing::info!("Active configuration is being overridden by persistent settings found in: {}", persistent_config_path);
+    }
+
     // --- NEW: Load push tokens from file on startup ---
     let initial_push_tokens = match fs::read_to_string(&config.paths.push_tokens_file).await {
         Ok(content) => {

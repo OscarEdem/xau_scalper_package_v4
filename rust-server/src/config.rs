@@ -366,6 +366,11 @@ impl Settings {
             .set_default("paths.sessions_dir", "./sessions_data")?
             // Look for config.toml in the current directory
             .add_source(File::with_name("config").required(false))
+            // Look for config.toml in the standard Render secrets directory
+            .add_source(File::with_name("/etc/secrets/config").required(false))
+            // Look for config.toml in the persistent data directory (to load API updates on restart)
+            .add_source(File::with_name("/data/sessions/config").required(false)) 
+            .add_source(File::with_name("./sessions_data/config").required(false))
             // Allow override with env vars (e.g. APP_SERVER__PORT=3000)
             .add_source(Environment::with_prefix("APP").separator("__"))
             .build()?;

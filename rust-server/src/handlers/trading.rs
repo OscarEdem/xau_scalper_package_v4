@@ -5,13 +5,12 @@ use axum::{
 };
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use chrono::Utc;
 use xau_scalper_server::EvalRequest;
 use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
-    ApplicationStateWithTicks, ActiveSignal, HistoricalSignal, LatestSignalsForSymbol,
+    ApplicationStateWithTicks, HistoricalSignal, LatestSignalsForSymbol,
     SignalDefinitionsResponse, SignalReasonInfo
 };
 
@@ -146,35 +145,12 @@ pub async fn process_data_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<EvalRequest<'static>>,
 ) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
-    state.inner.metrics.http_requests.inc();
-
-    let symbol = req.symbol.to_string();
-
-    // 1. Access settings to get filter flag
-    let settings = state.inner.session_manager.settings.read().expect("Settings lock poisoned").clone();
-    let filter_scalp = settings.scalp.filter_scalp_by_swing;
-
-    // 2. Get or create session
-    let session_arc = state.inner.session_manager.get_or_create_session(&symbol, filter_scalp);
-    let mut session = session_arc.lock().await;
-
-    // 3. Process data (updates session state for /signals/{symbol} and /signals/latest)
-    let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.session_manager.settings);
-
-    // 4. Save to history (for /signals)
-    if !signals.is_empty() {
-        let count = signals.len();
-        state.inner.total_signals_generated.fetch_add(count, Ordering::SeqCst);
-        state.inner.metrics.signal_counter.inc_by(count as f64);
-
-        let mut history = state.inner.signal_history.lock().await;
-        for signal in signals {
-            let active_signal = ActiveSignal { symbol: symbol.clone(), signal };
-            let historical_signal = HistoricalSignal { signal: active_signal, created_at: Utc::now().timestamp() };
-            history.push_front(historical_signal);
-        }
-    }
-
+    // The service handles all logic including metrics, history, and notifications.
+    let service = crate::services::trading::TradingService::new(state);
+    
+    // Delegate the entire processing to the service, which will offload to a background thread.
+    service.process_eval_request(req).await?;
+    
     Ok((StatusCode::OK, Json("Data processed")))
 }
 

@@ -142,21 +142,41 @@ pub async fn update_settings_handler(
     post,
     path = "/settings/reset",
     responses(
-        (status = 200, description = "Settings reset to defaults successfully", body = String)
+        (status = 200, description = "Settings reset to base config file successfully, undoing any API changes.", body = String),
+        (status = 500, description = "Failed to reset settings.", body = String)
     )
 )]
 pub async fn reset_settings_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
 ) -> (StatusCode, Json<String>) {
-    tracing::info!("Received request to reset trading settings to defaults.");
-    let default_settings = TradingSettings::default();
-    state.inner.session_manager.update_settings(default_settings.clone()).await;
+    tracing::info!("Received request to reset trading settings to base config file.");
 
-    if let Err(e) = persist_config(&default_settings, &state.inner.config.paths.sessions_dir).await {
-        tracing::error!("Failed to persist default settings to config file: {}", e);
+    // 1. Delete the persistent override file.
+    let persistent_config_path = format!("{}/config.toml", &state.inner.config.paths.sessions_dir);
+    if let Err(e) = fs::remove_file(&persistent_config_path).await {
+        // It's okay if the file doesn't exist (already reset), but log other errors.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!("Failed to delete persistent settings file at {}: {}", persistent_config_path, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Failed to delete persistent settings: {}", e)));
+        }
+    } else {
+        tracing::info!("Successfully deleted persistent settings override file at {}", persistent_config_path);
     }
 
-    (StatusCode::OK, Json("Settings reset to defaults successfully".to_string()))
+    // 2. Reload settings from the base config files (e.g., config.toml or /etc/secrets/config.toml).
+    // This re-runs the logic in Settings::new() which will now not find the override file.
+    match xau_scalper_server::config::Settings::new() {
+        Ok(base_config) => {
+            // 3. Update the in-memory settings with the reloaded ones.
+            state.inner.session_manager.update_settings(base_config.trading).await;
+            tracing::info!("Successfully reloaded settings from base config file.");
+            (StatusCode::OK, Json("Settings reset to base config file successfully".to_string()))
+        }
+        Err(e) => {
+            tracing::error!("Failed to reload base configuration after deleting override: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Failed to reload base configuration: {}", e)))
+        }
+    }
 }
 
 #[utoipa::path(

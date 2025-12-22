@@ -46,8 +46,8 @@ impl TradingService {
         let news = news_guard.clone();
         req.upcoming_events = Some(std::borrow::Cow::Owned(news));
 
-        // For now, we assume a global config for filtering. This could also be part of the request.
-        let filter_scalp_by_swing = true;
+        // Read the setting from the live config
+        let filter_scalp_by_swing = self.state.inner.session_manager.settings.read().unwrap().scalp.filter_scalp_by_swing;
 
         // --- PERFORMANCE FIX: Offload heavy math to a blocking thread ---
         let state_clone = self.state.clone();
