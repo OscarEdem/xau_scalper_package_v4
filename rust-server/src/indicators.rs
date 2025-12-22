@@ -186,6 +186,8 @@ pub struct EvalResponse {
     pub expiration_seconds: Option<u64>, // Cancel limit if not filled in X seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<HashMap<String, String>>,
+    #[serde(skip)]
+    pub should_push: bool,
 }
 
 impl Default for EvalResponse {
@@ -214,6 +216,7 @@ impl Default for EvalResponse {
             limit_order_price: 0.0,
             expiration_seconds: None,
             debug_info: None,
+            should_push: false,
         }
     }
 }

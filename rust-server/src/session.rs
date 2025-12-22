@@ -69,7 +69,7 @@ impl ExecutionManager {
 
     /// Evaluates if a signal should be broadcasted based on execution rules.
     /// Returns true if the signal is valid for notification.
-    pub fn evaluate_execution(&mut self, signal: &mut EvalResponse, current_time: i64) -> bool {
+    pub fn evaluate_execution(&mut self, signal: &mut EvalResponse, current_time: i64, reversal_threshold: f64) -> bool {
         if signal.entry_type == "none" {
             return false;
         }
@@ -117,7 +117,7 @@ impl ExecutionManager {
 
         // --- Reversal Logic ---
         let is_rapid_reversal = direction_changed && time_diff < 180;
-        let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction > 60.0);
+        let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction >= reversal_threshold);
 
         // --- Decision ---
         if self.strict_reversal_mode {
@@ -395,14 +395,15 @@ impl TradingSession {
         // Swing Execution Logic (Anti-Flicker & First-Signal Only)
         let current_time = req.last_m1_timestamp;
         let is_same_swing_id = self.swing_execution.last_notified_signal_id.as_ref() == Some(&swing_signal.signal_id);
-        let should_notify_swing = self.swing_execution.evaluate_execution(&mut swing_signal, current_time);
+        let should_notify_swing = self.swing_execution.evaluate_execution(&mut swing_signal, current_time, settings.swing.conviction_threshold);
         if should_notify_swing {
             self.swing_execution.update_state(&swing_signal, current_time);
             // Only send Push Notification if enabled and conviction is high enough
             if settings.swing.push_notifications_enabled && swing_signal.conviction_score.unwrap_or(0.0) >= settings.swing.push_notification_threshold {
                 self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
-                notifications.push(swing_signal.clone());
+                swing_signal.should_push = true;
             }
+            notifications.push(swing_signal.clone());
             if let Some(tx) = &self.broadcast_tx {
                 let ws_msg = WsSignal { symbol: &self.symbol, signal: &swing_signal };
                 // Strip heavy zone data for WebSocket to reduce payload
@@ -428,6 +429,7 @@ impl TradingSession {
                 && swing_signal.conviction_score.unwrap_or(0.0) >= settings.swing.push_notification_threshold 
             {
                 self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
+                swing_signal.should_push = true;
                 notifications.push(swing_signal.clone());
                 
                 // Broadcast update so UI reflects high conviction
@@ -451,6 +453,7 @@ impl TradingSession {
 
                 let mut update_signal = swing_signal.clone();
                 update_signal.reason = reason_text;
+                update_signal.should_push = true;
                 // We push this as a notification. The ID is the same, but the reason is different.
                 notifications.push(update_signal);
             }
@@ -515,7 +518,7 @@ impl TradingSession {
 
         // 5. FILTERING LOGIC & FINAL STORAGE
         // Delegate execution logic to the ExecutionManager
-        let should_notify = self.execution.evaluate_execution(&mut scalp_signal, current_time);
+        let should_notify = self.execution.evaluate_execution(&mut scalp_signal, current_time, settings.scalp.min_conviction);
         // Check ID match before evaluate_execution potentially updates state (though it doesn't here, it's safer)
         let is_same_scalp_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);
 
@@ -525,8 +528,9 @@ impl TradingSession {
             // Only send Push Notification if enabled and conviction is high enough
             if settings.scalp.push_notifications_enabled && scalp_signal.conviction_score.unwrap_or(0.0) >= settings.scalp.push_notification_threshold {
                 self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
-                notifications.push(scalp_signal.clone());
+                scalp_signal.should_push = true;
             }
+            notifications.push(scalp_signal.clone());
             if let Some(tx) = &self.broadcast_tx {
                 let ws_msg = WsSignal { symbol: &self.symbol, signal: &scalp_signal };
                 // Strip heavy zone data for WebSocket to reduce payload
@@ -555,6 +559,7 @@ impl TradingSession {
                 && scalp_signal.conviction_score.unwrap_or(0.0) >= settings.scalp.push_notification_threshold 
             {
                 self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
+                scalp_signal.should_push = true;
                 notifications.push(scalp_signal.clone());
                 
                 // Broadcast update

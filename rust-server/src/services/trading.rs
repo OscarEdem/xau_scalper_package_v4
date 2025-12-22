@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use chrono::Utc;
 use axum::http::StatusCode;
-use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage};
+use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage, ExpoPushTicket};
 use xau_scalper_server::{EvalRequest, EvalResponse};
 use crate::state::{ApplicationStateWithTicks, HistoricalSignal, ActiveSignal};
 
@@ -92,7 +92,9 @@ impl TradingService {
             self.state.inner.metrics.signal_counter.inc_by(num_new_signals as f64);
         }
         for (signal, symbol) in signals_to_send {
-            self.send_push_notification(&signal, &symbol).await;    
+            if signal.should_push {
+                self.send_push_notification(&signal, &symbol).await;
+            }
         }
 
         Ok(())
@@ -102,8 +104,11 @@ impl TradingService {
     async fn send_push_notification(&self, signal: &EvalResponse, symbol: &str) {
         let tokens = self.state.inner.push_tokens.lock().await.clone();
         if tokens.is_empty() {
+            tracing::warn!("Attempted to send push notification, but no tokens are registered.");
             return;
         }
+
+        tracing::info!("Sending push notification for {} signal to {} devices.", symbol, tokens.len());
 
         let messages: Vec<ExpoPushMessage> = tokens
             .into_iter()
@@ -113,12 +118,38 @@ impl TradingService {
                     .title(format!("New {} Signal: {} {}", symbol, signal.classification.to_uppercase(), signal.entry_type.to_uppercase()))
                     .body(format!("Entry: {:.5}, SL: {:.5}, TP1: {:.5}, TP2: {:.5}", signal.entry_price, signal.sl_price, signal.tp1_price, signal.tp2_price))
                     .data(&data)
-                    .and_then(|builder| builder.build())
+                    .and_then(|b| b.build())
             })
-            .filter_map(Result::ok)
+            .filter_map(|res| {
+                match res {
+                    Ok(msg) => Some(msg),
+                    Err(e) => {
+                        tracing::error!("Failed to build push message: {}", e);
+                        None
+                    }
+                }
+            })
             .collect();
 
+        if messages.is_empty() {
+            tracing::warn!("No valid push messages could be built.");
+            return;
+        }
+
         let client = Expo::new(ExpoClientOptions::default());
-        let _ = client.send_push_notifications(messages).await;
+        match client.send_push_notifications(messages).await {
+            Ok(tickets) => {
+                for ticket in tickets {
+                    match ticket {
+                        ExpoPushTicket::Ok(_) => {},
+                        ExpoPushTicket::Error(e) => {
+                            tracing::error!("Expo push delivery error: {:?} - {:?}", e.message, e.details);
+                        }
+                    }
+                }
+                tracing::info!("Push notifications sent successfully.");
+            },
+            Err(e) => tracing::error!("Failed to send push notifications via Expo API: {}", e),
+        }
     }
 }
