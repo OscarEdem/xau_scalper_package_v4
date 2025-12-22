@@ -1,6 +1,8 @@
 use crate::{state::ApplicationStateWithTicks, llm::gemini::generate_analysis, llm::prompts::MACRO_SYSTEM_PROMPT_V1};
+use crate::services::trading::TradingService;
 use xau_scalper_server::macro_analysis::builder::build_context;
 use xau_scalper_server::macro_analysis::types::TechnicalSignal;
+use xau_scalper_server::EvalResponse;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -126,6 +128,31 @@ pub async fn chat_analysis_handler(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+#[utoipa::path(
+    post, path = "/test-push",
+    responses(
+        (status = 200, description = "Test notification sent"),
+        (status = 500, description = "Failed to send notification")
+    )
+)]
+pub async fn test_push_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let service = TradingService::new(state.clone());
+    
+    let mut dummy_signal = EvalResponse::default();
+    dummy_signal.signal_id = format!("TEST-{}", Utc::now().timestamp());
+    dummy_signal.entry_type = "long".to_string();
+    dummy_signal.entry_price = 2000.0;
+    dummy_signal.push_title = Some("🔔 Test Notification".to_string());
+    dummy_signal.push_body = Some("This is a test signal to verify Expo integration.".to_string());
+    dummy_signal.should_push = true;
+
+    service.send_push_notification(&dummy_signal, "TEST-USD").await;
+
+    Ok(Json(serde_json::json!({ "status": "sent", "signal_id": dummy_signal.signal_id })))
 }
 
 /// Internal helper to generate fundamental analysis report

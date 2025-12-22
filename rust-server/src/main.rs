@@ -48,6 +48,7 @@ use crate::routes::ChatRequest;
         routes::daily_analysis,
         routes::weekly_analysis,
         routes::chat_analysis_handler,
+        routes::test_push_handler,
         handlers::system::get_loaded_models_handler,
         handlers::trading::get_signal_definitions_handler,
         handlers::system::metrics_handler,
@@ -211,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/daily-analysis", get(routes::daily_analysis))
         .route("/weekly-analysis", get(routes::weekly_analysis))
         .route("/chat-analysis", post(routes::chat_analysis_handler))
+        .route("/test-push", post(routes::test_push_handler))
         // Provide the state to all handlers
         .with_state(app_state_with_ticks);
 

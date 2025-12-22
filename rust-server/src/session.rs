@@ -374,6 +374,12 @@ impl TradingSession {
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, "Swing engine evaluated.");
 
+        // --- NEW: Explicitly label Liquidity Sweeps in the notification text ---
+        if swing_signal.sweep_detected != "none" && !swing_signal.reason.to_lowercase().contains("sweep") {
+            let sweep_desc = if swing_signal.sweep_detected == "high_sweep" { "Highs" } else { "Lows" };
+            swing_signal.reason = format!("Structural Liquidity Sweep ({}): {}", sweep_desc, swing_signal.reason);
+        }
+
         // Calculate current ATR for logging purposes
         let h1_atr = crate::atr(&req.h1_highs.as_ref().unwrap_or(&Cow::Borrowed(&[])), 
                                 &req.h1_lows.as_ref().unwrap_or(&Cow::Borrowed(&[])), 
@@ -402,6 +408,7 @@ impl TradingSession {
             if settings.swing.push_notifications_enabled && swing_signal.conviction_score.unwrap_or(0.0) >= settings.swing.push_notification_threshold {
                 self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
                 swing_signal.should_push = true;
+                Self::format_push_notification(&mut swing_signal, &self.symbol);
             }
             notifications.push(swing_signal.clone());
             if let Some(tx) = &self.broadcast_tx {
@@ -422,6 +429,20 @@ impl TradingSession {
                     let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
                 }
             }
+        } else if swing_signal.entry_type == "none" && is_same_swing_id {
+            // --- NEW: Notify on Trade Closure (SL Hit / Invalidation) ---
+            // If the signal ID matches the active trade, but entry_type is now "none", it means it was just invalidated.
+            if settings.swing.push_notifications_enabled && (swing_signal.reason.contains("Invalidated") || swing_signal.reason.contains("Stopped")) {
+                let mut close_notification = swing_signal.clone();
+                // We must set entry_type back to something valid (e.g. "close") or keep "none" but ensure frontend handles it.
+                // Here we keep "none" but rely on the 'reason' field for the UI.
+                close_notification.should_push = true;
+                Self::format_push_notification(&mut close_notification, &self.symbol);
+                notifications.push(close_notification);
+                
+                // Clear the execution state so we don't notify again
+                self.swing_execution.last_notified_signal_id = None;
+            }
         } else if is_same_swing_id {
             // Check for late conviction bloom (Signal was processed but not pushed, now strong enough)
             if settings.swing.push_notifications_enabled 
@@ -430,6 +451,7 @@ impl TradingSession {
             {
                 self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
                 swing_signal.should_push = true;
+                Self::format_push_notification(&mut swing_signal, &self.symbol);
                 notifications.push(swing_signal.clone());
                 
                 // Broadcast update so UI reflects high conviction
@@ -454,6 +476,7 @@ impl TradingSession {
                 let mut update_signal = swing_signal.clone();
                 update_signal.reason = reason_text;
                 update_signal.should_push = true;
+                Self::format_push_notification(&mut update_signal, &self.symbol);
                 // We push this as a notification. The ID is the same, but the reason is different.
                 notifications.push(update_signal);
             }
@@ -529,6 +552,7 @@ impl TradingSession {
             if settings.scalp.push_notifications_enabled && scalp_signal.conviction_score.unwrap_or(0.0) >= settings.scalp.push_notification_threshold {
                 self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
                 scalp_signal.should_push = true;
+                Self::format_push_notification(&mut scalp_signal, &self.symbol);
             }
             notifications.push(scalp_signal.clone());
             if let Some(tx) = &self.broadcast_tx {
@@ -560,6 +584,7 @@ impl TradingSession {
             {
                 self.execution.last_pushed_signal_id = Some(scalp_signal.signal_id.clone());
                 scalp_signal.should_push = true;
+                Self::format_push_notification(&mut scalp_signal, &self.symbol);
                 notifications.push(scalp_signal.clone());
                 
                 // Broadcast update
@@ -586,6 +611,52 @@ impl TradingSession {
         }
 
         notifications
+    }
+
+    /// Formats the `push_title` and `push_body` fields of a signal for a push notification service.
+    fn format_push_notification(signal: &mut EvalResponse, symbol: &str) {
+        let direction = signal.entry_type.to_uppercase();
+        let classification = signal.classification.to_uppercase();
+
+        // 1. Handle Trade Closure
+        if signal.entry_type == "none" {
+            signal.push_title = Some(format!("{} Trade Closed", symbol));
+            if signal.reason.contains("Invalidated") {
+                signal.push_body = Some("Position closed: Stop Loss hit.".to_string());
+            } else if signal.reason.contains("Stopped") {
+                signal.push_body = Some("Position closed: Stopped at Breakeven/Trail.".to_string());
+            } else {
+                signal.push_body = Some("Position invalidated or closed.".to_string());
+            }
+            return;
+        }
+
+        // 2. Handle Updates
+        if signal.reason.starts_with("Update:") {
+            signal.push_title = Some(format!("{} {} Update", symbol, direction));
+            if signal.reason.contains("TP1 Hit") {
+                signal.push_body = Some(format!("💰 TP1 Hit! SL moved to Breakeven @ {:.4}", signal.sl_price));
+            } else {
+                signal.push_body = Some(format!("🛡️ SL Trailed to {:.4}", signal.sl_price));
+            }
+            return;
+        }
+
+        // 3. Handle New Entries (Scalp, Swing, Re-entry, SFP)
+        let mut title_prefix = "New";
+        let mut body_prefix = "".to_string();
+
+        if signal.classification == "swing_reentry" {
+            title_prefix = "Re-Entry";
+            body_prefix = "🔄 ".to_string();
+        } else if signal.sweep_detected != "none" {
+            body_prefix = "💧 Liquidity Sweep. ".to_string();
+        } else if signal.reason.starts_with("(Counter-Trend:") {
+            body_prefix = "⚠️ Counter-Trend. ".to_string();
+        }
+
+        signal.push_title = Some(format!("{} {} Signal: {} {}", title_prefix, symbol, classification, direction));
+        signal.push_body = Some(format!("{}Entry: {:.4}, SL: {:.4}, TP1: {:.4}", body_prefix, signal.entry_price, signal.sl_price, signal.tp1_price));
     }
 
     fn manage_active_swing_trade(&mut self, swing_signal: &mut EvalResponse, current_price: f64, timestamp: i64, current_atr: f64) {

@@ -188,6 +188,13 @@ pub struct EvalResponse {
     pub debug_info: Option<HashMap<String, String>>,
     #[serde(skip)]
     pub should_push: bool,
+    // --- NEW: Fields for pre-formatted push notifications ---
+    /// The pre-formatted title for the push notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_title: Option<String>,
+    /// The pre-formatted body for the push notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_body: Option<String>,
 }
 
 impl Default for EvalResponse {
@@ -217,6 +224,8 @@ impl Default for EvalResponse {
             expiration_seconds: None,
             debug_info: None,
             should_push: false,
+            push_title: None,
+            push_body: None,
         }
     }
 }

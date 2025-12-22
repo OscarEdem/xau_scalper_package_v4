@@ -12,7 +12,7 @@ pub fn spawn_stale_signal_cleanup_task(state: Arc<ApplicationStateWithTicks>, mu
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("Stale signal cleanup task shutting down.");
+                    info!(event = "shutdown", task = "stale_signal_cleanup", "Stale signal cleanup task shutting down.");
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}
@@ -36,7 +36,7 @@ pub fn spawn_stale_signal_cleanup_task(state: Arc<ApplicationStateWithTicks>, mu
                 if let Some(session_arc) = sessions.get(&symbol) {
                     let mut session = session_arc.lock().await;
                     session.invalidate_signals();
-                    info!("Invalidated stale signals for symbol: {}", symbol);
+                    info!(event = "stale_invalidation", symbol = %symbol, "Invalidated stale signals for symbol: {}", symbol);
                 }
             }
         }
@@ -49,7 +49,7 @@ pub fn spawn_history_cleanup_task(state: Arc<ApplicationStateWithTicks>, mut shu
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("History cleanup task shutting down.");
+                    info!(event = "shutdown", task = "history_cleanup", "History cleanup task shutting down.");
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(3600)) => {}
@@ -63,7 +63,7 @@ pub fn spawn_history_cleanup_task(state: Arc<ApplicationStateWithTicks>, mut shu
             history.retain(|hs| (now - hs.created_at) < TWELVE_HOURS_IN_SECONDS);
             let removed_count = original_len - history.len();
             if removed_count > 0 {
-                info!("Removed {} signals from history older than 12 hours.", removed_count);
+                info!(event = "history_cleanup", count = removed_count, "Removed {} signals from history older than 12 hours.", removed_count);
             }
         }
     });
@@ -73,7 +73,7 @@ pub fn spawn_history_cleanup_task(state: Arc<ApplicationStateWithTicks>, mut shu
 pub fn spawn_news_fetch_task(state: Arc<ApplicationStateWithTicks>, mut shutdown_rx: broadcast::Receiver<()>) {
     tokio::spawn(async move {
         // Fetch immediately on startup
-        info!("Performing initial fetch of weekly news events from Forex Factory...");
+        info!(event = "news_fetch_start", type = "initial", "Performing initial fetch of weekly news events from Forex Factory...");
         let initial_events = fetch_calendar_events().await;
         *state.inner.news_events.lock().await = initial_events;
 
@@ -87,13 +87,13 @@ pub fn spawn_news_fetch_task(state: Arc<ApplicationStateWithTicks>, mut shutdown
 
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("News fetch task shutting down.");
+                    info!(event = "shutdown", task = "news_fetch", "News fetch task shutting down.");
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(fetch_interval_secs)) => {}
             }
 
-            info!("Periodically fetching weekly news events from Forex Factory...");
+            info!(event = "news_fetch_start", type = "periodic", "Periodically fetching weekly news events from Forex Factory...");
             let events = fetch_calendar_events().await;
             // Only update if we actually got new events, to avoid clearing on a failed fetch
             if !events.is_empty() {
@@ -110,7 +110,7 @@ pub fn spawn_session_persistence_task(state: Arc<ApplicationStateWithTicks>, mut
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("Session persistence task shutting down.");
+                    info!(event = "shutdown", task = "session_persistence", "Session persistence task shutting down.");
                     break;
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}

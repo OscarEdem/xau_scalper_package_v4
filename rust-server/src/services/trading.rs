@@ -101,7 +101,7 @@ impl TradingService {
     }
 
     /// Sends a push notification for a new signal to all registered devices.
-    async fn send_push_notification(&self, signal: &EvalResponse, symbol: &str) {
+    pub async fn send_push_notification(&self, signal: &EvalResponse, symbol: &str) {
         let tokens = self.state.inner.push_tokens.lock().await.clone();
         if tokens.is_empty() {
             tracing::warn!("Attempted to send push notification, but no tokens are registered.");
@@ -113,10 +113,13 @@ impl TradingService {
         let messages: Vec<ExpoPushMessage> = tokens
             .into_iter()
             .map(|token| {
-                let data = serde_json::json!({ "signalId": signal.signal_id, "symbol": symbol });
+                let data = serde_json::json!({ "signalId": signal.signal_id, "symbol": symbol, "signal": signal });
+                let title = signal.push_title.as_deref().unwrap_or("New Signal");
+                let body = signal.push_body.as_deref().unwrap_or("Check app for details.");
+
                 ExpoPushMessage::builder(vec![token])
-                    .title(format!("New {} Signal: {} {}", symbol, signal.classification.to_uppercase(), signal.entry_type.to_uppercase()))
-                    .body(format!("Entry: {:.5}, SL: {:.5}, TP1: {:.5}, TP2: {:.5}", signal.entry_price, signal.sl_price, signal.tp1_price, signal.tp2_price))
+                    .title(title)
+                    .body(body)
                     .data(&data)
                     .and_then(|b| b.build())
             })
