@@ -577,6 +577,14 @@ impl ScalpEngine {
                 }
             }
 
+            // Step 2.5: Enforce Directionality (Sanity Check)
+            // Ensure SL is always on the correct side of entry before clamping distance
+            if entry_type == "long" && sl >= entry_price {
+                sl = entry_price - (last_atr * settings.min_sl_atr_mult);
+            } else if entry_type == "short" && sl <= entry_price {
+                sl = entry_price + (last_atr * settings.min_sl_atr_mult);
+            }
+
             // Step 3: Safety Clamp (ATR Guardrail)
             let sl_distance = (entry_price - sl).abs();
             let min_sl = last_atr * settings.min_sl_atr_mult;

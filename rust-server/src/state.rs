@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, broadcast};
 use dashmap::DashMap;
-use prometheus::{Counter, CounterVec, Gauge};
 use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager};
 use xau_scalper_server::config::Settings;
+use xau_scalper_server::metrics::AppMetrics;
 
 #[derive(serde::Serialize, utoipa::ToSchema, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -21,16 +21,6 @@ pub struct HistoricalSignal {
     #[serde(flatten)]
     pub signal: ActiveSignal,
     pub created_at: i64, // Unix timestamp
-}
-
-#[derive(Clone)]
-pub struct AppMetrics {
-    pub signal_counter: Counter,
-    pub active_sessions: Gauge,
-    pub active_ws_clients: Gauge,
-    pub http_requests: Counter,
-    pub gemini_429_errors: Counter,
-    pub gemini_success_model: CounterVec,
 }
 
 /// A more flexible state for the whole application, including the new SessionManager.
@@ -52,6 +42,7 @@ pub struct ApplicationState {
     pub http_client: reqwest::Client,
     pub config: Settings,
     pub metrics: AppMetrics,
+    pub db: sqlx::PgPool,
 }
 
 // We need to add the broadcast sender to our application state

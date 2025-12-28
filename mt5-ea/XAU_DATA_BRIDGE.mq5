@@ -132,7 +132,7 @@ void OnTick()
         {
          // Format tick data as a JSON string
          string tick_json = StringFormat(
-                               "{\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,\"time_msc\":%llu}",
+                               "{\"symbol\":\"%s\",\"bid\":%.5f,\"ask\":%.5f,\"timestamp\":%llu}",
                                _Symbol,
                                last_tick.bid,
                                last_tick.ask,

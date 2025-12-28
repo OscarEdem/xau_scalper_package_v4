@@ -22,6 +22,7 @@ serde_qs = "0.12"
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
 tokio-tungstenite = "0.23.1"
 futures-util = "0.3"
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "macros", "chrono", "uuid", "json"] }
 rand = "0.8"
 rand_distr = "0.4"
 config = "0.13"
@@ -45,3 +46,6 @@ version = "5.5.3"
 
 [dependencies.dotenvy]
 version = "0.15"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }

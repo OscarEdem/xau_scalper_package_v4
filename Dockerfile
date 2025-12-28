@@ -15,8 +15,10 @@ WORKDIR /app/rust-server
 RUN cargo build --release
 
 # Copy the actual source code and build the final binaries
+# Ensure migrations are present for the sqlx::migrate! macro
+COPY rust-server/migrations ./migrations
 COPY rust-server/src ./src
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --bin xau-scalper-server
 
 # Stage 2: Create the final, minimal production image
 FROM debian:bookworm-slim
@@ -25,7 +27,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl dos2unix gawk libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binaries from the builder stage
-COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau-scalper-server
+COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau_scalper_server
 
 # Expose the port the app runs on (as seen in main.rs)
 EXPOSE 3000
@@ -62,4 +64,4 @@ ENV APP_SERVER__HOST=0.0.0.0 \
     RUST_LOG=info
 
 # Set the default container command to run the server
-CMD ["xau-scalper-server"]
+CMD ["xau_scalper_server"]

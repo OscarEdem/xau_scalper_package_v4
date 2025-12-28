@@ -11,12 +11,16 @@ use std::sync::{Arc, RwLock};
 use tracing::info;
 use serde::{Serialize, Deserialize};
 use tokio::sync::{Mutex, broadcast};
+use crate::metrics::AppMetrics;
+use chrono::Utc;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WsSignal<'a> {
     symbol: &'a str,
     #[serde(flatten)]
     signal: &'a EvalResponse,
+    created_at: i64,
 }
 
 /// Represents the dominant trend direction determined by the SwingEngine.
@@ -69,7 +73,16 @@ impl ExecutionManager {
 
     /// Evaluates if a signal should be broadcasted based on execution rules.
     /// Returns true if the signal is valid for notification.
-    pub fn evaluate_execution(&mut self, signal: &mut EvalResponse, current_time: i64, reversal_threshold: f64) -> bool {
+    pub fn evaluate_execution(
+        &mut self, 
+        signal: &mut EvalResponse, 
+        current_time: i64, 
+        reversal_threshold: f64,
+        cooldown_seconds: i64,
+        pyramiding_threshold: f64,
+        averaging_threshold: f64,
+        rapid_reversal_seconds: i64,
+    ) -> bool {
         if signal.entry_type == "none" {
             return false;
         }
@@ -91,14 +104,13 @@ impl ExecutionManager {
         let conviction = signal.conviction_score.unwrap_or(0.0);
         
         // Cooldown: 5 minutes (300 seconds)
-        let cooldown_passed = time_diff > 300;
+        let cooldown_passed = time_diff > cooldown_seconds;
 
         // --- Pyramiding Logic ---
         let price_delta_pct = if self.last_notified_price > 0.0 {
             (signal.entry_price - self.last_notified_price) / self.last_notified_price
         } else { 0.0 };
 
-        let pyramiding_threshold = 0.0015; // 0.15%
         let is_pyramiding_breakout = self.pyramiding_enabled && !direction_changed 
             && match signal.entry_type.as_str() {
                 "long" => price_delta_pct > pyramiding_threshold,
@@ -107,7 +119,6 @@ impl ExecutionManager {
             };
 
         // --- Averaging Logic (Max Profit / Better Entry) ---
-        let averaging_threshold = 0.0005; // 0.05% better price triggers re-entry
         let is_averaging_entry = self.pyramiding_enabled && !direction_changed
             && match signal.entry_type.as_str() {
                 "long" => price_delta_pct < -averaging_threshold, // Price moved lower (better buy)
@@ -116,7 +127,7 @@ impl ExecutionManager {
             };
 
         // --- Reversal Logic ---
-        let is_rapid_reversal = direction_changed && time_diff < 180;
+        let is_rapid_reversal = direction_changed && time_diff < rapid_reversal_seconds;
         let is_valid_reversal = direction_changed && (!is_rapid_reversal || conviction >= reversal_threshold);
 
         // --- Decision ---
@@ -200,10 +211,16 @@ pub struct TradingSession {
 
     #[serde(skip)]
     pub broadcast_tx: Option<broadcast::Sender<String>>,
+
+    #[serde(skip)]
+    pub db: Option<sqlx::PgPool>,
+
+    #[serde(skip)]
+    pub metrics: Option<Arc<AppMetrics>>,
 }
 
 impl TradingSession {
-    pub fn new(symbol: String, filter_scalp_by_swing: bool, initial_buffer_size: usize, broadcast_tx: Option<broadcast::Sender<String>>) -> Self {
+    pub fn new(symbol: String, filter_scalp_by_swing: bool, initial_buffer_size: usize, broadcast_tx: Option<broadcast::Sender<String>>, db: Option<sqlx::PgPool>, metrics: Option<Arc<AppMetrics>>) -> Self {
         Self {
             symbol,
             filter_scalp_by_swing,
@@ -241,6 +258,25 @@ impl TradingSession {
             execution: ExecutionManager::new(true, false), // Scalp: Allow pyramiding, Normal mode
             swing_execution: ExecutionManager::new(true, true), // Swing: Pyramiding YES, Strict Reversal YES
             broadcast_tx,
+            db,
+            metrics,
+        }
+    }
+
+    /// Helper to safely broadcast a signal to WebSocket clients.
+    /// Handles serialization and error logging to prevent stream interruptions.
+    fn broadcast_signal(&self, signal: &EvalResponse) {
+        if let Some(tx) = &self.broadcast_tx {
+            let ws_msg = WsSignal { 
+                symbol: &self.symbol, 
+                signal,
+                created_at: Utc::now().timestamp()
+            };
+            if let Ok(msg) = serde_json::to_string(&ws_msg) {
+                let _ = tx.send(msg);
+            } else {
+                tracing::error!(symbol = %self.symbol, "Failed to serialize signal for broadcast");
+            }
         }
     }
 
@@ -250,18 +286,41 @@ impl TradingSession {
     /// It takes an Arc<RwLock<...>> to ensure it always reads the latest, hot-reloaded settings.
     /// Returns a list of signals that should be notified.
     pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings_arc: &Arc<RwLock<TradingSettings>>) -> Vec<EvalResponse> {
-        let settings = settings_arc.read().unwrap();
+        let settings = settings_arc.read().expect("TradingSettings RwLock poisoned");
         info!(symbol = %self.symbol, "Processing new data for session with hot-reloaded settings.");
 
         // Update session configuration from global settings
         self.filter_scalp_by_swing = settings.scalp.filter_scalp_by_swing;
 
-        // 1. Update data buffers with the latest candle data from the request.
-        // Smart update: If input is small (incremental), push back. If large (sync), replace.
-        // Guard against duplicate ticks: Only update if timestamp advanced OR it's a full sync (>10 items).
+        // 1. Update data buffers
+        self.update_data_buffers(&req, &settings);
         
+        self.last_evaluation_timestamp = req.last_m1_timestamp;
+
+        // Log buffer status to help debug "Insufficient Data"
+        info!(
+            symbol = %self.symbol,
+            m1_len = self.m1_closes.len(),
+            m5_len = self.m5_closes.len(),
+            h1_len = self.h1_closes.len(),
+            "Session buffers updated."
+        );
+
+        let mut notifications = Vec::new();
+
+        // 2. Run Swing Engine & Logic
+        let swing_notifications = self.process_swing_logic(&req, predictor_cache, &settings);
+        notifications.extend(swing_notifications);
+
+        // 3. Run Scalp Engine & Logic
+        let scalp_notifications = self.process_scalp_logic(&req, predictor_cache, &settings);
+        notifications.extend(scalp_notifications);
+
+        notifications
+    }
+
+    fn update_data_buffers(&mut self, req: &EvalRequest, settings: &TradingSettings) {
         // M1 Update
-        // Increased sync threshold to 100 to prevent wiping history on small catch-up batches
         if req.last_m1_timestamp > self.last_m1_timestamp || req.closes.len() > settings.sync_threshold {
             Self::update_buffer(&mut self.m1_closes, &req.closes, settings.max_buffer_size);
             self.last_m1_timestamp = req.last_m1_timestamp;
@@ -274,11 +333,9 @@ impl TradingSession {
                 Self::update_buffer(&mut self.m5_highs, &req.m5_highs, settings.max_buffer_size);
                 Self::update_buffer(&mut self.m5_lows, &req.m5_lows, settings.max_buffer_size);
                 
-                // Handle timestamps
                 if let Some(ts_vec) = &req.m5_timestamps {
                     Self::update_buffer_i64(&mut self.m5_timestamps, ts_vec, settings.max_buffer_size);
                 } else {
-                    // Backfill if missing (Assume 300s intervals ending at last_m5_timestamp)
                     let count = req.m5_closes.len();
                     let mut generated = Vec::with_capacity(count);
                     for i in 0..count {
@@ -350,21 +407,11 @@ impl TradingSession {
         } else if req.d1_closes.as_ref().map_or(false, |v| !v.is_empty()) {
             tracing::warn!(symbol = %self.symbol, "Received D1 data but no last_d1_timestamp. Ignoring update.");
         }
-        
-        self.last_evaluation_timestamp = req.last_m1_timestamp;
+    }
 
-        // Log buffer status to help debug "Insufficient Data"
-        info!(
-            symbol = %self.symbol,
-            m1_len = self.m1_closes.len(),
-            m5_len = self.m5_closes.len(),
-            h1_len = self.h1_closes.len(),
-            "Session buffers updated."
-        );
-
+    fn process_swing_logic(&mut self, req: &EvalRequest, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
         let mut notifications = Vec::new();
-
-        // 2. Run the Swing Engine
+        
         // Scope the request to drop the borrow of self immediately after use
         let mut swing_signal = {
             let mut swing_req = self.build_engine_request("swing", req.current_price);
@@ -401,7 +448,22 @@ impl TradingSession {
         // Swing Execution Logic (Anti-Flicker & First-Signal Only)
         let current_time = req.last_m1_timestamp;
         let is_same_swing_id = self.swing_execution.last_notified_signal_id.as_ref() == Some(&swing_signal.signal_id);
-        let should_notify_swing = self.swing_execution.evaluate_execution(&mut swing_signal, current_time, settings.swing.conviction_threshold);
+        
+        // Execution parameters (TODO: Move to TradingSettings for runtime config)
+        let cooldown_seconds = 300;
+        let pyramiding_threshold = 0.0015; // 0.15%
+        let averaging_threshold = 0.0005; // 0.05%
+        let rapid_reversal_seconds = 180;
+
+        let should_notify_swing = self.swing_execution.evaluate_execution(
+            &mut swing_signal, 
+            current_time, 
+            settings.swing.conviction_threshold,
+            cooldown_seconds,
+            pyramiding_threshold,
+            averaging_threshold,
+            rapid_reversal_seconds
+        );
         if should_notify_swing {
             self.swing_execution.update_state(&swing_signal, current_time);
             // Only send Push Notification if enabled and conviction is high enough
@@ -410,25 +472,18 @@ impl TradingSession {
                 swing_signal.should_push = true;
                 Self::format_push_notification(&mut swing_signal, &self.symbol);
             }
-            notifications.push(swing_signal.clone());
-            if let Some(tx) = &self.broadcast_tx {
-                let ws_msg = WsSignal { symbol: &self.symbol, signal: &swing_signal };
-                // Strip heavy zone data for WebSocket to reduce payload
-                if let Ok(mut v) = serde_json::to_value(&ws_msg) {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.remove("liquidityZones");
-                        obj.remove("imbalances");
-                        obj.remove("imbalanceZones");
-                        obj.remove("orderBlocks");
-                        obj.remove("debug_info");
-                        obj.remove("debugInfo");
-                        obj.remove("reason");
-                        obj.remove("time_stop_seconds");
-                        obj.remove("timeStopSeconds");
-                    }
-                    let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
-                }
+
+            // Save Swing Signal to DB
+            if let Some(db) = &self.db {
+                let sig_clone = swing_signal.clone();
+                let sym_clone = self.symbol.clone();
+                let db_clone = db.clone();
+                let metrics_clone = self.metrics.clone();
+                tokio::spawn(async move { let _ = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await; });
             }
+
+            notifications.push(swing_signal.clone());
+            self.broadcast_signal(&swing_signal);
         } else if swing_signal.entry_type == "none" && is_same_swing_id {
             // --- NEW: Notify on Trade Closure (SL Hit / Invalidation) ---
             // If the signal ID matches the active trade, but entry_type is now "none", it means it was just invalidated.
@@ -438,6 +493,9 @@ impl TradingSession {
                 // Here we keep "none" but rely on the 'reason' field for the UI.
                 close_notification.should_push = true;
                 Self::format_push_notification(&mut close_notification, &self.symbol);
+                
+                // Broadcast Trade Closure to WebSocket
+                self.broadcast_signal(&close_notification);
                 notifications.push(close_notification);
                 
                 // Clear the execution state so we don't notify again
@@ -455,13 +513,7 @@ impl TradingSession {
                 notifications.push(swing_signal.clone());
                 
                 // Broadcast update so UI reflects high conviction
-                if let Some(tx) = &self.broadcast_tx {
-                    let ws_msg = WsSignal { symbol: &self.symbol, signal: &swing_signal };
-                    if let Ok(v) = serde_json::to_value(&ws_msg) {
-                        // ... (stripping logic omitted for brevity, same as above) ...
-                        let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
-                    }
-                }
+                self.broadcast_signal(&swing_signal);
             }
 
             // Notify on SL Update (Move to BE, Trailing)
@@ -478,6 +530,9 @@ impl TradingSession {
                 update_signal.should_push = true;
                 Self::format_push_notification(&mut update_signal, &self.symbol);
                 // We push this as a notification. The ID is the same, but the reason is different.
+                
+                // Broadcast SL Update to WebSocket
+                self.broadcast_signal(&update_signal);
                 notifications.push(update_signal);
             }
         }
@@ -500,7 +555,11 @@ impl TradingSession {
         };
         self.latest_swing_signal = Some(swing_signal);
 
-        // 3. Run the Scalp Engine (reuse base_req data)
+        notifications
+    }
+
+    fn process_scalp_logic(&mut self, req: &EvalRequest, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
+        let mut notifications = Vec::new();
         let predictor_model = self.predictor_model.clone();
         let mut scalp_signal = {
             let mut scalp_req = self.build_engine_request("scalp", req.current_price);
@@ -517,8 +576,6 @@ impl TradingSession {
         };
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, "Scalp engine evaluated.");
 
-        // 4. Apply cross-engine filtering if enabled.
-        // This is where the scalp signal can be suppressed if it conflicts with the swing trend.
         if self.filter_scalp_by_swing {
             let scalp_trend = TrendDirection::from(scalp_signal.entry_type.as_str());
             if self.swing_trend != TrendDirection::Sideways 
@@ -539,9 +596,23 @@ impl TradingSession {
             }
         }
 
-        // 5. FILTERING LOGIC & FINAL STORAGE
-        // Delegate execution logic to the ExecutionManager
-        let should_notify = self.execution.evaluate_execution(&mut scalp_signal, current_time, settings.scalp.min_conviction);
+        let current_time = req.last_m1_timestamp;
+        
+        // Execution parameters (TODO: Move to TradingSettings for runtime config)
+        let cooldown_seconds = 300;
+        let pyramiding_threshold = 0.0015; // 0.15%
+        let averaging_threshold = 0.0005; // 0.05%
+        let rapid_reversal_seconds = 180;
+
+        let should_notify = self.execution.evaluate_execution(
+            &mut scalp_signal, 
+            current_time, 
+            settings.scalp.min_conviction,
+            cooldown_seconds,
+            pyramiding_threshold,
+            averaging_threshold,
+            rapid_reversal_seconds
+        );
         // Check ID match before evaluate_execution potentially updates state (though it doesn't here, it's safer)
         let is_same_scalp_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);
 
@@ -554,25 +625,18 @@ impl TradingSession {
                 scalp_signal.should_push = true;
                 Self::format_push_notification(&mut scalp_signal, &self.symbol);
             }
-            notifications.push(scalp_signal.clone());
-            if let Some(tx) = &self.broadcast_tx {
-                let ws_msg = WsSignal { symbol: &self.symbol, signal: &scalp_signal };
-                // Strip heavy zone data for WebSocket to reduce payload
-                if let Ok(mut v) = serde_json::to_value(&ws_msg) {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.remove("liquidityZones");
-                        obj.remove("imbalances");
-                        obj.remove("imbalanceZones");
-                        obj.remove("orderBlocks");
-                        obj.remove("debug_info");
-                        obj.remove("debugInfo");
-                        obj.remove("reason");
-                        obj.remove("time_stop_seconds");
-                        obj.remove("timeStopSeconds");
-                    }
-                    let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
-                }
+
+            // Save Scalp Signal to DB
+            if let Some(db) = &self.db {
+                let sig_clone = scalp_signal.clone();
+                let sym_clone = self.symbol.clone();
+                let db_clone = db.clone();
+                let metrics_clone = self.metrics.clone();
+                tokio::spawn(async move { let _ = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await; });
             }
+
+            notifications.push(scalp_signal.clone());
+            self.broadcast_signal(&scalp_signal);
             self.latest_scalp_signal = Some(scalp_signal);
         } else if is_same_scalp_id {
             // Keep active for API visibility, but don't re-notify
@@ -588,12 +652,7 @@ impl TradingSession {
                 notifications.push(scalp_signal.clone());
                 
                 // Broadcast update
-                if let Some(tx) = &self.broadcast_tx {
-                    let ws_msg = WsSignal { symbol: &self.symbol, signal: &scalp_signal };
-                    if let Ok(v) = serde_json::to_value(&ws_msg) {
-                        let _ = serde_json::to_string(&v).map(|msg| tx.send(msg));
-                    }
-                }
+                self.broadcast_signal(&scalp_signal);
             }
             
             self.latest_scalp_signal = Some(scalp_signal);
@@ -973,6 +1032,8 @@ pub struct SessionManager {
     pub sessions: Arc<DashMap<String, Arc<Mutex<TradingSession>>>>,
     pub settings: Arc<RwLock<TradingSettings>>,
     pub broadcast_tx: broadcast::Sender<String>,
+    pub db: Option<sqlx::PgPool>,
+    pub metrics: Option<Arc<AppMetrics>>,
 }
 
 impl Default for SessionManager {
@@ -980,26 +1041,41 @@ impl Default for SessionManager {
         // This default is rarely used as we load from config, but good for tests
         let settings = TradingSettings::default();
         let (tx, _) = broadcast::channel(1);
-        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx: tx }
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx: tx, db: None, metrics: None }
     }
 }
 
 impl SessionManager {
-    pub fn new(settings: TradingSettings, broadcast_tx: broadcast::Sender<String>) -> Self {
-        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx }
+    pub fn new(settings: TradingSettings, broadcast_tx: broadcast::Sender<String>, db: Option<sqlx::PgPool>, metrics: Option<Arc<AppMetrics>>) -> Self {
+        Self { sessions: Arc::new(DashMap::new()), settings: Arc::new(RwLock::new(settings)), broadcast_tx, db, metrics }
     }
 
     pub fn get_or_create_session(&self, symbol: &str, filter_scalp_by_swing: bool) -> Arc<Mutex<TradingSession>> {
         self.sessions.entry(symbol.to_string()).or_insert_with(|| {
             info!("Creating new trading session for symbol: {}", symbol);
-            let settings = self.settings.read().unwrap();
-            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, settings.max_buffer_size, Some(self.broadcast_tx.clone()))))
+            let settings = self.settings.read().expect("SessionManager settings RwLock poisoned");
+            Arc::new(Mutex::new(TradingSession::new(symbol.to_string(), filter_scalp_by_swing, settings.max_buffer_size, Some(self.broadcast_tx.clone()), self.db.clone(), self.metrics.clone())))
         }).clone()
     }
 
     pub async fn update_settings(&self, new_settings: TradingSettings) {
         // 1. Update global settings for future sessions
-        *self.settings.write().unwrap() = new_settings.clone();
+        *self.settings.write().expect("SessionManager settings RwLock poisoned") = new_settings.clone();
+        
+        // 2. Persist to DB if available
+        if let Some(db) = &self.db {
+            let db_clone = db.clone();
+            let settings_clone = new_settings.clone();
+            let metrics_clone = self.metrics.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::db::save_settings(&db_clone, &settings_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
+                    tracing::error!("Failed to persist settings to DB: {}", e);
+                } else {
+                    tracing::info!("Settings persisted to DB.");
+                }
+            });
+        }
+
         info!("Global settings updated. All active sessions will use new settings on next tick.");
     }
 }

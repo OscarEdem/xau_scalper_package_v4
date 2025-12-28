@@ -4,6 +4,8 @@ pub mod engines;
 pub mod news_fetcher;
 pub mod session;
 pub mod macro_analysis;
+pub mod db;
+pub mod metrics;
 pub use indicators::*;
 pub use session::*;
 

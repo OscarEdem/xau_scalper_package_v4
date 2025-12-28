@@ -7,12 +7,27 @@ pub struct Settings {
     pub server: ServerSettings,
     pub trading: TradingSettings,
     pub paths: PathSettings,
+    #[serde(default)]
+    pub database: DatabaseSettings,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabaseSettings {
+    pub url: String,
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        Self {
+            url: "".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
@@ -357,6 +372,9 @@ impl SwingSettings {
 
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
+        // Check for DATABASE_URL environment variable (standard on Render)
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_default();
+
         let s = Config::builder()
             .set_default("server.host", "0.0.0.0")?
             .set_default("server.port", 3000)?
@@ -364,6 +382,7 @@ impl Settings {
             .set_default("paths.push_tokens_file", "push_tokens.json")?
             .set_default("paths.models_dir", "./models/")?
             .set_default("paths.sessions_dir", "./sessions_data")?
+            .set_default("database.url", database_url)?
             // Look for config.toml in the current directory
             .add_source(File::with_name("config").required(false))
             // Look for config.toml in the standard Render secrets directory

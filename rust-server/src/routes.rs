@@ -1,4 +1,4 @@
-use crate::{state::ApplicationStateWithTicks, llm::gemini::generate_analysis, llm::prompts::MACRO_SYSTEM_PROMPT_V1};
+use crate::{state::ApplicationStateWithTicks, llm::gemini::generate_analysis, llm::prompts::MACRO_SYSTEM_PROMPT_V1, HistoricalSignal};
 use crate::services::trading::TradingService;
 use xau_scalper_server::macro_analysis::builder::build_context;
 use xau_scalper_server::macro_analysis::types::TechnicalSignal;
@@ -34,6 +34,17 @@ pub struct ChatRequest {
     #[schema(example = "What are the key risks mentioned in the report?")]
     pub query: String,
 }
+
+#[derive(Deserialize, IntoParams)]
+pub struct PaginationQuery {
+    #[serde(default = "default_page")]
+    pub page: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+fn default_page() -> usize { 1 }
+fn default_limit() -> usize { 50 }
 
 #[utoipa::path(
     get, path = "/daily-analysis", params(SymbolQuery),
@@ -153,6 +164,53 @@ pub async fn test_push_handler(
     service.send_push_notification(&dummy_signal, "TEST-USD").await;
 
     Ok(Json(serde_json::json!({ "status": "sent", "signal_id": dummy_signal.signal_id })))
+}
+
+#[utoipa::path(
+    delete, path = "/signals/clear",
+    responses(
+        (status = 200, description = "Database and memory cleared of signals"),
+        (status = 500, description = "Failed to clear database")
+    )
+)]
+pub async fn clear_database_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 1. Clear Database
+    match crate::db::clear_all_signals(&state.inner.db, Some(&state.inner.metrics.db_retries_total)).await {
+        Ok(count) => {
+            // 2. Clear In-Memory History
+            let mut history = state.inner.signal_history.lock().await;
+            history.clear();
+            
+            info!("Manually cleared {} signals from database and memory.", count);
+            Ok(Json(serde_json::json!({ "status": "success", "deleted_count": count })))
+        },
+        Err(e) => {
+            tracing::error!("Failed to clear database: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[utoipa::path(
+    get, path = "/signals/paginated", params(PaginationQuery),
+    responses((status = 200, description = "Returns paginated historical signals"))
+)]
+pub async fn get_signals_paginated_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+    Query(q): Query<PaginationQuery>,
+) -> Json<serde_json::Value> {
+    let history = state.inner.signal_history.lock().await;
+    let start = (q.page - 1) * q.limit;
+    let signals: Vec<HistoricalSignal> = history.iter().skip(start).take(q.limit).cloned().collect();
+    
+    Json(serde_json::json!({
+        "page": q.page,
+        "limit": q.limit,
+        "total": history.len(),
+        "signals": signals
+    }))
 }
 
 /// Internal helper to generate fundamental analysis report
@@ -333,6 +391,12 @@ pub async fn generate_fundamental_report(
     // --- Cache the new result ---
     tracing::info!("Caching new fundamental analysis for '{}'.", cache_key);
     state.inner.fundamental_analysis_cache.insert(cache_key, (events_hash, result.to_string()));
+    
+    // --- Save to Database ---
+    let db_pool = &state.inner.db;
+    if let Err(e) = crate::db::save_analysis_report(db_pool, symbol, period, &result, events_hash, Some(&state.inner.metrics.db_retries_total)).await {
+        tracing::error!("Failed to save analysis report to DB: {}", e);
+    }
 
     serde_json::json!({
         "symbol": symbol,

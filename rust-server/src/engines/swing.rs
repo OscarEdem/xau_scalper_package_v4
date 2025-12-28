@@ -283,7 +283,7 @@ impl SwingEngine {
             tp1_price,
             tp2_price,
             reason,
-            classification: "swing_structure_plus_liquidity".to_string(),
+            classification: "swing".to_string(),
             conviction_score: Some(conviction_score),
             recommended_order_type,
             limit_order_price: if execution_price != req.current_price { execution_price } else { 0.0 },
@@ -570,17 +570,32 @@ impl SwingEngine {
         current_low: f64,
         settings: &SwingSettings,
     ) -> (f64, f64, f64) {
+        // Clamp max SL distance to avoid excessive risk on volatile candles (e.g. 3 ATRs)
+        let max_sl_dist = last_atr * 3.0;
+
         if entry_type == "long" {
             // For SFP, SL goes below the liquidity wick (current_low).
-            // For Structure/Trend, SL goes below the structural low (external_low) to give swing room.
+            // For Structure/Trend, try internal structure first (tighter), then external.
             let sl_anchor = if reason.contains("SFP") { 
                 current_low 
             } else { 
-                // Use structural low if valid (below entry), otherwise fallback to candle low
-                if structure.external_low.1 < entry_price { structure.external_low.1 } else { current_low }
+                if structure.internal_low.1 < entry_price && structure.internal_low.1 > 0.0 {
+                    structure.internal_low.1
+                } else if structure.external_low.1 < entry_price && structure.external_low.1 > 0.0 {
+                    structure.external_low.1 
+                } else { 
+                    current_low 
+                }
             };
 
-            let sl = sl_anchor - (last_atr * settings.sl_atr_buffer); // Small buffer below the low
+            let mut sl = sl_anchor - (last_atr * settings.sl_atr_buffer); // Small buffer below the low
+            
+            // Sanity Check: Ensure SL is below entry
+            if sl >= entry_price {
+                sl = entry_price - (last_atr * 0.5); // Fallback to 0.5 ATR stop
+            }
+            if (entry_price - sl) > max_sl_dist { sl = entry_price - max_sl_dist; }
+
             let risk = (entry_price - sl).abs();
             let tp1 = entry_price + risk * settings.risk_reward_ratio_tp1; // Aim for 1:2 R:R
             let tp2 = entry_price + risk * settings.risk_reward_ratio_tp2; // Aim for 1:4 R:R
@@ -589,11 +604,23 @@ impl SwingEngine {
             let sl_anchor = if reason.contains("SFP") { 
                 current_high 
             } else { 
-                // Use structural high if valid (above entry)
-                if structure.external_high.1 > entry_price { structure.external_high.1 } else { current_high }
+                if structure.internal_high.1 > entry_price && structure.internal_high.1 > 0.0 {
+                    structure.internal_high.1
+                } else if structure.external_high.1 > entry_price && structure.external_high.1 > 0.0 {
+                    structure.external_high.1
+                } else { 
+                    current_high 
+                }
             };
 
-            let sl = sl_anchor + (last_atr * settings.sl_atr_buffer);
+            let mut sl = sl_anchor + (last_atr * settings.sl_atr_buffer);
+            
+            // Sanity Check: Ensure SL is above entry
+            if sl <= entry_price {
+                sl = entry_price + (last_atr * 0.5); // Fallback to 0.5 ATR stop
+            }
+            if (sl - entry_price) > max_sl_dist { sl = entry_price + max_sl_dist; }
+
             let risk = (entry_price - sl).abs();
             let tp1 = entry_price - risk * settings.risk_reward_ratio_tp1;
             let tp2 = entry_price - risk * settings.risk_reward_ratio_tp2;

@@ -25,6 +25,7 @@ mod background;
 pub mod state;
 pub mod handlers;
 pub mod services;
+use xau_scalper_server::db;
 
 use prometheus::{register_counter, register_counter_vec, register_gauge};
 use xau_scalper_server::config::Settings;
@@ -32,7 +33,11 @@ use xau_scalper_server::config::{TradingSettings, ScalpSettings, SwingSettings, 
 use xau_scalper_server::engines::news_guard::GuardResult;
 use xau_scalper_server::macro_analysis::types::{MacroOutlook, Bias};
 use crate::state::*;
+use xau_scalper_server::metrics::AppMetrics;
 use crate::routes::ChatRequest;
+
+#[cfg(test)]
+mod e2e_tests;
 
 #[allow(dead_code)] // This is used by utoipa macro to generate OpenAPI spec
 #[derive(OpenApi)]
@@ -41,9 +46,6 @@ use crate::routes::ChatRequest;
         handlers::system::health_check_handler,
         handlers::trading::process_data_handler,
         handlers::trading::documented_tick_ingest_handler,
-        handlers::trading::get_latest_signals_handler,
-        handlers::trading::get_all_latest_signals_handler,
-        handlers::trading::get_signals_handler,
         handlers::system::save_push_token_handler,
         routes::daily_analysis,
         routes::weekly_analysis,
@@ -56,10 +58,12 @@ use crate::routes::ChatRequest;
         handlers::system::update_settings_handler,
         handlers::system::reset_settings_handler,
         handlers::system::get_settings_handler,
-        handlers::trading::get_news_guard_status_handler
+        handlers::trading::get_news_guard_status_handler,
+        routes::get_signals_paginated_handler,
+        routes::clear_database_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, LatestSignalsForSymbol, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -86,18 +90,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Active configuration is being overridden by persistent settings found in: {}", persistent_config_path);
     }
 
-    // --- NEW: Load push tokens from file on startup ---
-    let initial_push_tokens = match fs::read_to_string(&config.paths.push_tokens_file).await {
-        Ok(content) => {
-            let tokens: BTreeSet<String> = serde_json::from_str(&content).unwrap_or_default();
-            tracing::info!("Loaded {} push notification tokens from {}", tokens.len(), config.paths.push_tokens_file);
+    // Initialize Database
+    // Prioritize DATABASE_URL env var (Render), fallback to config, then panic
+    let db_url = std::env::var("DATABASE_URL").unwrap_or(config.database.url.clone());
+    if db_url.is_empty() {
+        panic!("Database URL is not set. Please set DATABASE_URL environment variable.");
+    }
+    let db_pool = db::init_db(&db_url).await.expect("Failed to initialize database");
+
+    // --- NEW: Load push tokens from DB on startup ---
+    let initial_push_tokens = match db::load_push_tokens(&db_pool, None).await {
+        Ok(tokens) => {
+            tracing::info!("Loaded {} push notification tokens from DB", tokens.len());
             tokens
-        }
-        Err(_) => {
-            tracing::info!("No '{}' file found. Starting with an empty set of push tokens.", config.paths.push_tokens_file);
+        },
+        Err(e) => {
+            tracing::error!("Failed to load push tokens from DB: {}. Falling back to empty set.", e);
             BTreeSet::new()
         }
     };
+
+    // --- NEW: Load settings from DB ---
+    let mut trading_settings = config.trading.clone();
+    match db::load_settings(&db_pool, None).await {
+        Ok(Some(db_settings)) => {
+            tracing::info!("Loaded trading settings from Database, overriding config file.");
+            trading_settings = db_settings;
+        },
+        Ok(None) => {
+            tracing::info!("No settings found in Database, using config file defaults.");
+        },
+        Err(e) => {
+            tracing::error!("Failed to load settings from DB: {}. Using config file defaults.", e);
+        }
+    }
 
     // Initialize metrics with proper error handling
     let signal_counter = register_counter!("xau_scalper_signals_total", "Total number of signals generated")
@@ -115,8 +141,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gemini_success_model = register_counter_vec!("xau_scalper_gemini_success_model_total", "Total successful Gemini API requests by model", &["model"])
         .map_err(|e| format!("Failed to register gemini_success_model: {}", e))?;
 
+    let db_retries_total = register_counter!("xau_scalper_db_retries_total", "Total number of database operation retries")
+        .map_err(|e| format!("Failed to register db_retries_total: {}", e))?;
+
     let metrics = AppMetrics {
-        signal_counter, active_sessions, active_ws_clients, http_requests, gemini_429_errors, gemini_success_model
+        signal_counter, active_sessions, active_ws_clients, http_requests, gemini_429_errors, gemini_success_model, db_retries_total
     };
 
     // 1. Create a channel to broadcast live market data AND signals to WebSocket clients.
@@ -126,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize the shared state
     let shared_state = ApplicationState {
-        session_manager: SessionManager::new(config.trading.clone(), tick_tx.clone()),
+        session_manager: SessionManager::new(trading_settings, tick_tx.clone(), Some(db_pool.clone()), Some(Arc::new(metrics.clone()))),
         predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::new(config.paths.models_dir.clone()),
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
         // Use the tokens loaded from the file
@@ -143,34 +172,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap(),
         config: config.clone(),
         metrics,
+        db: db_pool,
     };
 
-    // --- NEW: Load persisted sessions ---
-    let sessions_dir = &config.paths.sessions_dir;
-    if let Err(e) = fs::create_dir_all(sessions_dir.as_str()).await {
-        tracing::error!("Failed to create sessions directory: {}", e);
-    }
-
-    if let Ok(mut entries) = fs::read_dir(sessions_dir.as_str()).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match fs::read_to_string(&path).await {
-                    Ok(content) => {
-                        match serde_json::from_str::<TradingSession>(&content) {
-                            Ok(mut session) => {
-                                session.broadcast_tx = Some(tick_tx.clone());
-                                tracing::info!("Loaded session for {} from disk.", session.symbol);
-                                shared_state.session_manager.sessions.insert(session.symbol.clone(), Arc::new(Mutex::new(session)));
-                            },
-                            Err(e) => tracing::error!("Failed to deserialize session from {:?}: {}", path, e),
-                        }
-                    },
-                    Err(e) => tracing::error!("Failed to read session file {:?}: {}", path, e),
-                }
+    // --- NEW: Load persisted sessions from DB ---
+    match db::load_sessions(&shared_state.db, Some(&shared_state.metrics.db_retries_total)).await {
+        Ok(sessions) => {
+            for mut session in sessions {
+                session.broadcast_tx = Some(tick_tx.clone());
+                session.db = Some(shared_state.db.clone()); // Inject DB pool
+                session.metrics = Some(Arc::new(shared_state.metrics.clone())); // Inject Metrics
+                tracing::info!("Loaded session for {} from DB.", session.symbol);
+                shared_state.session_manager.sessions.insert(session.symbol.clone(), Arc::new(Mutex::new(session)));
             }
+        },
+        Err(e) => {
+            tracing::error!("Failed to load sessions from DB: {}", e);
         }
-    }
+    };
 
     // --- Phase 2: Real-time Data Gateway ---
 
@@ -185,38 +204,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     background::spawn_history_cleanup_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
     background::spawn_news_fetch_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
     background::spawn_session_persistence_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
+    background::spawn_db_cleanup_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
 
     // --- Start Background Analysis Task ---
     routes::start_background_analysis_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
 
-    let app = Router::new()
-        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .route("/", get(handlers::system::health_check_handler))
-        .route("/ws", get(handlers::ws::websocket_handler))
-        .route("/metrics", get(handlers::system::metrics_handler))
-        .route("/metrics/prometheus", get(handlers::system::prometheus_metrics_handler)) // NEW: Prometheus endpoint
-        .route("/health", get(handlers::system::health_check_handler))
-        .route("/data", post(handlers::trading::process_data_handler)) // For main analysis
-        .route("/ticks", post(handlers::trading::tick_ingest_handler)) // NEW: For live ticks
-        .route("/signals/latest", get(handlers::trading::get_all_latest_signals_handler))
-        .route("/signals/:symbol", get(handlers::trading::get_latest_signals_handler))
-        .route("/signals", get(handlers::trading::get_signals_handler))
-        .route("/definitions/reasons", get(handlers::trading::get_signal_definitions_handler))
-        // --- Add new routes for logging ---
-        .route("/save-push-token", post(handlers::system::save_push_token_handler))
-        .route("/settings", post(handlers::system::update_settings_handler).get(handlers::system::get_settings_handler))
-        .route("/settings/reset", post(handlers::system::reset_settings_handler))
-        .route("/news-guard/:symbol", get(handlers::trading::get_news_guard_status_handler))
-        .route("/models/loaded", get(handlers::system::get_loaded_models_handler))
-        // --- Analysis Endpoints ---
-        .route("/daily-analysis", get(routes::daily_analysis))
-        .route("/weekly-analysis", get(routes::weekly_analysis))
-        .route("/chat-analysis", post(routes::chat_analysis_handler))
-        .route("/test-push", post(routes::test_push_handler))
-        // Provide the state to all handlers
-        .with_state(app_state_with_ticks);
+    let app = create_app(app_state_with_ticks);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    // Render/Docker specific: Listen on 0.0.0.0 and use the PORT env var
+    let host = "0.0.0.0"; 
+    let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(config.server.port);
+    
+    let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     tracing::info!("listening on {}", addr);
     axum::serve(listener, app)
@@ -234,4 +233,32 @@ async fn shutdown_signal(shutdown_tx: broadcast::Sender<()>) {
         .expect("failed to install CTRL+C signal handler");
     tracing::info!("Received shutdown signal, shutting down gracefully.");
     let _ = shutdown_tx.send(());
+}
+
+pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
+    Router::new()
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/", get(handlers::system::health_check_handler))
+        .route("/ws", get(handlers::ws::websocket_handler))
+        .route("/metrics", get(handlers::system::metrics_handler))
+        .route("/metrics/prometheus", get(handlers::system::prometheus_metrics_handler)) // NEW: Prometheus endpoint
+        .route("/health", get(handlers::system::health_check_handler))
+        .route("/data", post(handlers::trading::process_data_handler)) // For main analysis
+        .route("/ticks", post(handlers::trading::tick_ingest_handler)) // NEW: For live ticks
+        .route("/signals/paginated", get(routes::get_signals_paginated_handler)) // NEW: Pagination
+        .route("/signals/clear", axum::routing::delete(routes::clear_database_handler)) // NEW: Clear DB
+        .route("/definitions/reasons", get(handlers::trading::get_signal_definitions_handler))
+        // --- Add new routes for logging ---
+        .route("/save-push-token", post(handlers::system::save_push_token_handler))
+        .route("/settings", post(handlers::system::update_settings_handler).get(handlers::system::get_settings_handler))
+        .route("/settings/reset", post(handlers::system::reset_settings_handler))
+        .route("/news-guard/:symbol", get(handlers::trading::get_news_guard_status_handler))
+        .route("/models/loaded", get(handlers::system::get_loaded_models_handler))
+        // --- Analysis Endpoints ---
+        .route("/daily-analysis", get(routes::daily_analysis))
+        .route("/weekly-analysis", get(routes::weekly_analysis))
+        .route("/chat-analysis", post(routes::chat_analysis_handler))
+        .route("/test-push", post(routes::test_push_handler))
+        // Provide the state to all handlers
+        .with_state(state)
 }

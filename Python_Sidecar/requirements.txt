@@ -1,2 +1,3 @@
 MetaTrader5
 websocket-client
+PySide6

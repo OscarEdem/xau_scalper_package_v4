@@ -11,18 +11,23 @@ use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
     ApplicationStateWithTicks, HistoricalSignal, LatestSignalsForSymbol,
-    SignalDefinitionsResponse, SignalReasonInfo
+    SignalDefinitionsResponse, SignalReasonInfo, TickData
 };
 
 /// New handler to ingest a single tick via HTTP POST and broadcast it.
+/// Validates the JSON payload against TickData to ensure stream integrity.
 pub async fn tick_ingest_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
-    tick_json: String, // Axum can receive the raw body as a String
+    Json(tick_data): Json<TickData>, 
 ) -> StatusCode {
     state.inner.metrics.http_requests.inc();
     let service = crate::services::trading::TradingService::new(state);
-    service.broadcast_tick(tick_json);
-    StatusCode::OK
+    if let Ok(tick_json) = serde_json::to_string(&tick_data) {
+        service.broadcast_tick(tick_json);
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 /// This is a trick for utoipa to document the raw JSON body of `tick_ingest_handler`.

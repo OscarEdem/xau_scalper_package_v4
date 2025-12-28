@@ -3,7 +3,7 @@ use serde_json::json;
 use anyhow::{anyhow, Result}; // Changed to anyhow::Result for clarity
 use std::time::Duration;
 use tokio::time::sleep;
-use crate::state::AppMetrics;
+use xau_scalper_server::metrics::AppMetrics;
 
 // Use the v1beta endpoint for the latest models
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1/models";
