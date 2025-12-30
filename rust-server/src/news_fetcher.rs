@@ -1,21 +1,8 @@
 use crate::NewsEvent;
+use crate::CalendarEvent;
 use crate::macro_analysis::classification::classify_event;
 use chrono::{Datelike, DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use reqwest::Client;
-use serde::Deserialize;
-use tracing::{debug, error, info};
-
-/// Represents the structure of a single event from the Forex Factory JSON endpoint.
-#[derive(Deserialize, Debug)]
-struct ForexFactoryEvent {
-    title: String,
-    country: String,
-    date: String,
-    impact: String,
-    forecast: Option<String>,
-    previous: Option<String>,
-    actual: Option<String>,
-}
+use tracing::{debug, info};
 
 /// Maps ForexFactory country codes to ISO currency codes.
 pub fn map_country_to_currency(country: &str) -> Option<String> {
@@ -77,63 +64,9 @@ pub fn parse_forexfactory_datetime_to_utc(date_str: &str) -> Option<i64> {
     Some(dt_with_tz.with_timezone(&Utc).timestamp())
 }
 
-/// Fetches the entire economic calendar for the week, filtering only by impact.
-pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
-    let client = match Client::builder().user_agent("Mozilla/5.0 (compatible; xau_scalper_ml/1.0)").build() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to build reqwest client: {}", e);
-            return vec![];
-        }
-    };
-
-    let url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
-    
-    let mut attempt = 0;
-    let max_retries = 3;
-    let mut response = None;
-
-    while attempt < max_retries {
-        match client.get(url).send().await {
-            Ok(res) => {
-                if res.status().is_success() {
-                    response = Some(res);
-                    break;
-                } else if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    let wait_secs = 60 * (attempt + 1);
-                    error!("Forex Factory returned 429 Too Many Requests. Retrying in {} seconds...", wait_secs);
-                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs as u64)).await;
-                } else {
-                    error!("Forex Factory returned error status: {}. Retrying...", res.status());
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-            Err(e) => {
-                error!("Failed to connect to Forex Factory: {}. Retrying...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-        attempt += 1;
-    }
-
-    let response = match response {
-        Some(r) => r,
-        None => {
-            error!("Failed to fetch news events after {} attempts.", max_retries);
-            return vec![];
-        }
-    };
-
-    let events: Vec<ForexFactoryEvent> = match response.json().await {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to parse Forex Factory JSON: {}", e);
-            return vec![];
-        }
-    };
-
-    let now = Utc::now().timestamp();
-    info!("Filtering news events. Server Time (UTC): {}", now);
+/// Processes raw calendar events: filters by impact, maps currency, and classifies.
+pub fn process_calendar_events(events: &[CalendarEvent]) -> Vec<NewsEvent> {
+    info!("Processing {} raw calendar events...", events.len());
     let mut relevant_events = Vec::new();
 
     for event in events {
@@ -164,14 +97,14 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
         let category = classify_event(&event.title);
 
         relevant_events.push(NewsEvent {
-            event: event.title,
+            event: event.title.clone(),
             timestamp,
             impact,
-            country: event.country,
+            country: event.country.clone(),
             currency,
-            forecast: event.forecast,
-            previous: event.previous,
-            actual: event.actual,
+            forecast: event.forecast.clone(),
+            previous: event.previous.clone(),
+            actual: event.actual.clone(),
             category,
         });
     }
@@ -179,6 +112,6 @@ pub async fn fetch_calendar_events() -> Vec<NewsEvent> {
     // 7. Sort ascending
     relevant_events.sort_by_key(|e| e.timestamp);
 
-    info!("Fetched {} global high-impact news events.", relevant_events.len());
+    info!("Processed {} global high-impact news events.", relevant_events.len());
     relevant_events
 }

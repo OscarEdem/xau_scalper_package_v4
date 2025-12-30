@@ -1,4 +1,5 @@
 use crate::{state::ApplicationStateWithTicks, llm::gemini::generate_analysis, llm::prompts::MACRO_SYSTEM_PROMPT_V1, HistoricalSignal};
+use xau_scalper_server::{NewsItem, CalendarEvent, SignalDirection};
 use crate::services::trading::TradingService;
 use xau_scalper_server::macro_analysis::builder::build_context;
 use xau_scalper_server::macro_analysis::types::TechnicalSignal;
@@ -155,7 +156,7 @@ pub async fn test_push_handler(
     
     let mut dummy_signal = EvalResponse::default();
     dummy_signal.signal_id = format!("TEST-{}", Utc::now().timestamp());
-    dummy_signal.entry_type = "long".to_string();
+    dummy_signal.entry_type = SignalDirection::Long;
     dummy_signal.entry_price = 2000.0;
     dummy_signal.push_title = Some("🔔 Test Notification".to_string());
     dummy_signal.push_body = Some("This is a test signal to verify Expo integration.".to_string());
@@ -213,6 +214,30 @@ pub async fn get_signals_paginated_handler(
     }))
 }
 
+#[utoipa::path(
+    get, path = "/external/calendar",
+    tag = "External Data",
+    responses((status = 200, description = "Returns cached external economic calendar events", body = Vec<CalendarEvent>))
+)]
+pub async fn get_external_calendar_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+) -> Json<Vec<CalendarEvent>> {
+    let events = state.inner.external_calendar_events.lock().await.clone();
+    Json(events)
+}
+
+#[utoipa::path(
+    get, path = "/external/news",
+    tag = "External Data",
+    responses((status = 200, description = "Returns cached external RSS news items", body = Vec<NewsItem>))
+)]
+pub async fn get_external_news_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+) -> Json<Vec<NewsItem>> {
+    let news = state.inner.external_rss_news.lock().await.clone();
+    Json(news)
+}
+
 /// Internal helper to generate fundamental analysis report
 pub async fn generate_fundamental_report(
     state: Arc<ApplicationStateWithTicks>,
@@ -268,9 +293,9 @@ pub async fn generate_fundamental_report(
             }
 
             // Extract Swing Signals
-            if signal.entry_type != "none" {
+            if signal.entry_type != SignalDirection::None {
                 swing_signals_ctx.push(TechnicalSignal {
-                    signal_type: signal.entry_type.clone(),
+                    signal_type: signal.entry_type.to_string(),
                     confidence: signal.conviction_score.unwrap_or(0.0),
                     price_level: signal.entry_price,
                 });

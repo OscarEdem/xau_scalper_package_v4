@@ -33,40 +33,40 @@ jobs:
           cargo test --verbose
 
   # New job to build and push the Docker image to GitHub Container Registry
-  build-and-push-docker:
-    # This job runs only when changes are pushed to the main branch
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # It depends on the build-and-test job passing first
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write # Required to push to GitHub Container Registry
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Log in to the GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile # Specify the path to our new Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  # build-and-push-docker:
+  #   # This job runs only when changes are pushed to the main branch
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   # It depends on the build-and-test job passing first
+  #   needs: build-and-test
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     packages: write # Required to push to GitHub Container Registry
+  #
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Log in to the GitHub Container Registry
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #
+  #     - name: Extract metadata (tags, labels) for Docker
+  #       id: meta
+  #       uses: docker/metadata-action@v5
+  #       with:
+  #         images: ghcr.io/${{ github.repository }}
+  #
+  #     - name: Build and push Docker image
+  #       uses: docker/build-push-action@v5
+  #       with:
+  #         context: .
+  #         file: ./Dockerfile # Specify the path to our new Dockerfile
+  #         push: true
+  #         tags: ${{ steps.meta.outputs.tags }}
+  #         labels: ${{ steps.meta.outputs.labels }}
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max

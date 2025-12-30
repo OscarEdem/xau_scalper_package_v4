@@ -2,7 +2,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use chrono::Utc;
 use tracing::info;
-use crate::fetch_calendar_events;
 use crate::state::ApplicationStateWithTicks;
 
 /// Spawns the background task for cleaning up stale signals in active sessions.
@@ -58,48 +57,6 @@ pub fn spawn_history_cleanup_task(_state: Arc<ApplicationStateWithTicks>, mut sh
             // This task now just sleeps to keep the structure intact or can be removed entirely.
             // We keep it running but doing nothing to avoid breaking main.rs calls.
             // info!(event = "history_cleanup", "Skipping automatic cleanup (disabled).");
-        }
-    });
-}
-
-/// Spawns the background task for fetching news events.
-pub fn spawn_news_fetch_task(state: Arc<ApplicationStateWithTicks>, mut shutdown_rx: broadcast::Receiver<()>) {
-    tokio::spawn(async move {
-        // Fetch immediately on startup
-        info!(event = "news_fetch_start", type = "initial", "Performing initial fetch of weekly news events from Forex Factory...");
-        let initial_events = fetch_calendar_events().await;
-        *state.inner.news_events.lock().await = initial_events;
-        
-        if let Err(e) = crate::db::save_news_events(&state.inner.db, &state.inner.news_events.lock().await, Some(&state.inner.metrics.db_retries_total)).await {
-            tracing::error!("Failed to save initial news events to DB: {}", e);
-        }
-
-        loop {
-            // Adjust interval: If we have no news (failed fetch), retry sooner (e.g., 5 mins).
-            let fetch_interval_secs = if state.inner.news_events.lock().await.is_empty() {
-                300
-            } else {
-                6 * 3600
-            };
-
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    info!(event = "shutdown", task = "news_fetch", "News fetch task shutting down.");
-                    break;
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(fetch_interval_secs)) => {}
-            }
-
-            info!(event = "news_fetch_start", type = "periodic", "Periodically fetching weekly news events from Forex Factory...");
-            let events = fetch_calendar_events().await;
-            // Only update if we actually got new events, to avoid clearing on a failed fetch
-            if !events.is_empty() {
-                *state.inner.news_events.lock().await = events;
-                
-                if let Err(e) = crate::db::save_news_events(&state.inner.db, &state.inner.news_events.lock().await, Some(&state.inner.metrics.db_retries_total)).await {
-                    tracing::error!("Failed to save periodic news events to DB: {}", e);
-                }
-            }
         }
     });
 }

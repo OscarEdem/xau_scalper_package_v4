@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, broadcast};
 use dashmap::DashMap;
-use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager};
+use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager, NewsItem, CalendarEvent};
 use xau_scalper_server::config::Settings;
 use xau_scalper_server::metrics::AppMetrics;
 
@@ -31,6 +31,8 @@ pub struct ApplicationState {
     pub signal_history: Arc<Mutex<VecDeque<HistoricalSignal>>>,
     pub push_tokens: Arc<Mutex<BTreeSet<String>>>,
     pub news_events: Arc<Mutex<Vec<NewsEvent>>>,
+    pub external_calendar_events: Arc<Mutex<Vec<CalendarEvent>>>,
+    pub external_rss_news: Arc<Mutex<Vec<NewsItem>>>,
     /// Cache for fundamental analysis reports. Key: "PAIR_period", Value: (events_hash, report)
     pub fundamental_analysis_cache: Arc<DashMap<String, (u64, String)>>,
     pub ws_clients: Arc<AtomicUsize>,

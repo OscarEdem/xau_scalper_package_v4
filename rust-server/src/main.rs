@@ -12,10 +12,10 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 use utoipa::{OpenApi};
-use utoipa_swagger_ui::SwaggerUi; pub use xau_scalper_server::{news_fetcher::fetch_calendar_events};
+use utoipa_swagger_ui::SwaggerUi;
 use tokio::fs; // Use tokio's async fs module
 pub use xau_scalper_server::{
-    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory
+    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory, NewsItem, CalendarEvent
 };
 use tokio::sync::Mutex;
 
@@ -25,6 +25,7 @@ mod background;
 pub mod state;
 pub mod handlers;
 pub mod services;
+pub mod external_feeds;
 use xau_scalper_server::db;
 
 use prometheus::{register_counter, register_counter_vec, register_gauge};
@@ -60,10 +61,12 @@ mod e2e_tests;
         handlers::system::get_settings_handler,
         handlers::trading::get_news_guard_status_handler,
         routes::get_signals_paginated_handler,
-        routes::clear_database_handler
+        routes::clear_database_handler,
+        routes::get_external_calendar_handler,
+        routes::get_external_news_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest, CalendarEvent, NewsItem)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -96,7 +99,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if db_url.is_empty() {
         panic!("Database URL is not set. Please set DATABASE_URL environment variable.");
     }
-    let db_pool = db::init_db(&db_url).await.expect("Failed to initialize database");
+
+    let mut db_pool = None;
+    let max_retries = 10;
+    for attempt in 1..=max_retries {
+        match db::init_db(&db_url).await {
+            Ok(pool) => {
+                db_pool = Some(pool);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize database (attempt {}/{}): {}", attempt, max_retries, e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+    let db_pool = db_pool.expect("Failed to initialize database after multiple attempts");
 
     // --- NEW: Load push tokens from DB on startup ---
     let initial_push_tokens = match db::load_push_tokens(&db_pool, None).await {
@@ -161,6 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Use the tokens loaded from the file
         push_tokens: Arc::new(Mutex::new(initial_push_tokens)),
         news_events: Arc::new(Mutex::new(Vec::new())),
+        external_calendar_events: Arc::new(Mutex::new(Vec::new())),
+        external_rss_news: Arc::new(Mutex::new(Vec::new())),
         fundamental_analysis_cache: Arc::new(DashMap::new()),
         ws_clients: Arc::new(AtomicUsize::new(0)),
         chat_rate_limiter: Arc::new(DashMap::new()),
@@ -202,9 +222,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Start Background Tasks ---
     background::spawn_stale_signal_cleanup_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
     background::spawn_history_cleanup_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
-    background::spawn_news_fetch_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
     background::spawn_session_persistence_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
     background::spawn_db_cleanup_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
+    external_feeds::spawn_external_feeds_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
 
     // --- Start Background Analysis Task ---
     routes::start_background_analysis_task(app_state_with_ticks.clone(), shutdown_tx.subscribe());
@@ -248,6 +268,8 @@ pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
         .route("/signals/paginated", get(routes::get_signals_paginated_handler)) // NEW: Pagination
         .route("/signals/clear", axum::routing::delete(routes::clear_database_handler)) // NEW: Clear DB
         .route("/definitions/reasons", get(handlers::trading::get_signal_definitions_handler))
+        .route("/external/calendar", get(routes::get_external_calendar_handler)) // NEW: External Calendar
+        .route("/external/news", get(routes::get_external_news_handler)) // NEW: External RSS News
         // --- Add new routes for logging ---
         .route("/save-push-token", post(handlers::system::save_push_token_handler))
         .route("/settings", post(handlers::system::update_settings_handler).get(handlers::system::get_settings_handler))

@@ -57,6 +57,8 @@ async fn setup_test_state() -> Arc<ApplicationStateWithTicks> {
         signal_history: Arc::new(Mutex::new(VecDeque::new())),
         push_tokens: Arc::new(Mutex::new(BTreeSet::new())),
         news_events: Arc::new(Mutex::new(Vec::new())),
+        external_calendar_events: Arc::new(Mutex::new(Vec::new())),
+        external_rss_news: Arc::new(Mutex::new(Vec::new())),
         fundamental_analysis_cache: Arc::new(DashMap::new()),
         ws_clients: Arc::new(AtomicUsize::new(0)),
         chat_rate_limiter: Arc::new(DashMap::new()),

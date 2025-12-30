@@ -1,4 +1,4 @@
-use crate::{EvalRequest, EvalResponse, PriceLevel};
+use crate::{EvalRequest, EvalResponse, PriceLevel, SignalDirection};
 use ::uuid::Uuid;
 use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, calculate_dynamic_thickness, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::ScalpSettings};
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ enum ScalpMode {
 
 /// Internal struct to hold the decision from a strategy sub-function.
 struct Decision {
-    entry_type: String,
+    entry_type: SignalDirection,
     conviction: f64,
     reason: String,
     scalp_mode: ScalpMode,
@@ -26,7 +26,7 @@ struct Decision {
 impl Default for Decision {
     fn default() -> Self {
         Self {
-            entry_type: "none".to_string(),
+            entry_type: SignalDirection::None,
             conviction: 0.0,
             reason: "No Signal".to_string(),
             scalp_mode: ScalpMode::Pullback,
@@ -136,8 +136,8 @@ impl ScalpEngine {
             _ => false,
         };
 
-        if decision.entry_type != "none" && !mode_allowed {
-            decision.entry_type = "none".to_string();
+        if decision.entry_type != SignalDirection::None && !mode_allowed {
+            decision.entry_type = SignalDirection::None;
             decision.reason = format!("No Signal ({} session blocks {:?})", session, decision.scalp_mode);
         }
 
@@ -150,7 +150,7 @@ impl ScalpEngine {
             } else { false };
 
             if confirmed {
-                decision.entry_type = if london_hunt_signal == "bullish_hunt" { "long".to_string() } else { "short".to_string() };
+                decision.entry_type = if london_hunt_signal == "bullish_hunt" { SignalDirection::Long } else { SignalDirection::Short };
                 decision.reason = format!("London Open Stop-Hunt: Swept Asia {}", if london_hunt_signal == "bullish_hunt" { "Low" } else { "High" });
                 decision.entry_price = req.current_price;
                 decision.recommended_order_type = format!("market_{}", decision.entry_type);
@@ -185,14 +185,14 @@ impl ScalpEngine {
         decision.debug_info.insert("vol_regime".to_string(), format!("{:.2}", decision.vol_regime_val));
 
         // ---- Deterministic Signal ID ----
-        let signal_id = if decision.entry_type != "none" {
+        let signal_id = if decision.entry_type != SignalDirection::None {
             let m5_timestamp = req.last_m1_timestamp - (req.last_m1_timestamp % 300);
-            format!("{}-{}-{}", req.symbol, decision.entry_type, m5_timestamp)
+            format!("{}-{}-{}", req.symbol, decision.entry_type.to_string(), m5_timestamp)
         } else {
             Uuid::new_v4().to_string()
         };
 
-        let scalp_mode_str = if decision.entry_type != "none" {
+        let scalp_mode_str = if decision.entry_type != SignalDirection::None {
             Some(match decision.scalp_mode {
                 ScalpMode::Momentum => "momentum".to_string(),
                 ScalpMode::Pullback => "pullback".to_string(),
@@ -275,7 +275,7 @@ impl ScalpEngine {
                 let m1_close = *req.closes.last().unwrap_or(&0.0);
                 let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
                 if m1_close < prev_m1_close {
-                    decision.entry_type = "short".to_string();
+                    decision.entry_type = SignalDirection::Short;
                     decision.reason = format!("Fade Short: Parabolic Rejection at Upper Fence");
                     triggered = true;
                 }
@@ -283,7 +283,7 @@ impl ScalpEngine {
                 let m1_close = *req.closes.last().unwrap_or(&0.0);
                 let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
                 if m1_close > prev_m1_close {
-                    decision.entry_type = "long".to_string();
+                    decision.entry_type = SignalDirection::Long;
                     decision.reason = format!("Fade Long: Parabolic Rejection at Lower Fence");
                     triggered = true;
                 }
@@ -461,11 +461,11 @@ impl ScalpEngine {
 
             let min_conv_to_trade = settings.min_conviction;
             if conv_long >= min_conv_to_trade && conv_long > conv_short {
-                decision.entry_type = "long".to_string();
+                decision.entry_type = SignalDirection::Long;
                 decision.conviction = conv_long;
                 decision.reason = long_reasons.join(" + ");
             } else if conv_short >= min_conv_to_trade && conv_short > conv_long {
-                decision.entry_type = "short".to_string();
+                decision.entry_type = SignalDirection::Short;
                 decision.conviction = conv_short;
                 decision.reason = short_reasons.join(" + ");
             } else {
@@ -476,17 +476,17 @@ impl ScalpEngine {
                 } else {
                     "No Signal (Low Conviction)".to_string()
                 };
-                decision.entry_type = "none".to_string();
+                decision.entry_type = SignalDirection::None;
                 decision.conviction = 0.0;
                 decision.reason = detailed_reason;
             };
 
             // Execution Decision
-            if decision.entry_type == "none" {
+            if decision.entry_type == SignalDirection::None {
                 decision.recommended_order_type = "none".to_string();
                 decision.entry_price = 0.0;
             } else {
-                let suffix = decision.entry_type.clone();
+                let suffix = decision.entry_type.to_string();
                 if inducement_score > 0.0 {
                     decision.recommended_order_type = format!("market_{}", suffix);
                     decision.entry_price = req.current_price;
@@ -505,9 +505,9 @@ impl ScalpEngine {
             }
 
             // Mode Classification
-            let near_structure = match decision.entry_type.as_str() {
-                "long" => last_swing_low.map(|p| (decision.entry_price - p) < last_atr).unwrap_or(false),
-                "short" => last_swing_high.map(|p| (p - decision.entry_price) < last_atr).unwrap_or(false),
+            let near_structure = match decision.entry_type {
+                SignalDirection::Long => last_swing_low.map(|p| (decision.entry_price - p) < last_atr).unwrap_or(false),
+                SignalDirection::Short => last_swing_high.map(|p| (p - decision.entry_price) < last_atr).unwrap_or(false),
                 _ => false,
             };
 
@@ -538,12 +538,12 @@ impl ScalpEngine {
         let entry_price = decision.entry_price;
         let entry_type = &decision.entry_type;
 
-        if entry_type != "none" {
+        if *entry_type != SignalDirection::None {
             match decision.scalp_mode {
                 ScalpMode::Fade => {
                     let sl_dist = last_atr * settings.fade_sl_atr_mult;
                     let tp1_dist = last_atr * settings.fade_tp1_atr_mult;
-                    if entry_type == "long" {
+                    if *entry_type == SignalDirection::Long {
                         sl = entry_price - sl_dist;
                         tp1 = entry_price + tp1_dist;
                     } else {
@@ -555,22 +555,22 @@ impl ScalpEngine {
                 ScalpMode::Momentum => {
                     // 1️⃣ Fix: Enforce floor on Momentum SL
                     let risk = (last_atr * settings.momentum_risk_atr_mult).max(last_atr * settings.momentum_min_risk_atr);
-                    sl = if entry_type == "long" { entry_price - risk } else { entry_price + risk };
-                    tp1 = if entry_type == "long" { entry_price + last_atr * settings.momentum_tp1_atr_mult } else { entry_price - last_atr * settings.momentum_tp1_atr_mult };
-                    tp2 = if entry_type == "long" { entry_price + last_atr * settings.momentum_tp2_atr_mult } else { entry_price - last_atr * settings.momentum_tp2_atr_mult };
+                    sl = if *entry_type == SignalDirection::Long { entry_price - risk } else { entry_price + risk };
+                    tp1 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.momentum_tp1_atr_mult } else { entry_price - last_atr * settings.momentum_tp1_atr_mult };
+                    tp2 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.momentum_tp2_atr_mult } else { entry_price - last_atr * settings.momentum_tp2_atr_mult };
                 },
                 ScalpMode::Pullback => {
                     // 2️⃣ Fix: Structure-first, ATR-second. No structure = No trade.
-                    let base_sl = match entry_type.as_str() {
-                        "long" => last_swing_low,
-                        "short" => last_swing_high,
+                    let base_sl = match entry_type {
+                        SignalDirection::Long => last_swing_low,
+                        SignalDirection::Short => last_swing_high,
                         _ => None,
                     };
 
                     if let Some(anchor) = base_sl {
-                        sl = if entry_type == "long" { anchor - last_atr * settings.pullback_sl_atr_mult } else { anchor + last_atr * settings.pullback_sl_atr_mult };
-                        tp1 = if entry_type == "long" { entry_price + last_atr * settings.pullback_tp1_atr_mult } else { entry_price - last_atr * settings.pullback_tp1_atr_mult };
-                        tp2 = if entry_type == "long" { entry_price + last_atr * settings.pullback_tp2_atr_mult } else { entry_price - last_atr * settings.pullback_tp2_atr_mult };
+                        sl = if *entry_type == SignalDirection::Long { anchor - last_atr * settings.pullback_sl_atr_mult } else { anchor + last_atr * settings.pullback_sl_atr_mult };
+                        tp1 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.pullback_tp1_atr_mult } else { entry_price - last_atr * settings.pullback_tp1_atr_mult };
+                        tp2 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.pullback_tp2_atr_mult } else { entry_price - last_atr * settings.pullback_tp2_atr_mult };
                     } else {
                         return (0.0, 0.0, 0.0);
                     }
@@ -579,9 +579,9 @@ impl ScalpEngine {
 
             // Step 2.5: Enforce Directionality (Sanity Check)
             // Ensure SL is always on the correct side of entry before clamping distance
-            if entry_type == "long" && sl >= entry_price {
+            if *entry_type == SignalDirection::Long && sl >= entry_price {
                 sl = entry_price - (last_atr * settings.min_sl_atr_mult);
-            } else if entry_type == "short" && sl <= entry_price {
+            } else if *entry_type == SignalDirection::Short && sl <= entry_price {
                 sl = entry_price + (last_atr * settings.min_sl_atr_mult);
             }
 
@@ -592,10 +592,10 @@ impl ScalpEngine {
 
             if sl_distance < min_sl {
                 // Too tight: Push SL away to meet min_sl
-                sl = if entry_type == "long" { entry_price - min_sl } else { entry_price + min_sl };
+                sl = if *entry_type == SignalDirection::Long { entry_price - min_sl } else { entry_price + min_sl };
             } else if sl_distance > max_sl {
                 // Too wide: Pull SL closer to meet max_sl
-                sl = if entry_type == "long" { entry_price - max_sl } else { entry_price + max_sl };
+                sl = if *entry_type == SignalDirection::Long { entry_price - max_sl } else { entry_price + max_sl };
             }
         }
         (sl, tp1, tp2)

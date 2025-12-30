@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use chrono::Utc;
 use prometheus::{Encoder, TextEncoder};
-use tokio::fs;
 use xau_scalper_server::config::TradingSettings;
 
 use crate::state::{ApplicationStateWithTicks, MetricsResponse, SavePushTokenRequest};
@@ -75,22 +74,13 @@ pub async fn save_push_token_handler(
     }
 
     let mut tokens = state.inner.push_tokens.lock().await;
+    let token_for_db = body.token.clone();
     let inserted = tokens.insert(body.token);
 
-    // --- NEW: Persist tokens to file if a new one was added ---
+    // --- NEW: Persist tokens to DB if a new one was added ---
     if inserted {
         tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
-        let file_path = state.inner.config.paths.push_tokens_file.clone();
-        // Clone the tokens to write them to the file without holding the lock.
-        let tokens_to_save = tokens.clone();
-        // In a separate task to avoid blocking the response.
-        tokio::spawn(async move {
-            if let Ok(json) = serde_json::to_string(&tokens_to_save) {
-                if let Err(e) = fs::write(&file_path, json).await {
-                    tracing::error!("Failed to write push tokens to file {}: {}", file_path, e);
-                }
-            }
-        });
+        state.inner.session_manager.save_push_token(token_for_db, "expo".to_string()).await;
     }
 
     (StatusCode::OK, Json("Token processed"))
@@ -130,11 +120,6 @@ pub async fn update_settings_handler(
     tracing::info!("Received request to update trading settings.");
     state.inner.session_manager.update_settings(settings.clone()).await;
 
-    // Persist the updated settings to the config file
-    if let Err(e) = persist_config(&settings, &state.inner.config.paths.sessions_dir).await {
-        tracing::error!("Failed to persist settings to config file: {}", e);
-    }
-
     (StatusCode::OK, Json("Settings updated successfully".to_string()))
 }
 
@@ -150,18 +135,6 @@ pub async fn reset_settings_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
 ) -> (StatusCode, Json<String>) {
     tracing::info!("Received request to reset trading settings to base config file.");
-
-    // 1. Delete the persistent override file.
-    let persistent_config_path = format!("{}/config.toml", &state.inner.config.paths.sessions_dir);
-    if let Err(e) = fs::remove_file(&persistent_config_path).await {
-        // It's okay if the file doesn't exist (already reset), but log other errors.
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::error!("Failed to delete persistent settings file at {}: {}", persistent_config_path, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(format!("Failed to delete persistent settings: {}", e)));
-        }
-    } else {
-        tracing::info!("Successfully deleted persistent settings override file at {}", persistent_config_path);
-    }
 
     // 2. Reload settings from the base config files (e.g., config.toml or /etc/secrets/config.toml).
     // This re-runs the logic in Settings::new() which will now not find the override file.
@@ -192,18 +165,4 @@ pub async fn get_loaded_models_handler(
 ) -> Json<Vec<String>> {
     let keys = state.inner.predictor_cache.loaded_keys();
     Json(keys)
-}
-
-async fn persist_config(settings: &TradingSettings, config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Construct the path to the config file
-    let config_file_path = format!("{}/config.toml", config_path);
-
-    // Serialize the settings to a TOML string
-    let toml_string = toml::to_string(settings)?;
-
-    // Write the TOML string to the config file
-    tokio::fs::write(config_file_path, toml_string).await?;
-
-    tracing::info!("Successfully persisted settings to config file");
-    Ok(())
 }

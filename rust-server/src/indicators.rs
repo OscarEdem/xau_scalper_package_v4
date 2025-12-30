@@ -27,6 +27,27 @@ pub struct NewsEvent {
     pub category: MacroCategory, // NEW
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct NewsItem {
+    pub title: String,
+    pub link: String,
+    pub pub_date: String,
+    pub source: String,
+    pub image_url: Option<String>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CalendarEvent {
+    pub title: String,
+    pub country: String,
+    pub date: String, // ISO-8601-like string from JSON
+    pub impact: String,
+    pub forecast: Option<String>,
+    pub previous: Option<String>,
+    pub actual: Option<String>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -155,11 +176,29 @@ pub struct VwapBands {
     pub lower_band2: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalDirection {
+    Long,
+    Short,
+    None,
+}
+
+impl std::fmt::Display for SignalDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignalDirection::Long => write!(f, "long"),
+            SignalDirection::Short => write!(f, "short"),
+            SignalDirection::None => write!(f, "none"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalResponse {
     pub signal_id: String, // e.g., a UUID or timestamp-based ID
-    pub entry_type: String, // "long", "short", "none"
+    pub entry_type: SignalDirection, // "long", "short", "none"
     pub entry_price: f64,
     pub sl_price: f64,
     pub tp1_price: f64, // Imbalance fill
@@ -201,7 +240,7 @@ impl Default for EvalResponse {
     fn default() -> Self {
         Self {
             signal_id: "".to_string(),
-            entry_type: "none".to_string(),
+            entry_type: SignalDirection::None,
             entry_price: 0.0,
             sl_price: 0.0,
             tp1_price: 0.0,
@@ -558,7 +597,7 @@ pub fn atr_pulse(atr_vals: &[f64], lookback: usize, factor: f64) -> bool {
     sorted.retain(|&v| v > 0.0);
     if sorted.is_empty() { return false; }
 
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = sorted[sorted.len() / 2];
 
     atr_vals[n - 1] > median * factor
@@ -648,14 +687,14 @@ pub fn detect_rsi_divergence(lows: &[f64], highs: &[f64], closes: &[f64], rsi_pe
 pub fn get_fvg_limit_price(
     zones: &Vec<PriceLevel>,
     current_price: f64,
-    direction: &str,
+    direction: &SignalDirection,
     strategy: &str, // "optimal" or "aggressive"
 ) -> Option<f64> {
     if zones.is_empty() {
         return None;
     }
 
-    if direction == "long" {
+    if *direction == SignalDirection::Long {
         // Find closest FVG below current price
         if let Some(zone) = zones
             .iter()
@@ -700,7 +739,10 @@ pub fn detect_realtime_divergence(
     let current_high = highs[n - 1];
     let current_rsi = rsi_vals[n - 1];
 
-    let (prev_low_idx, &prev_low_val) = lows[n - lookback..n - 1].iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    let min_low = lows[n - lookback..n - 1].iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+    if min_low.is_none() { return "none".to_string(); }
+    let (prev_low_idx, &prev_low_val) = min_low.unwrap();
+
     let prev_low_rsi = rsi_vals[(n - lookback) + prev_low_idx];
 
     // Aggressive Bullish Check: Price is CURRENTLY breaking the low, but RSI is curling up/higher
@@ -708,7 +750,10 @@ pub fn detect_realtime_divergence(
         return "bullish_realtime".to_string();
     }
 
-    let (prev_high_idx, &prev_high_val) = highs[n - lookback..n - 1].iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    let max_high = highs[n - lookback..n - 1].iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+    if max_high.is_none() { return "none".to_string(); }
+    let (prev_high_idx, &prev_high_val) = max_high.unwrap();
+
     let prev_high_rsi = rsi_vals[(n - lookback) + prev_high_idx];
 
     // Aggressive Bearish Check: Price is CURRENTLY breaking the high, but RSI is curling down/lower

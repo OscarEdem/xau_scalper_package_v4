@@ -1,4 +1,4 @@
-use crate::{EvalRequest, EvalResponse};
+use crate::{EvalRequest, EvalResponse, SignalDirection};
 use ::uuid::Uuid;
 use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, find_order_blocks, calculate_dynamic_thickness, get_daily_bias, get_trend_bias, rsi, get_fvg_limit_price, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::SwingSettings};
 use tracing::debug;
@@ -161,9 +161,9 @@ impl SwingEngine {
         // --- 7. Execution Logic ---
         let conviction_threshold = settings.conviction_threshold; // Lowered to capture Context-only trades (HTF + AI)
         let (entry_type, conviction_score, reason) = if long_score > short_score && long_score >= conviction_threshold {
-            ("long".to_string(), long_score.min(100.0), reason_long)
+            (SignalDirection::Long, long_score.min(100.0), reason_long)
         } else if short_score > long_score && short_score >= conviction_threshold {
-            ("short".to_string(), short_score.min(100.0), reason_short)
+            (SignalDirection::Short, short_score.min(100.0), reason_short)
         } else {
             let (leaning_reason, score) = if long_score >= short_score {
                 (reason_long, long_score)
@@ -175,16 +175,16 @@ impl SwingEngine {
             } else {
                 "No Signal (Low Conviction)".to_string()
             };
-            ("none".to_string(), 0.0, detailed_reason)
+            (SignalDirection::None, 0.0, detailed_reason)
         };
 
         // --- 7b. Order Type & Price Logic ---
         // If the signal is based on an FVG, try to get a limit entry at equilibrium (50% of gap).
         // Otherwise, default to market execution.
-        let (recommended_order_type, execution_price) = if entry_type == "none" {
+        let (recommended_order_type, execution_price) = if entry_type == SignalDirection::None {
             ("none".to_string(), 0.0)
         } else {
-            let suffix = entry_type.clone(); // "long" or "short"
+            let suffix = entry_type.to_string(); // "long" or "short"
             
             if reason.contains("FVG") {
                  if let Some(price) = get_fvg_limit_price(&fvg_zones, req.current_price, &entry_type, "optimal") {
@@ -198,7 +198,7 @@ impl SwingEngine {
         };
 
         // --- 8. Risk Model ---
-        let (sl_price, tp1_price, tp2_price) = if entry_type != "none" {
+        let (sl_price, tp1_price, tp2_price) = if entry_type != SignalDirection::None {
             Self::risk_model(
                 &entry_type, &reason, execution_price, last_atr, &structure, h1_highs[n-1], h1_lows[n-1], settings
             )
@@ -263,14 +263,26 @@ impl SwingEngine {
         debug_info.insert("long_score".to_string(), format!("{:.2}", long_score));
         debug_info.insert("short_score".to_string(), format!("{:.2}", short_score));
         debug_info.insert("entry_atr".to_string(), format!("{:.5}", last_atr));
+        debug_info.insert("raw_long_score".to_string(), format!("{:.2}", long_score));
+        debug_info.insert("raw_short_score".to_string(), format!("{:.2}", short_score));
 
         // --- Deterministic Signal ID ---
         // We generate a stable ID based on the structural level being traded.
         // This ensures that as long as the setup exists at this price, the ID remains the same.
-        let signal_id = if entry_type != "none" {
-            let price_key = if entry_type == "long" { structure.external_low.1 } else { structure.external_high.1 };
+        let signal_id = if entry_type != SignalDirection::None {
+            let (price_key, idx) = if entry_type == SignalDirection::Long { 
+                (structure.external_low.1, structure.external_low.0) 
+            } else { 
+                (structure.external_high.1, structure.external_high.0) 
+            };
+
+            // Calculate timestamp of the swing point to ensure ID uniqueness across time
+            let n = h1_closes.len();
+            let last_ts = req.last_h1_timestamp.unwrap_or(0);
+            let swing_ts = if last_ts > 0 { last_ts - ((n.saturating_sub(1).saturating_sub(idx)) as i64 * 3600) } else { 0 };
+
             // Use UUID v5 (Name-based) to create a unique hash for this specific setup
-            format!("{}-{}-{:.5}", req.symbol, entry_type, price_key)
+            format!("{}-{}-{:.5}-{}", req.symbol, entry_type.to_string(), price_key, swing_ts)
         } else {
             Uuid::new_v4().to_string()
         };
@@ -518,34 +530,39 @@ impl SwingEngine {
         }
 
         // 4. FVG Alignment (Weight: 20)
-        // Bullish FVG created below price after a bullish move
-        if displacement.is_bullish {
-            if fvg_zones.iter().any(|z| z.bottom < current_price && z.is_bullish.unwrap_or(false)) {
-                long_score += settings.fvg_weight;
-                reason_long.push("Bullish FVG Support");
-            }
+        // Check for FVG Support/Resistance regardless of current displacement (allows retests)
+        let bullish_fvg_match = fvg_zones.iter().any(|z| {
+            let is_valid_location = z.bottom < current_price && z.is_bullish.unwrap_or(false);
+            if !is_valid_location { return false; }
+            let is_testing = current_price <= z.top;
+            is_testing || displacement.is_bullish
+        });
+        if bullish_fvg_match {
+             long_score += settings.fvg_weight;
+             reason_long.push("Bullish FVG Support");
         }
-        // Bearish FVG created above price after a bearish move
-        if displacement.is_bearish {
-             if fvg_zones.iter().any(|z| z.top > current_price && !z.is_bullish.unwrap_or(true)) {
-                short_score += settings.fvg_weight;
-                reason_short.push("Bearish FVG Resistance");
-            }
+
+        let bearish_fvg_match = fvg_zones.iter().any(|z| {
+            let is_valid_location = z.top > current_price && !z.is_bullish.unwrap_or(true);
+            if !is_valid_location { return false; }
+            let is_testing = current_price >= z.bottom;
+            is_testing || displacement.is_bearish
+        });
+        if bearish_fvg_match {
+             short_score += settings.fvg_weight;
+             reason_short.push("Bearish FVG Resistance");
         }
 
         // 5. Order Block Alignment (Weight: 25)
-        if displacement.is_bullish {
-             if order_blocks.iter().any(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998) {
-                 long_score += 25.0;
-                 reason_long.push("Bullish Order Block Test");
-             }
+        // Decoupled from displacement to allow Limit entries on retests
+        if order_blocks.iter().any(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998) {
+             long_score += 25.0;
+             reason_long.push("Bullish Order Block Test");
         }
 
-        if displacement.is_bearish {
-             if order_blocks.iter().any(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002) {
-                 short_score += 25.0;
-                 reason_short.push("Bearish Order Block Test");
-             }
+        if order_blocks.iter().any(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002) {
+             short_score += 25.0;
+             reason_short.push("Bearish Order Block Test");
         }
 
         if final_prediction_bias > 0.0 {
@@ -561,7 +578,7 @@ impl SwingEngine {
 
     /// Calculates SL and TP based on ATR and setup type.
     fn risk_model(
-        entry_type: &str,
+        entry_type: &SignalDirection,
         reason: &str,
         entry_price: f64,
         last_atr: f64,
@@ -573,7 +590,7 @@ impl SwingEngine {
         // Clamp max SL distance to avoid excessive risk on volatile candles (e.g. 3 ATRs)
         let max_sl_dist = last_atr * 3.0;
 
-        if entry_type == "long" {
+        if *entry_type == SignalDirection::Long {
             // For SFP, SL goes below the liquidity wick (current_low).
             // For Structure/Trend, try internal structure first (tighter), then external.
             let sl_anchor = if reason.contains("SFP") { 
@@ -631,7 +648,7 @@ impl SwingEngine {
     /// Checks M15 structure to prevent entering against immediate momentum.
     /// Returns a penalty to subtract from your conviction score.
     pub fn fractal_guard(
-        entry_type: &str,
+        entry_type: &str, // Kept as str for internal helper usage or update to enum if preferred
         m15_highs: Option<&[f64]>,
         m15_lows: Option<&[f64]>,
         m15_closes: Option<&[f64]>,
@@ -674,28 +691,30 @@ impl SwingEngine {
         let is_lower_low = ltf_structure.external_low.0 > ltf_structure.internal_low.0;
         let is_higher_low = !is_lower_low;
 
-        let is_ltf_downtrend = is_lower_high && is_lower_low;
-        let is_ltf_uptrend = is_higher_high && is_higher_low;
+        let _is_ltf_downtrend = is_lower_high && is_lower_low;
+        let _is_ltf_uptrend = is_higher_high && is_higher_low;
 
         match entry_type {
             "long" => {
                 // DANGER: H1 says Long, but M15 is making Lower Lows (Downtrend) or breaking down
                 let is_breaking_down = current_close < ltf_structure.internal_low.1;
 
-                if is_ltf_downtrend || is_breaking_down {
+                // Fix: Don't penalize just for downtrend (pullback), only for active breakdown
+                if is_breaking_down {
                     result.is_fighting_trend = true;
                     result.penalty_score = settings.fractal_penalty_score;
-                    result.warning = Some("M15 Trend is Bearish (Falling Knife)".to_string());
+                    result.warning = Some("M15 Structure Breakdown (Falling Knife)".to_string());
                 }
             },
             "short" => {
                 // DANGER: H1 says Short, but M15 is making Higher Highs (Uptrend) or breaking up
                 let is_breaking_up = current_close > ltf_structure.internal_high.1;
 
-                if is_ltf_uptrend || is_breaking_up {
+                // Fix: Don't penalize just for uptrend (pullback), only for active breakout
+                if is_breaking_up {
                     result.is_fighting_trend = true;
                     result.penalty_score = settings.fractal_penalty_score;
-                    result.warning = Some("M15 Trend is Bullish (Step in front of train)".to_string());
+                    result.warning = Some("M15 Structure Breakout (Step in front of train)".to_string());
                 }
             },
             _ => {}
