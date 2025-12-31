@@ -1,10 +1,19 @@
-import MetaTrader5 as mt5 # type: ignore
+import sys
 import time
 import threading
 import websocket # type: ignore
 import json
-import sys
 from datetime import datetime
+import ctypes
+
+try:
+    import MetaTrader5 as mt5 # type: ignore
+except ImportError as e:
+    error_msg = f"CRITICAL ERROR: Failed to import MetaTrader5 module.\nDetails: {e}"
+    if "numpy" in str(e).lower():
+        error_msg += "\n\nPOSSIBLE CAUSE: Incompatible Numpy version (2.0+).\nPlease downgrade to Numpy 1.x (pip install \"numpy<2\")."
+    ctypes.windll.user32.MessageBoxW(0, error_msg, "Startup Error", 0x10)
+    sys.exit(1)
 
 from config import CONFIG, state
 from mt5_interface import execute_trade, manage_positions, init_trade_tracking
@@ -23,6 +32,9 @@ def trading_loop():
     
     # Initialize Trade Tracking (Load active trades)
     init_trade_tracking()
+
+    if "processed_ids" not in state:
+        state["processed_ids"] = set()
 
     def on_open(ws):
         state["status_text"] = "Connected"
@@ -91,7 +103,8 @@ def trading_loop():
                         print(f"[FILTER] Swing signal ignored (Swing Mode OFF)")
                         continue
                     
-                    if sig_id != state["last_processed_id"] and e_type in ["long", "short"]:
+                    if sig_id not in state["processed_ids"] and e_type in ["long", "short"]:
+                        state["processed_ids"].add(sig_id)
                         state["last_processed_id"] = sig_id
                         execute_trade(data)
                 

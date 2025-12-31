@@ -78,6 +78,9 @@ pub struct EvalRequest<'a> {
     pub m15_highs: Option<Cow<'a, [f64]>>,
     #[schema(value_type = Option<Vec<f64>>)]
     pub m15_lows: Option<Cow<'a, [f64]>>,
+    /// UNIX timestamps for M15 candles. Essential for precise structural analysis.
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub m15_timestamps: Option<Cow<'a, [i64]>>, // NEW
     #[schema(value_type = Vec<f64>)]
     pub m30_closes: Cow<'a, [f64]>,
     #[schema(value_type = Option<Vec<f64>>)]
@@ -88,6 +91,9 @@ pub struct EvalRequest<'a> {
     pub h1_opens: Option<Cow<'a, [f64]>>,
     #[schema(value_type = Option<Vec<f64>>)]
     pub h1_lows: Option<Cow<'a, [f64]>>,
+    /// UNIX timestamps for H1 candles. Used to generate deterministic Swing IDs.
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub h1_timestamps: Option<Cow<'a, [i64]>>, // NEW
     // Add these Higher Time Frames
     #[schema(value_type = Option<Vec<f64>>)]
     pub h4_closes: Option<Cow<'a, [f64]>>,
@@ -95,10 +101,16 @@ pub struct EvalRequest<'a> {
     pub h4_highs: Option<Cow<'a, [f64]>>, 
     #[schema(value_type = Option<Vec<f64>>)]
     pub h4_lows: Option<Cow<'a, [f64]>>,  
+    /// UNIX timestamps for H4 candles.
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub h4_timestamps: Option<Cow<'a, [i64]>>, // NEW
     #[schema(value_type = Option<Vec<f64>>)]
     pub d1_opens: Option<Cow<'a, [f64]>>,
     #[schema(value_type = Option<Vec<f64>>)]
     pub d1_closes: Option<Cow<'a, [f64]>>,
+    /// UNIX timestamps for D1 candles.
+    #[schema(value_type = Option<Vec<i64>>)]
+    pub d1_timestamps: Option<Cow<'a, [i64]>>, // NEW
     #[schema(value_type = Option<Vec<NewsEvent>>)]
     pub upcoming_events: Option<Cow<'a, [NewsEvent]>>,
     // Optional base parameters

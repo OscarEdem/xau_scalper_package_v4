@@ -183,6 +183,7 @@ pub struct MarketDataBuffer {
     pub m5_highs: VecDeque<f64>,
     pub m5_lows: VecDeque<f64>,
     pub m5_timestamps: VecDeque<i64>,
+    pub m15_timestamps: VecDeque<i64>,
     pub m15_closes: VecDeque<f64>,
     pub m15_highs: VecDeque<f64>,
     pub m15_lows: VecDeque<f64>,
@@ -191,11 +192,14 @@ pub struct MarketDataBuffer {
     pub h1_highs: VecDeque<f64>,
     pub h1_opens: VecDeque<f64>,
     pub h1_lows: VecDeque<f64>,
+    pub h1_timestamps: VecDeque<i64>,
     pub h4_closes: VecDeque<f64>,
     pub h4_highs: VecDeque<f64>,
     pub h4_lows: VecDeque<f64>,
+    pub h4_timestamps: VecDeque<i64>,
     pub d1_opens: VecDeque<f64>,
     pub d1_closes: VecDeque<f64>,
+    pub d1_timestamps: VecDeque<i64>,
 }
 
 impl MarketDataBuffer {
@@ -213,6 +217,7 @@ impl MarketDataBuffer {
             m5_highs: VecDeque::with_capacity(initial_buffer_size),
             m5_lows: VecDeque::with_capacity(initial_buffer_size),
             m5_timestamps: VecDeque::with_capacity(initial_buffer_size),
+            m15_timestamps: VecDeque::with_capacity(initial_buffer_size),
             m15_closes: VecDeque::with_capacity(initial_buffer_size),
             m15_highs: VecDeque::with_capacity(initial_buffer_size),
             m15_lows: VecDeque::with_capacity(initial_buffer_size),
@@ -221,11 +226,14 @@ impl MarketDataBuffer {
             h1_highs: VecDeque::with_capacity(initial_buffer_size),
             h1_opens: VecDeque::with_capacity(initial_buffer_size),
             h1_lows: VecDeque::with_capacity(initial_buffer_size),
+            h1_timestamps: VecDeque::with_capacity(initial_buffer_size),
             h4_closes: VecDeque::with_capacity(initial_buffer_size),
             h4_highs: VecDeque::with_capacity(initial_buffer_size),
             h4_lows: VecDeque::with_capacity(initial_buffer_size),
+            h4_timestamps: VecDeque::with_capacity(initial_buffer_size),
             d1_opens: VecDeque::with_capacity(initial_buffer_size),
             d1_closes: VecDeque::with_capacity(initial_buffer_size),
+            d1_timestamps: VecDeque::with_capacity(initial_buffer_size),
         }
     }
 
@@ -263,6 +271,7 @@ impl MarketDataBuffer {
                 if let Some(v) = &req.m15_closes { TradingSession::update_buffer(&mut self.m15_closes, v, settings.max_buffer_size); }
                 if let Some(v) = &req.m15_highs { TradingSession::update_buffer(&mut self.m15_highs, v, settings.max_buffer_size); }
                 if let Some(v) = &req.m15_lows { TradingSession::update_buffer(&mut self.m15_lows, v, settings.max_buffer_size); }
+                if let Some(v) = &req.m15_timestamps { TradingSession::update_buffer_i64(&mut self.m15_timestamps, v, settings.max_buffer_size); }
                 self.last_m15_timestamp = ts;
             }
         }
@@ -288,6 +297,7 @@ impl MarketDataBuffer {
                 if let Some(v) = &req.h1_highs { TradingSession::update_buffer(&mut self.h1_highs, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h1_opens { TradingSession::update_buffer(&mut self.h1_opens, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h1_lows { TradingSession::update_buffer(&mut self.h1_lows, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h1_timestamps { TradingSession::update_buffer_i64(&mut self.h1_timestamps, v, settings.max_buffer_size); }
                 self.last_h1_timestamp = ts;
             }
         }
@@ -298,6 +308,7 @@ impl MarketDataBuffer {
                 if let Some(v) = &req.h4_closes { TradingSession::update_buffer(&mut self.h4_closes, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h4_highs { TradingSession::update_buffer(&mut self.h4_highs, v, settings.max_buffer_size); }
                 if let Some(v) = &req.h4_lows { TradingSession::update_buffer(&mut self.h4_lows, v, settings.max_buffer_size); }
+                if let Some(v) = &req.h4_timestamps { TradingSession::update_buffer_i64(&mut self.h4_timestamps, v, settings.max_buffer_size); }
                 self.last_h4_timestamp = ts;
             }
         }
@@ -307,6 +318,7 @@ impl MarketDataBuffer {
             if (ts > 0 && ts > self.last_d1_timestamp) || req.d1_closes.as_ref().map_or(false, |v| v.len() > settings.sync_threshold) {
                 if let Some(v) = &req.d1_opens { TradingSession::update_buffer(&mut self.d1_opens, v, settings.max_buffer_size); }
                 if let Some(v) = &req.d1_closes { TradingSession::update_buffer(&mut self.d1_closes, v, settings.max_buffer_size); }
+                if let Some(v) = &req.d1_timestamps { TradingSession::update_buffer_i64(&mut self.d1_timestamps, v, settings.max_buffer_size); }
                 self.last_d1_timestamp = ts;
             }
         }
@@ -336,6 +348,10 @@ pub struct TradingSession {
     latest_scalp_signal: Option<EvalResponse>,
     latest_swing_signal: Option<EvalResponse>,
     
+    // NEW: Separates the "Idea" from the "Live Trade"
+    pub active_swing_trade_id: Option<String>, 
+    pub active_trade_latch_time: i64, 
+
     pending_re_entry: Option<ReEntryContext>,
 
     pub execution: ExecutionManager,
@@ -362,6 +378,8 @@ impl TradingSession {
             market_data: MarketDataBuffer::new(initial_buffer_size),
             latest_scalp_signal: None,
             latest_swing_signal: None,
+            active_swing_trade_id: None,
+            active_trade_latch_time: 0,
             pending_re_entry: None,
             execution: ExecutionManager::new(true, false), // Scalp: Allow pyramiding, Normal mode
             swing_execution: ExecutionManager::new(true, true), // Swing: Pyramiding YES, Strict Reversal YES
@@ -440,14 +458,53 @@ impl TradingSession {
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, reason = %swing_signal.reason, "Swing engine evaluated.");
 
-        // --- ID Stabilization Logic ---
-        // Ensure that if the trend direction is unchanged, we maintain the original Signal ID.
-        // This prevents the session from treating continuation signals as "New" (which Strict Mode would block),
-        // and ensures we latch onto the original entry price for PnL tracking.
-        if let Some(existing) = &self.latest_swing_signal {
-            if existing.entry_type != SignalDirection::None && swing_signal.entry_type == existing.entry_type {
-                // Force ID to match existing active trade
-                swing_signal.signal_id = existing.signal_id.clone();
+        // --- ID STABILIZATION & HYSTERESIS ---
+
+        // 1. Check if we have an active trade ID tracked in the SESSION (not just the last signal)
+        if let Some(active_id) = &self.active_swing_trade_id {
+            
+            // Scenario A: Engine confirms the active trade
+            if swing_signal.signal_id == *active_id {
+                 self.active_trade_latch_time = req.last_m1_timestamp; // Refresh latch
+            } 
+            // Scenario B: Engine returns "None" (Conviction Drop) OR a new ID (Structural Shift)
+            else {
+                // Check if we are within the "Grace Period" (e.g., 1 hour)
+                // This prevents a momentary drop in conviction from killing the trade ID
+                let grace_period = 3600; 
+                let within_grace = (req.last_m1_timestamp - self.active_trade_latch_time) < grace_period;
+
+                if within_grace && swing_signal.entry_type == SignalDirection::None {
+                    // FORCE THE OLD ID onto the "None" signal
+                    swing_signal.signal_id = active_id.clone();
+                    
+                    // Restore state from latest_swing_signal to maintain "Holding" status
+                    if let Some(existing) = &self.latest_swing_signal {
+                        if existing.signal_id == *active_id {
+                             swing_signal.entry_type = existing.entry_type.clone();
+                             swing_signal.entry_price = existing.entry_price;
+                             swing_signal.sl_price = existing.sl_price;
+                             swing_signal.tp1_price = existing.tp1_price;
+                             swing_signal.tp2_price = existing.tp2_price;
+                             swing_signal.tp3_price = existing.tp3_price;
+                             swing_signal.debug_info = existing.debug_info.clone();
+                             swing_signal.reason = format!("Holding (Low Conviction): {}", swing_signal.reason);
+                        }
+                    }
+                } else if !within_grace && swing_signal.entry_type == SignalDirection::None {
+                    // Grace period over. Trade is dead.
+                    self.active_swing_trade_id = None;
+                } else if swing_signal.entry_type != SignalDirection::None {
+                    // Engine found a totally NEW valid signal (different ID). Overwrite active trade.
+                    self.active_swing_trade_id = Some(swing_signal.signal_id.clone());
+                    self.active_trade_latch_time = req.last_m1_timestamp;
+                }
+            }
+        } else {
+            // No active trade, and Engine found a new one
+            if swing_signal.entry_type != SignalDirection::None {
+                self.active_swing_trade_id = Some(swing_signal.signal_id.clone());
+                self.active_trade_latch_time = req.last_m1_timestamp;
             }
         }
 
@@ -522,7 +579,7 @@ impl TradingSession {
         let cooldown_seconds = 300;
         let pyramiding_threshold = 0.0015; // 0.15%
         let averaging_threshold = 0.0005; // 0.05%
-        let rapid_reversal_seconds = 180;
+        let rapid_reversal_seconds = 300; // Increased to 5m to prevent ping-pong
 
         let should_notify_swing = self.swing_execution.evaluate_execution(
             &mut swing_signal, 
@@ -634,10 +691,6 @@ impl TradingSession {
                 // Broadcast SL Update to WebSocket
                 self.broadcast_signal(&update_signal);
                 notifications.push(update_signal);
-            } else {
-                // Heartbeat: Broadcast active swing signal every minute so UI stays in sync
-                // even if no specific "event" (like SL change) occurred.
-                self.broadcast_signal(&swing_signal);
             }
         } else if swing_signal.entry_type != SignalDirection::None {
             // Fallback: Broadcast valid signals even if execution manager suppressed them (e.g. Strict Mode repeats with new ID).
@@ -726,12 +779,15 @@ impl TradingSession {
         let cooldown_seconds = 300;
         let pyramiding_threshold = 0.0015; // 0.15%
         let averaging_threshold = 0.0005; // 0.05%
-        let rapid_reversal_seconds = 180;
+        let rapid_reversal_seconds = 300; // Increased to 5m to prevent ping-pong
+
+        // Require significantly higher conviction to override rapid reversal check
+        let reversal_conviction_threshold = (settings.scalp.min_conviction + 20.0).min(95.0);
 
         let should_notify = self.execution.evaluate_execution(
             &mut scalp_signal, 
             current_time, 
-            settings.scalp.min_conviction,
+            reversal_conviction_threshold,
             cooldown_seconds,
             pyramiding_threshold,
             averaging_threshold,
@@ -1080,6 +1136,7 @@ impl TradingSession {
         let m5_highs = self.market_data.m5_highs.make_contiguous();
         let m5_lows = self.market_data.m5_lows.make_contiguous();
         let m5_timestamps = if !self.market_data.m5_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.m5_timestamps.make_contiguous() as &[i64])) } else { None };
+        let m15_timestamps = if !self.market_data.m15_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.m15_timestamps.make_contiguous() as &[i64])) } else { None };
         let m30_closes = self.market_data.m30_closes.make_contiguous();
 
         let m15_closes = if !self.market_data.m15_closes.is_empty() { Some(Cow::Borrowed(self.market_data.m15_closes.make_contiguous() as &[f64])) } else { None };
@@ -1091,13 +1148,16 @@ impl TradingSession {
         let h1_highs = if !self.market_data.h1_highs.is_empty() { Some(Cow::Borrowed(self.market_data.h1_highs.make_contiguous() as &[f64])) } else { None };
         let h1_opens = if !self.market_data.h1_opens.is_empty() { Some(Cow::Borrowed(self.market_data.h1_opens.make_contiguous() as &[f64])) } else { None };
         let h1_lows = if !self.market_data.h1_lows.is_empty() { Some(Cow::Borrowed(self.market_data.h1_lows.make_contiguous() as &[f64])) } else { None };
+        let h1_timestamps = if !self.market_data.h1_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.h1_timestamps.make_contiguous() as &[i64])) } else { None };
         
         let h4_closes = if !self.market_data.h4_closes.is_empty() { Some(Cow::Borrowed(self.market_data.h4_closes.make_contiguous() as &[f64])) } else { None };
         let h4_highs = if !self.market_data.h4_highs.is_empty() { Some(Cow::Borrowed(self.market_data.h4_highs.make_contiguous() as &[f64])) } else { None };
         let h4_lows = if !self.market_data.h4_lows.is_empty() { Some(Cow::Borrowed(self.market_data.h4_lows.make_contiguous() as &[f64])) } else { None };
+        let h4_timestamps = if !self.market_data.h4_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.h4_timestamps.make_contiguous() as &[i64])) } else { None };
         
         let d1_opens = if !self.market_data.d1_opens.is_empty() { Some(Cow::Borrowed(self.market_data.d1_opens.make_contiguous() as &[f64])) } else { None };
         let d1_closes = if !self.market_data.d1_closes.is_empty() { Some(Cow::Borrowed(self.market_data.d1_closes.make_contiguous() as &[f64])) } else { None };
+        let d1_timestamps = if !self.market_data.d1_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.d1_timestamps.make_contiguous() as &[i64])) } else { None };
 
         EvalRequest {
             symbol: Cow::Borrowed(&self.symbol),
@@ -1114,16 +1174,20 @@ impl TradingSession {
             m15_closes,
             m15_highs,
             m15_lows,
+            m15_timestamps,
             m30_closes: Cow::Borrowed(m30_closes),
             h1_closes,
             h1_highs,
             h1_opens,
             h1_lows,
+            h1_timestamps,
             h4_closes,
             h4_highs,
             h4_lows,
+            h4_timestamps,
             d1_opens,
             d1_closes,
+            d1_timestamps,
             mode: Cow::Owned(mode.to_string()), // Mode is usually small string
             current_price, 
             last_m1_timestamp: self.last_evaluation_timestamp,

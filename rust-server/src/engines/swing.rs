@@ -1,5 +1,4 @@
 use crate::{EvalRequest, EvalResponse, SignalDirection};
-use ::uuid::Uuid;
 use crate::{adx, atr, atr_pulse, find_imbalance_zones, find_swing_points, find_order_blocks, calculate_dynamic_thickness, get_daily_bias, get_trend_bias, rsi, get_fvg_limit_price, PriceLevel, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::SwingSettings};
 use tracing::debug;
 use std::collections::HashMap;
@@ -276,15 +275,26 @@ impl SwingEngine {
                 (structure.external_high.1, structure.external_high.0) 
             };
 
-            // Calculate timestamp of the swing point to ensure ID uniqueness across time
-            let n = h1_closes.len();
-            let last_ts = req.last_h1_timestamp.unwrap_or(0);
-            let swing_ts = if last_ts > 0 { last_ts - ((n.saturating_sub(1).saturating_sub(idx)) as i64 * 3600) } else { 0 };
+            // 1. Get the actual timestamp of the structural point
+            let swing_ts = if let Some(timestamps) = &req.h1_timestamps {
+                // Safety check for index bounds
+                if idx < timestamps.len() {
+                    timestamps[idx]
+                } else {
+                    // Fallback (only if data is corrupted)
+                    req.last_h1_timestamp.unwrap_or(0)
+                }
+            } else {
+                // Legacy fallback (calculation) - only use if timestamps missing
+                let n = h1_closes.len();
+                let last_ts = req.last_h1_timestamp.unwrap_or(0);
+                if last_ts > 0 { last_ts - ((n.saturating_sub(1).saturating_sub(idx)) as i64 * 3600) } else { 0 }
+            };
 
-            // Use UUID v5 (Name-based) to create a unique hash for this specific setup
-            format!("{}-{}-{:.5}-{}", req.symbol, entry_type.to_string(), price_key, swing_ts)
+            // 2. Generate ID using swing_ts (absolute) and price_key (structural)
+            format!("{}-{}-{}-{}", req.symbol, entry_type.to_string(), swing_ts, price_key as i64)
         } else {
-            Uuid::new_v4().to_string()
+            "none".to_string()
         };
 
         EvalResponse {

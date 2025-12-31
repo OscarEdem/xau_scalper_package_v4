@@ -66,6 +66,7 @@ ulong    g_last_data_sent_time = 0; // For flashing indicator
 
 // --- State Globals for Data Processing ---
 datetime g_prev_time_m5 = 0;
+datetime g_prev_time_m15 = 0;
 datetime g_prev_time_m30 = 0;
 datetime g_prev_time_h1 = 0;
 datetime g_prev_time_h4 = 0;
@@ -194,7 +195,7 @@ void ProcessData(bool manual_force)
      }
 
 // --- Prepare price data for server ---
-   MqlRates m1_rates[], m5_rates[], m30_rates[], h1_rates[], h4_rates[], d1_rates[];
+   MqlRates m1_rates[], m5_rates[], m15_rates[], m30_rates[], h1_rates[], h4_rates[], d1_rates[];
    if(CopyRates(_Symbol, PERIOD_M1, 0, NumCloses, m1_rates) < NumCloses)
      {
       Print("Could not get enough M1 bar data. Need ", NumCloses, " bars.");
@@ -207,12 +208,14 @@ void ProcessData(bool manual_force)
    bool force_sync = manual_force || (GetTickCount64() - g_last_force_sync > 60000);
 
    bool update_m5 = (iTime(_Symbol, PERIOD_M5, 0) != g_prev_time_m5) || force_sync;
+   bool update_m15 = (iTime(_Symbol, PERIOD_M15, 0) != g_prev_time_m15) || force_sync;
    bool update_m30 = (iTime(_Symbol, PERIOD_M30, 0) != g_prev_time_m30) || force_sync;
    bool update_h1 = (iTime(_Symbol, PERIOD_H1, 0) != g_prev_time_h1) || force_sync;
    bool update_h4 = (iTime(_Symbol, PERIOD_H4, 0) != g_prev_time_h4) || force_sync;
    bool update_d1 = (iTime(_Symbol, PERIOD_D1, 0) != g_prev_time_d1) || force_sync;
 
    if(update_m5 && CopyRates(_Symbol, PERIOD_M5, 0, NumCloses, m5_rates) < NumCloses) return;
+   if(update_m15 && CopyRates(_Symbol, PERIOD_M15, 0, NumCloses, m15_rates) < NumCloses) return;
    if(update_m30 && CopyRates(_Symbol, PERIOD_M30, 0, NumCloses, m30_rates) < NumCloses) return;
    if(update_h1 && CopyRates(_Symbol, PERIOD_H1, 0, NumCloses, h1_rates) < NumCloses) return;
    if(update_h4 && CopyRates(_Symbol, PERIOD_H4, 0, NumCloses, h4_rates) < NumCloses) return;
@@ -220,6 +223,7 @@ void ProcessData(bool manual_force)
 
    // Update trackers
    if(update_m5 && ArraySize(m5_rates) > 0) g_prev_time_m5 = m5_rates[ArraySize(m5_rates)-1].time;
+   if(update_m15 && ArraySize(m15_rates) > 0) g_prev_time_m15 = m15_rates[ArraySize(m15_rates)-1].time;
    if(update_m30 && ArraySize(m30_rates) > 0) g_prev_time_m30 = m30_rates[ArraySize(m30_rates)-1].time;
    if(update_h1 && ArraySize(h1_rates) > 0) g_prev_time_h1 = h1_rates[ArraySize(h1_rates)-1].time;
    if(update_h4 && ArraySize(h4_rates) > 0) g_prev_time_h4 = h4_rates[ArraySize(h4_rates)-1].time;
@@ -230,8 +234,10 @@ void ProcessData(bool manual_force)
 // Build the JSON payload
    string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
    string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "", h1_opens_str = "";
-   string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "", h4_closes_str = "", h4_highs_str = "", h4_lows_str = "";
-   string d1_opens_str = "", d1_closes_str = "";
+   string m15_closes_str = "", m15_highs_str = "", m15_lows_str = "", m15_timestamps_str = "";
+   string m30_closes_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "", h1_timestamps_str = "";
+   string h4_closes_str = "", h4_highs_str = "", h4_lows_str = "", h4_timestamps_str = "";
+   string d1_opens_str = "", d1_closes_str = "", d1_timestamps_str = "";
 
    for(int i = 0; i < ArraySize(m1_rates); i++)
      {
@@ -267,6 +273,21 @@ void ProcessData(bool manual_force)
         }
      }
 
+   if(update_m15)
+     {
+      for(int i = 0; i < ArraySize(m15_rates); i++)
+        {
+         m15_closes_str += DoubleToString(m15_rates[i].close, _Digits);
+         m15_highs_str += DoubleToString(m15_rates[i].high, _Digits);
+         m15_lows_str += DoubleToString(m15_rates[i].low, _Digits);
+         m15_timestamps_str += IntegerToString(m15_rates[i].time);
+         if(i < ArraySize(m15_rates) - 1)
+           {
+            m15_closes_str += ","; m15_highs_str += ","; m15_lows_str += ","; m15_timestamps_str += ",";
+           }
+        }
+     }
+
    if(update_m30)
      {
       for(int i = 0; i < ArraySize(m30_rates); i++)
@@ -285,12 +306,14 @@ void ProcessData(bool manual_force)
          h1_highs_str += DoubleToString(h1_rates[i].high, _Digits);
          h1_lows_str += DoubleToString(h1_rates[i].low, _Digits);
          h1_opens_str += DoubleToString(h1_rates[i].open, _Digits);
+         h1_timestamps_str += IntegerToString(h1_rates[i].time);
          if(i < ArraySize(h1_rates) - 1)
            {
             h1_closes_str += ",";
             h1_highs_str += ",";
             h1_lows_str += ",";
             h1_opens_str += ",";
+            h1_timestamps_str += ",";
            }
         }
      }
@@ -302,11 +325,13 @@ void ProcessData(bool manual_force)
          h4_closes_str += DoubleToString(h4_rates[i].close, _Digits);
          h4_highs_str += DoubleToString(h4_rates[i].high, _Digits);
          h4_lows_str += DoubleToString(h4_rates[i].low, _Digits);
+         h4_timestamps_str += IntegerToString(h4_rates[i].time);
          if(i < ArraySize(h4_rates) - 1)
            {
             h4_closes_str += ",";
             h4_highs_str += ",";
             h4_lows_str += ",";
+            h4_timestamps_str += ",";
            }
         }
      }
@@ -317,16 +342,19 @@ void ProcessData(bool manual_force)
         {
          d1_opens_str += DoubleToString(d1_rates[i].open, _Digits);
          d1_closes_str += DoubleToString(d1_rates[i].close, _Digits);
+         d1_timestamps_str += IntegerToString(d1_rates[i].time);
          if(i < ArraySize(d1_rates) - 1)
            {
             d1_opens_str += ",";
             d1_closes_str += ",";
+            d1_timestamps_str += ",";
            }
         }
      }
 
    long last_m1_timestamp = (long)m1_rates[ArraySize(m1_rates)-1].time;
    long last_m5_timestamp = (ArraySize(m5_rates) > 0) ? (long)m5_rates[ArraySize(m5_rates)-1].time : 0;
+   long last_m15_timestamp = (ArraySize(m15_rates) > 0) ? (long)m15_rates[ArraySize(m15_rates)-1].time : 0;
    long last_m30_timestamp = (ArraySize(m30_rates) > 0) ? (long)m30_rates[ArraySize(m30_rates)-1].time : 0;
    long last_h1_timestamp = (ArraySize(h1_rates) > 0) ? (long)h1_rates[ArraySize(h1_rates)-1].time : 0;
    long last_h4_timestamp = (ArraySize(h4_rates) > 0) ? (long)h4_rates[ArraySize(h4_rates)-1].time : 0;
@@ -337,11 +365,12 @@ void ProcessData(bool manual_force)
                             "\"currentPrice\":%.5f,\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
                             "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
                             "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],"
+                            "\"m15Closes\":[%s],\"m15Highs\":[%s],\"m15Lows\":[%s],\"m15Timestamps\":[%s],"
                             "\"m30Closes\":[%s],"
-                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],"
-                            "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],"
-                            "\"d1Opens\":[%s],\"d1Closes\":[%s],"
-                            "\"lastM5Timestamp\":%lld,\"lastM30Timestamp\":%lld,\"lastH1Timestamp\":%lld,\"lastH4Timestamp\":%lld,\"lastD1Timestamp\":%lld,"
+                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],\"h1Timestamps\":[%s],"
+                            "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],\"h4Timestamps\":[%s],"
+                            "\"d1Opens\":[%s],\"d1Closes\":[%s],\"d1Timestamps\":[%s],"
+                            "\"lastM5Timestamp\":%lld,\"lastM15Timestamp\":%lld,\"lastM30Timestamp\":%lld,\"lastH1Timestamp\":%lld,\"lastH4Timestamp\":%lld,\"lastD1Timestamp\":%lld,"
                             "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
                             "\"spreadLimitPoints\":%.1f,"
                             "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
@@ -354,11 +383,12 @@ void ProcessData(bool manual_force)
                             _Symbol,
                             ask, spread_pts, _Digits, last_m1_timestamp,
                             m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
-                            m5_closes_str, m5_highs_str, m5_lows_str, m30_closes_str,
-                            h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str,
-                            h4_closes_str, h4_highs_str, h4_lows_str,
-                            d1_opens_str, d1_closes_str,
-                            last_m5_timestamp, last_m30_timestamp, last_h1_timestamp, last_h4_timestamp, last_d1_timestamp,
+                            m5_closes_str, m5_highs_str, m5_lows_str,
+                            m15_closes_str, m15_highs_str, m15_lows_str, m15_timestamps_str, m30_closes_str,
+                            h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str, h1_timestamps_str,
+                            h4_closes_str, h4_highs_str, h4_lows_str, h4_timestamps_str,
+                            d1_opens_str, d1_closes_str, d1_timestamps_str,
+                            last_m5_timestamp, last_m15_timestamp, last_m30_timestamp, last_h1_timestamp, last_h4_timestamp, last_d1_timestamp,
                             RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
                             StochKPeriod, StochDPeriod, StochSlowing,
                             SlAtrMultiplier, TpAtrMultiplier,

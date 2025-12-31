@@ -1,13 +1,15 @@
 import sys
+import os
 import json
 import csv
+import shutil
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,  # type: ignore
                                QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, 
                                QPushButton, QComboBox, QTabWidget, QTreeWidget, QTreeWidgetItem, 
                                QFrame, QMessageBox, QGridLayout, QHeaderView, QSizePolicy, QAbstractSpinBox,
                                QDialog, QScrollArea, QDialogButtonBox, QFormLayout, QMenu, QFileDialog)
 from PySide6.QtCore import Qt, QTimer, Property, QPropertyAnimation, QEasingCurve, QByteArray # type: ignore
-from PySide6.QtGui import QColor, QPainter, QBrush # type: ignore
+from PySide6.QtGui import QColor, QPainter, QBrush, QIcon # type: ignore
 
 import MetaTrader5 as mt5 # type: ignore
 from datetime import datetime, timedelta
@@ -230,6 +232,9 @@ class DashboardGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("XAU Scalper v4")
+        # Set Window Icon if available
+        if os.path.exists("icon.ico"):
+            self.setWindowIcon(QIcon("icon.ico"))
         self.resize(600, 800)
         self.setMinimumSize(450, 500)
         
@@ -470,6 +475,18 @@ class DashboardGUI(QMainWindow):
         self.total_profit_label.setStyleSheet("font-weight: bold; font-size: 10pt;")
         hist_layout.addWidget(self.total_profit_label)
         
+        perf_btn_layout = QHBoxLayout()
+        
+        self.btn_export_perf = QPushButton("Export Perf CSV")
+        self.btn_export_perf.clicked.connect(self.export_performance_csv)
+        perf_btn_layout.addWidget(self.btn_export_perf)
+        
+        self.btn_clear_perf = QPushButton("Clear Perf CSV")
+        self.btn_clear_perf.clicked.connect(self.clear_performance_csv)
+        perf_btn_layout.addWidget(self.btn_clear_perf)
+        
+        hist_layout.addLayout(perf_btn_layout)
+        
         self.tabs.addTab(self.hist_tab, "History")
 
         # Tab 4: Logs
@@ -671,6 +688,43 @@ class DashboardGUI(QMainWindow):
 
     def clear_logs(self):
         self.tree_log.clear()
+
+    def export_performance_csv(self):
+        src_filename = "strategy_performance.csv"
+        if not os.path.exists(src_filename):
+            QMessageBox.information(self, "Export Failed", "No performance data found.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Performance", "performance_export.csv", "CSV Files (*.csv)")
+        if not filename:
+            return
+            
+        try:
+            shutil.copy2(src_filename, filename)
+            QMessageBox.information(self, "Export Successful", f"Performance data exported to {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Error exporting data: {str(e)}")
+
+    def clear_performance_csv(self):
+        src_filename = "strategy_performance.csv"
+        if not os.path.exists(src_filename):
+            QMessageBox.information(self, "Clear Failed", "No performance data found.")
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm Clear")
+        msg.setText("Are you sure you want to clear the performance history CSV?")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.No)
+        msg.setStyleSheet("QMessageBox { background-color: #121212; color: white; } QPushButton { background-color: #2979FF; color: white; padding: 5px; }")
+        
+        if msg.exec() == QMessageBox.Yes:
+            try:
+                os.remove(src_filename)
+                QMessageBox.information(self, "Clear Successful", "Performance history cleared.")
+            except Exception as e:
+                QMessageBox.critical(self, "Clear Failed", f"Error clearing data: {str(e)}")
 
     def close_bulk(self, mode):
         if "loss" in mode:

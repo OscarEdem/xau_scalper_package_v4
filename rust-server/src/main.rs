@@ -48,6 +48,7 @@ mod e2e_tests;
         handlers::trading::process_data_handler,
         handlers::trading::documented_tick_ingest_handler,
         handlers::system::save_push_token_handler,
+        handlers::system::remove_push_token_handler,
         routes::daily_analysis,
         routes::weekly_analysis,
         routes::chat_analysis_handler,
@@ -271,7 +272,7 @@ pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
         .route("/external/calendar", get(routes::get_external_calendar_handler)) // NEW: External Calendar
         .route("/external/news", get(routes::get_external_news_handler)) // NEW: External RSS News
         // --- Add new routes for logging ---
-        .route("/save-push-token", post(handlers::system::save_push_token_handler))
+        .route("/save-push-token", post(handlers::system::save_push_token_handler).delete(handlers::system::remove_push_token_handler))
         .route("/settings", post(handlers::system::update_settings_handler).get(handlers::system::get_settings_handler))
         .route("/settings/reset", post(handlers::system::reset_settings_handler))
         .route("/news-guard/:symbol", get(handlers::trading::get_news_guard_status_handler))

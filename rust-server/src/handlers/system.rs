@@ -87,6 +87,34 @@ pub async fn save_push_token_handler(
 }
 
 #[utoipa::path(
+    delete,
+    path = "/save-push-token",
+    request_body = SavePushTokenRequest,
+    responses(
+        (status = 200, description = "Token removed successfully"),
+        (status = 500, description = "Failed to remove token")
+    )
+)]
+/// Handler to remove a push notification token.
+pub async fn remove_push_token_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+    Json(body): Json<SavePushTokenRequest>,
+) -> (StatusCode, Json<&'static str>) {
+    match crate::db::remove_push_token(&state.inner.db, &body.token, Some(&state.inner.metrics.db_retries_total)).await {
+        Ok(_) => {
+            let mut tokens = state.inner.push_tokens.lock().await;
+            tokens.remove(&body.token);
+            tracing::info!("Removed push token. Total tokens: {}", tokens.len());
+            (StatusCode::OK, Json("Token removed"))
+        },
+        Err(e) => {
+            tracing::error!("Failed to remove push token: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json("Failed to remove token"))
+        }
+    }
+}
+
+#[utoipa::path(
     get,
     path = "/settings",
     responses(

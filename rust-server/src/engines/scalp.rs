@@ -460,11 +460,14 @@ impl ScalpEngine {
             decision.debug_info.insert("raw_score_short".to_string(), format!("{:.4}", short_score));
 
             let min_conv_to_trade = settings.min_conviction;
-            if conv_long >= min_conv_to_trade && conv_long > conv_short {
+            // Add hysteresis to prevent flickering between Long/Short when scores are close
+            let hysteresis = 5.0;
+
+            if conv_long >= min_conv_to_trade && conv_long > (conv_short + hysteresis) {
                 decision.entry_type = SignalDirection::Long;
                 decision.conviction = conv_long;
                 decision.reason = long_reasons.join(" + ");
-            } else if conv_short >= min_conv_to_trade && conv_short > conv_long {
+            } else if conv_short >= min_conv_to_trade && conv_short > (conv_long + hysteresis) {
                 decision.entry_type = SignalDirection::Short;
                 decision.conviction = conv_short;
                 decision.reason = short_reasons.join(" + ");
