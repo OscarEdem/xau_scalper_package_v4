@@ -1,7 +1,7 @@
 import threading
 
 # --- DEFAULT CONFIGURATION ---
-CONFIG = {
+DEFAULT_CONFIG = {
     "server_url": "https://gold-ml-base-server.onrender.com",
     "signal_symbol": "XAUUSD",
     "trade_symbol": "XAUUSD",
@@ -16,9 +16,11 @@ CONFIG = {
     "fixed_lot_size": 0.05,
     "swing_lot_size": 0.03,
     "max_entries": 10,
+    "min_conviction": 20.0,
     "scalp_mode": True,
     "swing_mode": True,
     "force_market": False,
+    "manage_manual": False,
     
     # -- Filters --
     "max_spread_points": 162,
@@ -38,7 +40,14 @@ CONFIG = {
     "stag_time_mult": 6.0,
     "use_trailing_scalp": True,
     "use_trailing_swing": True,
+    "use_atr_trailing": True,
+    "atr_dist_mult_scalp": 1.5,
+    "atr_dist_mult_swing": 2.5,
+    "atr_high_vol_threshold": 1.0,
+    "max_scalp_sl_pips": 100.0,
 }
+
+CONFIG = DEFAULT_CONFIG.copy()
 
 # --- GLOBAL STATE ---
 state = {

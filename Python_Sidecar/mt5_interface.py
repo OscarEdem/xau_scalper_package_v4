@@ -28,8 +28,26 @@ def calculate_velocity():
     past = now - timedelta(seconds=CONFIG["velocity_lookback_sec"])
     ticks = mt5.copy_ticks_range(CONFIG["trade_symbol"], past, now, mt5.COPY_TICKS_INFO)
     if ticks is None or len(ticks) == 0: return 0.0
-    bids = [t[1] for t in ticks]
-    return (max(bids) - min(bids)) / (get_point() * 10.0)
+    # Optimization: Use Numpy field access directly (ticks is a structured array)
+    bids = ticks['bid']
+    return (bids.max() - bids.min()) / (get_point() * 10.0)
+
+def calculate_local_atr(symbol, period=14):
+    """Calculate ATR(14) using M1 candles from MT5."""
+    # Fetch period+1 candles to calculate True Range for 'period' candles
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, period + 1)
+    if rates is None or len(rates) < period + 1:
+        return 0.0
+    
+    tr_sum = 0.0
+    for i in range(1, len(rates)):
+        high = rates[i]['high']
+        low = rates[i]['low']
+        close_prev = rates[i-1]['close']
+        tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
+        tr_sum += tr
+        
+    return tr_sum / period
 
 # =============================================================================
 # PERFORMANCE LOGGING
@@ -77,12 +95,15 @@ def log_trade_performance(ticket, signal_data, deals):
     file_exists = os.path.exists(CSV_FILENAME)
     headers = ["SignalID", "Time", "Ticket", "Symbol", "Type", "Volume", "EntryPrice", "SL", "TP", "Conviction", "CloseTime", "ClosePrice", "GrossProfit", "Swap", "Comm", "NetPL", "Classification"]
     
+    raw_type = signal_data.get("entryType", "").lower()
+    display_type = "BUY" if "long" in raw_type else "SELL" if "short" in raw_type else raw_type.upper()
+
     row = [
         signal_data.get("signalId", "N/A"),
         signal_data.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ticket,
         signal_data.get("symbol", ""),
-        signal_data.get("entryType", ""),
+        display_type,
         signal_data.get("volume", 0.0),
         signal_data.get("price", 0.0),
         signal_data.get("sl", 0.0),
@@ -184,6 +205,20 @@ def execute_trade(signal):
     
     # Calculate Entries based on Conviction
     conviction = float(signal.get("convictionScore", signal.get("conviction", 0.0)))
+    
+    # Filter: Minimum Conviction
+    min_conv = CONFIG.get("min_conviction", 20.0)
+    if conviction < min_conv:
+        msg = f"Conviction {conviction:.1f}% < {min_conv}%"
+        with state["lock"]:
+            state["gui_logs"].append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "ticket": "-",
+                "type": "Filter",
+                "details": msg
+            })
+        return
+
     target_entries = int((conviction / 100.0) * CONFIG["max_entries"])
     entries_to_execute = max(1, target_entries) # Ensure at least 1 trade
 
@@ -220,11 +255,27 @@ def execute_trade(signal):
     if symbol_info:
         tick_size = symbol_info.trade_tick_size
         digits = symbol_info.digits
+        point = symbol_info.point
         
         def normalize(val):
             return round(round(val / tick_size) * tick_size, digits)
             
         price = normalize(price)
+        
+        # Enforce Max Risk (100 pips) for Scalp
+        if "scalp" in classification:
+            max_risk_pips = min(CONFIG.get("max_scalp_sl_pips", 100.0), 100.0)
+            max_risk_pts = max_risk_pips * 10 * point
+            
+            if is_long:
+                limit_sl = price - max_risk_pts
+                if raw_sl == 0.0 or raw_sl < limit_sl:
+                    raw_sl = limit_sl
+            else:
+                limit_sl = price + max_risk_pts
+                if raw_sl == 0.0 or raw_sl > limit_sl:
+                    raw_sl = limit_sl
+
         if raw_sl > 0: raw_sl = normalize(raw_sl)
         if raw_tp1 > 0: raw_tp1 = normalize(raw_tp1)
         if raw_tp2 > 0: raw_tp2 = normalize(raw_tp2)
@@ -347,13 +398,13 @@ def monitor_closed_trades(open_positions):
                 save_active_trades()
 
 def manage_positions():
-    positions = mt5.positions_get(symbol=CONFIG["trade_symbol"], magic=CONFIG["magic_number"])
-    # Also check swing trades (magic + 1)
-    swing_positions = mt5.positions_get(symbol=CONFIG["trade_symbol"], magic=CONFIG["magic_number"] + 1)
-    
-    all_positions = []
-    if positions: all_positions.extend(positions)
-    if swing_positions: all_positions.extend(swing_positions)
+    # 0. Update ATR from Chart (M1)
+    local_atr = calculate_local_atr(CONFIG["trade_symbol"])
+    if local_atr > 0:
+        state["server_atr"] = local_atr
+
+    # Fetch all positions for the symbol (including Manual with magic=0)
+    all_positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
     
     # Check for closed trades
     monitor_closed_trades(all_positions)
@@ -377,6 +428,14 @@ def manage_positions():
     update_requests = []
 
     for pos in all_positions:
+        # Filter: Only manage Scalp, Swing, or Manual (if enabled)
+        is_scalp = pos.magic == CONFIG["magic_number"]
+        is_swing = pos.magic == CONFIG["magic_number"] + 1
+        is_manual = pos.magic == 0
+        
+        if not (is_scalp or is_swing or (is_manual and CONFIG["manage_manual"])):
+            continue
+
         # 1. Calculate Profit in Pips
         current_price = symbol_info.bid if pos.type == mt5.ORDER_TYPE_BUY else symbol_info.ask
         if current_price == 0.0: continue # Skip if price is invalid
@@ -389,12 +448,11 @@ def manage_positions():
         # Assuming 1 pip = 10 points for XAUUSD (2 digits)
         profit_pips = diff / (point * 10)
         
-        is_scalp = pos.magic == CONFIG["magic_number"]
         is_buy = pos.type == mt5.ORDER_TYPE_BUY
 
-        # 2. Stagnation Logic (Partial Close)
+        # 2. Stagnation Logic (Partial Close) - Skip for Manual trades
         is_stagnating = False
-        if CONFIG["use_stagnation"] and pos.ticket not in state["stagnated_orders"]:
+        if CONFIG["use_stagnation"] and not is_manual and pos.ticket not in state["stagnated_orders"]:
             elapsed = server_time - pos.time
             limit = CONFIG["stagnation_sec"]
             
@@ -440,10 +498,17 @@ def manage_positions():
         sl_reason = "Manual"
         
         # Params
-        use_trailing = CONFIG["use_trailing_scalp"] if is_scalp else CONFIG["use_trailing_swing"]
-        tr_start = CONFIG["trailing_start_pips_scalp"] if is_scalp else CONFIG["trailing_start_pips_swing"]
-        tr_dist_cfg = CONFIG["trailing_dist_pips_scalp"] if is_scalp else CONFIG["trailing_dist_pips_swing"]
-        tr_step = CONFIG["trailing_step_pips_scalp"] if is_scalp else CONFIG["trailing_step_pips_swing"]
+        # Use Scalp settings for Scalp trades, Swing settings for Swing AND Manual trades
+        if is_scalp:
+            use_trailing = CONFIG["use_trailing_scalp"]
+            tr_start = CONFIG["trailing_start_pips_scalp"]
+            tr_dist_cfg = CONFIG["trailing_dist_pips_scalp"]
+            tr_step = CONFIG["trailing_step_pips_scalp"]
+        else:
+            use_trailing = CONFIG["use_trailing_swing"]
+            tr_start = CONFIG["trailing_start_pips_swing"]
+            tr_dist_cfg = CONFIG["trailing_dist_pips_swing"]
+            tr_step = CONFIG["trailing_step_pips_swing"]
         
         # Debug info container
         debug_msg = None
@@ -451,6 +516,14 @@ def manage_positions():
         # Check Trailing
         if use_trailing and profit_pips >= tr_start:
             dist_pips = tr_dist_cfg
+            
+            # Dynamic ATR Logic
+            if CONFIG.get("use_atr_trailing", False) and state["server_atr"] > 0:
+                # Convert ATR (Price) to Pips (1 pip = 10 points)
+                atr_pips = state["server_atr"] / (point * 10)
+                mult = CONFIG.get("atr_dist_mult_scalp", 1.5) if is_scalp else CONFIG.get("atr_dist_mult_swing", 2.5)
+                dist_pips = atr_pips * mult
+
             dist_pts = dist_pips * 10 * point
             candidate_sl = (current_price - dist_pts) if is_buy else (current_price + dist_pts)
             

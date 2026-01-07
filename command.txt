@@ -12,7 +12,7 @@ python xau_controller.py
 
 #Docker containiazation
 
-
+pyinstaller --noconsole --onefile --clean --name="XAU_Scalper_v4" --icon=icon.ico --hidden-import=numpy --hidden-import=MetaTrader5 xau_controller.py
 
 Best Result (Optimized for Sharpe Ratio) ---
 Parameters: EMA(11/50), RSI(14), SL: 2.0*ATR, TP: 1.5*ATR

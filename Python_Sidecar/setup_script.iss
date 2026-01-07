@@ -27,6 +27,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+; Ensure clean install by deleting previous files
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\*"
+
 [Files]
 Source: "dist\XAU_Scalper_v4.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
@@ -39,9 +43,36 @@ Name: "{autodesktop}\XAU Scalper v4"; Filename: "{app}\XAU_Scalper_v4.exe"; Icon
 Filename: "{app}\XAU_Scalper_v4.exe"; Description: "{cm:LaunchProgram,XAU Scalper v4}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function GetUninstallString(): String;
+var
+  sUnInstPath: String;
+  sUnInstPathKey: String;
+begin
+  sUnInstPath := '';
+  sUnInstPathKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A1E2C3D4-B5F6-7890-1234-567890ABCDEF}_is1';
+  { Check for uninstall key in HKLM (32-bit and 64-bit) and HKCU }
+  if RegQueryStringValue(HKLM, sUnInstPathKey, 'UninstallString', sUnInstPath) then
+    Result := sUnInstPath
+  else if RegQueryStringValue(HKCU, sUnInstPathKey, 'UninstallString', sUnInstPath) then
+    Result := sUnInstPath
+  else if RegQueryStringValue(HKLM64, sUnInstPathKey, 'UninstallString', sUnInstPath) then
+    Result := sUnInstPath;
+end;
+
 function InitializeSetup(): Boolean;
+var
+  sUnInstallString: String;
+  iResultCode: Integer;
 begin
   Result := True;
+  
+  // Check for previous version and uninstall
+  sUnInstallString := GetUninstallString();
+  if sUnInstallString <> '' then begin
+    sUnInstallString := RemoveQuotes(sUnInstallString);
+    Exec(sUnInstallString, '/SILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode);
+  end;
+
   if MsgBox('IMPORTANT REQUIREMENT:' + #13#10 + #13#10 + 
             'This software requires MetaTrader 5 (MT5) to be installed and running.' + #13#10 + 
             'Please ensure you have an MT5 account logged in before using this bot.' + #13#10 + #13#10 + 

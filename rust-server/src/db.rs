@@ -1,5 +1,6 @@
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Pool, Postgres, Row};
+use std::str::FromStr;
 use tracing::info;
 use crate::{EvalResponse, TradingSession, NewsEvent, NewsItem};
 use crate::config::TradingSettings;
@@ -37,9 +38,12 @@ macro_rules! db_retry {
 }
 
 pub async fn init_db(database_url: &str) -> Result<DbPool, sqlx::Error> {
+    let options = PgConnectOptions::from_str(database_url)?
+        .ssl_mode(PgSslMode::Require);
+
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(database_url)
+        .connect_with(options)
         .await?;
 
     info!("Connected to PostgreSQL.");
