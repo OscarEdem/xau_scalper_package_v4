@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, QByteArray, QRectF, QPointF, Signal # type: ignor
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QPainterPath, QFont, QPolygonF # type: ignore
 from config import CONFIG, state, save_config
 from gui_styles import GLOBAL_STYLESHEET
+from gui_dialogs import ModernToast
 
 class CandleChartWidget(QWidget):
     def __init__(self, parent=None):
@@ -401,6 +402,7 @@ class CandleChartWidget(QWidget):
 
         if action == copy_action:
             QApplication.clipboard().setText(f"{price:.2f}")
+            ModernToast.show_message(self, f"Price {price:.2f} Copied", style="success")
         elif action == snap_action:
             self.save_snapshot()
         elif action == delete_action:
@@ -410,6 +412,7 @@ class CandleChartWidget(QWidget):
             elif delete_draw_idx != -1:
                 self.drawings.pop(delete_draw_idx)
                 self.save_drawings()
+            ModernToast.show_message(self, "Object Deleted", style="info")
             self.update()
 
     def mousePressEvent(self, event):
@@ -756,6 +759,7 @@ class CandleChartWidget(QWidget):
         if filename:
             pixmap = self.grab()
             pixmap.save(filename)
+            ModernToast.show_message(self, "Snapshot Saved", style="success")
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1562,6 +1566,7 @@ class ChartWindow(QMainWindow):
     def on_clear_drawings(self):
         if QMessageBox.question(self, "Confirm", "Clear all drawings?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             self.chart_widget.clear_all_drawings()
+            ModernToast.show_message(self, "All Drawings Cleared", style="info")
 
     def load_geometry(self):
         try:

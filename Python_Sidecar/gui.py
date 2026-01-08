@@ -19,7 +19,7 @@ from config import CONFIG, state, save_config
 from gui_styles import GLOBAL_STYLESHEET
 from mt5_interface import execute_trade
 from gui_widgets import SignalIndicator, StatusCircle, SafetyButton, ToggleSwitch, ModernSpinBox
-from gui_dialogs import AdvancedSettingsDialog, ManualExecutionDialog, PositionModifyDialog, SignalDetailsDialog
+from gui_dialogs import AdvancedSettingsDialog, ManualExecutionDialog, PositionModifyDialog, SignalDetailsDialog, ModernToast
 from gui_chart import ChartWindow
 from gui_workers import MT5DataWorker, SignalHistoryWorker
 
@@ -1012,6 +1012,7 @@ class DashboardGUI(QMainWindow):
             if action == copy_action:
                 text = " | ".join([item.text(i) for i in range(self.tree_positions.columnCount())])
                 QApplication.clipboard().setText(text)
+                ModernToast.show_message(self, "Row Copied to Clipboard", style="success")
             elif action == close_action:
                 self.close_ticket(int(item.text(0)))
 
@@ -1025,6 +1026,7 @@ class DashboardGUI(QMainWindow):
             if action == copy_action:
                 text = f"[{item.text(0)}] Ticket:{item.text(1)} Type:{item.text(2)} - {item.text(3)}"
                 QApplication.clipboard().setText(text)
+                ModernToast.show_message(self, "Log Copied to Clipboard", style="success")
 
     def show_history_context_menu(self, pos):
         item = self.tree_history.itemAt(pos)
@@ -1036,6 +1038,7 @@ class DashboardGUI(QMainWindow):
             if action == copy_action:
                 text = " | ".join([item.text(i) for i in range(self.tree_history.columnCount())])
                 QApplication.clipboard().setText(text)
+                ModernToast.show_message(self, "History Row Copied", style="success")
 
     def on_trade_selected(self):
         items = self.tree_positions.selectedItems()
@@ -1049,11 +1052,15 @@ class DashboardGUI(QMainWindow):
 
     def copy_price_to_field(self, field):
         tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
-        if tick: field.setValue(tick.bid)
+        if tick: 
+            field.setValue(tick.bid)
+            ModernToast.show_message(self, f"Price Copied: {tick.bid}", style="info")
 
     def close_ticket(self, ticket):
         positions = mt5.positions_get(ticket=ticket)
-        if positions: self._send_close_request(positions[0])
+        if positions: 
+            self._send_close_request(positions[0])
+            ModernToast.show_message(self, f"Close Request Sent: #{ticket}", style="info")
 
     def _send_close_request(self, pos):
         tick = mt5.symbol_info_tick(pos.symbol)
@@ -1093,6 +1100,7 @@ class DashboardGUI(QMainWindow):
             elif mode == "manual" and is_manual: self._send_close_request(pos)
             elif mode == "scalp_profit" and is_scalp and pos.profit > 0: self._send_close_request(pos)
             elif mode == "scalp_loss" and is_scalp and pos.profit < 0: self._send_close_request(pos)
+        ModernToast.show_message(self, f"Executed: {action}", style="info")
 
     def _send_sltp_update(self, pos, sl, tp):
         req = {"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "sl": float(sl), "tp": float(tp), "symbol": pos.symbol}
@@ -1105,6 +1113,7 @@ class DashboardGUI(QMainWindow):
         if positions:
             for pos in positions:
                 if pos.magic == 0: self._send_sltp_update(pos, sl, tp)
+            ModernToast.show_message(self, "Manual Trades Updated", style="success")
 
     def update_selected_sltp(self):
         sl = self.spin_update_sl.value()
@@ -1113,7 +1122,9 @@ class DashboardGUI(QMainWindow):
         if items:
             ticket = int(items[0].text(0))
             positions = mt5.positions_get(ticket=ticket)
-            if positions: self._send_sltp_update(positions[0], sl, tp)
+            if positions: 
+                self._send_sltp_update(positions[0], sl, tp)
+                ModernToast.show_message(self, f"Trade #{ticket} Updated", style="success")
 
     def export_logs_to_csv(self):
         filename, _ = QFileDialog.getSaveFileName(self, "Export Logs", "logs_export.csv", "CSV Files (*.csv)")
@@ -1125,20 +1136,25 @@ class DashboardGUI(QMainWindow):
                 for i in range(root.childCount()):
                     item = root.child(i)
                     writer.writerow([item.text(0), item.text(1), item.text(2), item.text(3)])
+            ModernToast.show_message(self, "Logs Exported Successfully", style="success")
 
     def clear_logs(self):
         self.tree_logs.clear()
+        ModernToast.show_message(self, "Logs Cleared", style="info")
 
     def export_performance_csv(self):
         src = "strategy_performance.csv"
         if os.path.exists(src):
             filename, _ = QFileDialog.getSaveFileName(self, "Export Performance", "performance_export.csv", "CSV Files (*.csv)")
-            if filename: shutil.copy2(src, filename)
+            if filename: 
+                shutil.copy2(src, filename)
+                ModernToast.show_message(self, "Performance Exported", style="success")
 
     def clear_performance_csv(self):
         if os.path.exists("strategy_performance.csv"):
             if QMessageBox.question(self, "Confirm", "Clear history?") == QMessageBox.Yes:
                 os.remove("strategy_performance.csv")
+                ModernToast.show_message(self, "History Cleared", style="info")
 
     def on_position_dbl_click(self, item, column):
         ticket = item.text(0)
@@ -1162,6 +1178,7 @@ class DashboardGUI(QMainWindow):
         if positions:
             for pos in positions:
                 self._send_close_request(pos)
+            ModernToast.show_message(self, "PANIC CLOSE INITIATED", style="error")
 
     def closeEvent(self, event):
         self._is_closing = True

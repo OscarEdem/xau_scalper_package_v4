@@ -4306,5 +4306,77 @@
         "tp": 4449.637,
         "conviction": 39.186011569147325,
         "classification": "scalp"
+    },
+    "2164390841": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:00",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4524.126,
+        "conviction": 63.5,
+        "classification": "swing"
+    },
+    "2164390878": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:00",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4524.126,
+        "conviction": 63.5,
+        "classification": "swing"
+    },
+    "2164390906": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:00",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4524.126,
+        "conviction": 63.5,
+        "classification": "swing"
+    },
+    "2164390924": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:01",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4599.215,
+        "conviction": 63.5,
+        "classification": "swing"
+    },
+    "2164390993": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:01",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4599.215,
+        "conviction": 63.5,
+        "classification": "swing"
+    },
+    "2164391016": {
+        "signalId": "XAUUSDm-long-1767873600-4407",
+        "timestamp": "2026-01-08 21:30:01",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.03,
+        "price": 4475.297,
+        "sl": 4411.494,
+        "tp": 4599.215,
+        "conviction": 63.5,
+        "classification": "swing"
     }
 }

@@ -5,12 +5,124 @@ from datetime import datetime, timedelta
 import MetaTrader5 as mt5 # type: ignore
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QScrollArea, QFrame, QWidget,  # type: ignore
                                QFormLayout, QLabel, QLineEdit, QDialogButtonBox, 
-                               QMessageBox, QGridLayout, QHBoxLayout, QPushButton, QTextEdit, QTabWidget, QApplication)
-from PySide6.QtCore import Qt, QByteArray, QPointF, QTimer # type: ignore
+                               QMessageBox, QGridLayout, QHBoxLayout, QPushButton, QTextEdit, QTabWidget, QApplication, QGraphicsOpacityEffect)
+from PySide6.QtCore import Qt, QByteArray, QPointF, QPoint, QTimer, QPropertyAnimation, QEasingCurve # type: ignore
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QPolygonF # type: ignore
 from config import CONFIG, DEFAULT_CONFIG, state, save_config
 from gui_styles import GLOBAL_STYLESHEET
 from gui_widgets import ModernSpinBox, ToggleSwitch
+
+class ModernToast(QWidget):
+    _active_toasts = []
+
+    def __init__(self, parent, text, duration=2500, style="success"):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.SubWindow)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        
+        # Colors & Icon
+        if style == "success":
+            bg, fg, icon = "#A3BE8C", "#2E3440", "✓"
+        elif style == "error":
+            bg, fg, icon = "#BF616A", "#ECEFF4", "✕"
+        else:
+            bg, fg, icon = "#EBCB8B", "#2E3440", "!"
+
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: {bg};
+                color: {fg};
+                border-radius: 6px;
+                border: 1px solid {fg}40;
+            }}
+            QLabel {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: bold;
+                font-size: 13px;
+                padding: 4px;
+            }}
+        """)
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+        
+        lbl_icon = QLabel(icon)
+        lbl_text = QLabel(text)
+        layout.addWidget(lbl_icon)
+        layout.addWidget(lbl_text)
+        
+        self.adjustSize()
+        
+        # Animation Setup
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        
+        self.anim_opacity = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.anim_opacity.setDuration(300)
+        self.anim_opacity.setStartValue(0.0)
+        self.anim_opacity.setEndValue(1.0)
+        self.anim_opacity.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim_opacity.start()
+        
+        # Stack Management
+        ModernToast._active_toasts.append(self)
+        self.update_stack()
+        
+        # Slide Animation
+        final_pos = self.pos()
+        start_pos = QPoint(final_pos.x(), final_pos.y() + 20)
+        self.move(start_pos)
+        
+        self.anim_pos = QPropertyAnimation(self, b"pos")
+        self.anim_pos.setDuration(300)
+        self.anim_pos.setStartValue(start_pos)
+        self.anim_pos.setEndValue(final_pos)
+        self.anim_pos.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim_pos.start()
+            
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.fade_out)
+        self.timer.start(duration)
+        
+        self.show()
+        self.raise_()
+
+    def closeEvent(self, event):
+        if self in ModernToast._active_toasts:
+            ModernToast._active_toasts.remove(self)
+            self.update_stack()
+        super().closeEvent(event)
+
+    def update_stack(self):
+        parent = self.parent()
+        if not parent: return
+        
+        # Filter toasts for this parent
+        my_toasts = [t for t in ModernToast._active_toasts if t.parent() == parent]
+        
+        base_y = parent.rect().height() - 50
+        spacing = 10
+        
+        # Iterate backwards (newest at bottom)
+        for toast in reversed(my_toasts):
+            x = (parent.rect().width() - toast.width()) // 2
+            y = base_y - toast.height()
+            toast.move(x, y)
+            base_y = y - spacing
+
+    def fade_out(self):
+        self.anim_opacity.setDirection(QPropertyAnimation.Backward)
+        self.anim_opacity.finished.connect(self.close)
+        self.anim_opacity.start()
+
+    @staticmethod
+    def show_message(parent, text, duration=2500, style="success"):
+        if parent:
+            ModernToast(parent, text, duration, style)
 
 class AdvancedSettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -173,6 +285,7 @@ class AdvancedSettingsDialog(QDialog):
                         widget.setText(str(val))
                     else:
                         widget.setValue(val)
+            ModernToast.show_message(self, "Settings restored to defaults", style="success")
 
     def accept(self):
         msg = QMessageBox(self)
@@ -423,6 +536,7 @@ class ManualExecutionDialog(QDialog):
         tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
         if tick:
             self.spin_man_price.setValue(tick.bid)
+            ModernToast.show_message(self, f"Price Copied: {tick.bid}", style="info")
 
     def calc_sltp(self, direction):
         symbol = CONFIG["trade_symbol"]
@@ -458,6 +572,7 @@ class ManualExecutionDialog(QDialog):
             
         self.spin_man_sl.setValue(round(sl, sym_info.digits))
         self.spin_man_tp.setValue(round(tp, sym_info.digits))
+        ModernToast.show_message(self, f"{direction.title()} SL/TP Calculated", style="success")
 
     def execute_manual_trade(self, order_type):
         vol = self.spin_man_vol.value()
@@ -552,6 +667,7 @@ class ManualExecutionDialog(QDialog):
                     "type": "Manual Exec",
                     "details": f"{t_str} {vol} @ {price}"
                 })
+                ModernToast.show_message(self, f"Executed: {t_str} {vol}", style="success")
             else:
                 err = res.comment if res else "Unknown"
                 state["gui_logs"].append({
@@ -560,6 +676,7 @@ class ManualExecutionDialog(QDialog):
                     "type": "Exec Fail",
                     "details": err
                 })
+                ModernToast.show_message(self, f"Failed: {err}", style="error")
 
     def setup_from_signal(self, signal):
         self.spin_man_price.setValue(signal.get("entryPrice", 0.0))
@@ -622,9 +739,10 @@ class PositionModifyDialog(QDialog):
         
         res = mt5.order_send(req)
         if res.retcode == mt5.TRADE_RETCODE_DONE:
-            self.accept()
+            ModernToast.show_message(self, "Position Modified", style="success")
+            QTimer.singleShot(800, self.accept)
         else:
-            QMessageBox.warning(self, "Error", f"Failed to modify position.\nError: {res.comment}")
+            ModernToast.show_message(self, f"Error: {res.comment}", style="error")
 
     def close_position(self):
         tick = mt5.symbol_info_tick(self.symbol)
@@ -654,9 +772,10 @@ class PositionModifyDialog(QDialog):
         
         res = mt5.order_send(req)
         if res.retcode == mt5.TRADE_RETCODE_DONE:
-            self.accept()
+            ModernToast.show_message(self, "Position Closed", style="success")
+            QTimer.singleShot(800, self.accept)
         else:
-            QMessageBox.warning(self, "Error", f"Failed to close position.\nError: {res.comment}")
+            ModernToast.show_message(self, f"Error: {res.comment}", style="error")
 
 class SignalMiniChart(QWidget):
     def __init__(self, signal_data, parent=None):
@@ -1011,7 +1130,7 @@ class SignalDetailsDialog(QDialog):
         btn_raw = QPushButton("Copy JSON")
         btn_raw.setFixedWidth(80)
         btn_raw.setToolTip("Copy raw JSON to clipboard")
-        btn_raw.clicked.connect(lambda: QApplication.clipboard().setText(json.dumps(signal_data, indent=4)))
+        btn_raw.clicked.connect(self.copy_json)
         
         btn_reexec = QPushButton("Re-Execute")
         btn_reexec.setToolTip("Open Manual Trade Panel with these parameters")
@@ -1031,6 +1150,10 @@ class SignalDetailsDialog(QDialog):
         self.dbg_frame.setVisible(checked)
         self.btn_toggle_debug.setText("Hide Debug Info ▲" if checked else "Show Debug Info ▼")
         self.adjustSize()
+
+    def copy_json(self):
+        QApplication.clipboard().setText(json.dumps(self.signal_data, indent=4))
+        ModernToast.show_message(self, "JSON Copied to Clipboard", style="success")
 
     def on_re_execute(self):
         parent = self.parent()
