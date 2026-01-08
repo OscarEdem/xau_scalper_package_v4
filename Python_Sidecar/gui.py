@@ -1,837 +1,66 @@
 import sys
 import os
-import json
 import csv
 import shutil
-from typing import Dict, List, Any, Optional, Set
+import json
+import time
+from typing import Dict, List, Any, Optional
+from datetime import datetime
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,  # type: ignore
-                               QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, 
-                               QPushButton, QComboBox, QTabWidget, QTreeWidget, QTreeWidgetItem, 
-                               QFrame, QMessageBox, QGridLayout, QHeaderView, QSizePolicy, QAbstractSpinBox,
-                               QDialog, QScrollArea, QDialogButtonBox, QFormLayout, QMenu, QFileDialog)
-from PySide6.QtCore import (Qt, QTimer, Property, QPropertyAnimation, QEasingCurve, QByteArray,  # type: ignore
-                            QThread, Signal, Slot, QObject, QRectF)
-from PySide6.QtGui import QColor, QPainter, QBrush, QIcon, QPen # type: ignore
-
+                               QLabel, QFrame, QMessageBox, QGridLayout, QHeaderView, 
+                               QTreeWidget, QTreeWidgetItem, QPushButton, QTabWidget, QSplitter,
+                               QFileDialog, QMenu, QDoubleSpinBox, QAbstractSpinBox, QComboBox, QSizePolicy)
+from PySide6.QtCore import Qt, QThread, Slot, QTimer, QByteArray, Signal, QEvent # type: ignore
+from PySide6.QtGui import QColor, QIcon, QAction, QBrush # type: ignore
 import MetaTrader5 as mt5 # type: ignore
-from datetime import datetime, timedelta
-import time
 
-from config import CONFIG, DEFAULT_CONFIG, state
-
-# =============================================================================
-# STYLESHEET (NORD THEME)
-# =============================================================================
-GLOBAL_STYLESHEET = """
-    QMainWindow { background-color: #2E3440; color: #D8DEE9; font-family: "Segoe UI", sans-serif; }
-    QWidget { font-size: 10pt; color: #D8DEE9; }
-    
-    /* Panels & Frames */
-    QFrame.Panel { background-color: #3B4252; border-radius: 6px; border: 1px solid #434C5E; }
-    QTabWidget::pane { border: 1px solid #434C5E; background: #3B4252; }
-    QTabBar::tab { background: #2E3440; color: #D8DEE9; padding: 8px 16px; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }
-    QTabBar::tab:selected { background: #88C0D0; color: #2E3440; font-weight: bold; }
-    
-    /* Inputs */
-    QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background-color: #434C5E; border: 1px solid #4C566A; border-radius: 4px; padding: 5px; color: #ECEFF4; selection-background-color: #88C0D0; }
-    QComboBox::drop-down { border: none; background: #4C566A; width: 20px; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
-    
-    /* Buttons */
-    QPushButton { background-color: #4C566A; border: none; border-radius: 4px; padding: 8px; color: #ECEFF4; font-weight: bold; }
-    QPushButton:hover { background-color: #5E81AC; }
-    QPushButton:pressed { background-color: #81A1C1; }
-    QPushButton.Danger { background-color: #BF616A; }
-    QPushButton.Danger:hover { background-color: #D08770; }
-    QPushButton.Success { background-color: #A3BE8C; color: #2E3440; }
-    QPushButton.Success:hover { background-color: #B5D19E; }
-    
-    /* SpinBox Buttons */
-    QPushButton.SpinBtn { background-color: #4C566A; border-radius: 2px; font-size: 14px; }
-    QPushButton.SpinBtn:hover { background-color: #88C0D0; color: #2E3440; }
-    
-    /* Tree/List */
-    QTreeWidget { background-color: #3B4252; border: none; font-family: "Consolas", monospace; font-size: 9pt; alternate-background-color: #434C5E; }
-    QHeaderView::section { background-color: #2E3440; color: #D8DEE9; padding: 6px; border: none; font-weight: bold; }
-    
-    /* Scrollbars */
-    QScrollBar:vertical { background: #2E3440; width: 10px; }
-    QScrollBar::handle:vertical { background: #4C566A; border-radius: 5px; }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-    
-    /* Custom Labels */
-    QLabel.Header { font-size: 14pt; font-weight: bold; color: #ECEFF4; }
-    QLabel.SubHeader { font-size: 11pt; font-weight: bold; color: #88C0D0; }
-    QLabel.Price { font-family: "Consolas", monospace; font-size: 20pt; font-weight: bold; color: #ECEFF4; }
-    QLabel.StatusTag { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 9pt; }
-"""
-
-# =============================================================================
-# WORKER THREAD
-# =============================================================================
-class MT5DataWorker(QObject):
-    """
-    Handles all MT5 read operations in a separate thread to prevent UI freezing.
-    """
-    data_updated = Signal(dict)
-
-    def __init__(self):
-        super().__init__()
-        self.timer = QTimer(self)
-        self.timer.setInterval(200)  # 5Hz update rate
-        self.timer.timeout.connect(self.fetch_data)
-
-    @Slot()
-    def start_working(self):
-        self.timer.start()
-
-    @Slot()
-    def stop_working(self):
-        self.timer.stop()
-
-    def fetch_data(self):
-        if not state.get("running", False):
-            return
-
-        data: Dict[str, Any] = {}
-        
-        # 1. Connection & Terminal Info
-        term = mt5.terminal_info()
-        data["connected"] = term.connected if term else False
-        data["trade_allowed"] = term.trade_allowed if term else False
-        data["ping"] = term.ping_last // 1000 if term else 0
-        
-        # 2. Price Data
-        symbol = CONFIG["trade_symbol"]
-        tick = mt5.symbol_info_tick(symbol)
-        if tick:
-            data["bid"] = tick.bid
-            data["ask"] = tick.ask
-        else:
-            data["bid"] = 0.0
-            data["ask"] = 0.0
-            
-        # 3. Account Info
-        acct = mt5.account_info()
-        data["balance"] = acct.balance if acct else 0.0
-        data["equity"] = acct.equity if acct else 0.0
-        
-        # 4. Positions
-        positions = mt5.positions_get(symbol=symbol)
-        pos_list = []
-        counts = {"scalp": 0, "swing": 0, "manual": 0}
-        total_open_pl = 0.0
-        
-        if positions:
-            for p in positions:
-                # Categorize
-                if p.magic == CONFIG["magic_number"]: counts["scalp"] += 1
-                elif p.magic == CONFIG["magic_number"] + 1: counts["swing"] += 1
-                elif p.magic == 0: counts["manual"] += 1
-                
-                if p.magic in [CONFIG["magic_number"], CONFIG["magic_number"]+1, 0]:
-                    # Calculate Net P/L (Profit + Swap)
-                    net_pl = p.profit + p.swap
-                    total_open_pl += net_pl
-                    pos_list.append({
-                        "ticket": p.ticket,
-                        "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                        "volume": p.volume,
-                        "profit": net_pl,
-                        "magic": p.magic,
-                        "sl": p.sl,
-                        "tp": p.tp,
-                        "symbol": p.symbol
-                    })
-        
-        data["positions"] = pos_list
-        data["counts"] = counts
-        data["open_pl"] = total_open_pl
-        
-        # 5. History (Last 24h)
-        # Optimization: Only fetch if tab is likely visible or periodically? 
-        # For now, fetch every cycle but lightweight.
-        from_d = datetime.now() - timedelta(hours=24)
-        deals = mt5.history_deals_get(from_d, datetime.now())
-        hist_list = []
-        total_pl_24h = 0.0
-        
-        if deals:
-            # Sort by time descending
-            sorted_deals = sorted(deals, key=lambda x: x.time, reverse=True)
-            for d in sorted_deals:
-                if d.symbol == symbol and d.magic in [CONFIG["magic_number"], CONFIG["magic_number"]+1, 0]:
-                    if d.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
-                        total_pl_24h += d.profit
-                        hist_list.append({
-                            "ticket": d.ticket,
-                            "type": "SELL" if d.type == mt5.ORDER_TYPE_BUY else "BUY",
-                            "volume": d.volume,
-                            "profit": d.profit,
-                            "time": d.time
-                        })
-        
-        data["history"] = hist_list
-        data["total_pl_24h"] = total_pl_24h
-        
-        # 6. Logs (Consume from state)
-        with state["lock"]:
-            if state.get("gui_logs"):
-                data["new_logs"] = state["gui_logs"][:]
-                state["gui_logs"] = []
-            else:
-                data["new_logs"] = []
-                
-        # 7. Status Text
-        data["status_text"] = state.get("status_text", "")
-        data["connection_time"] = state.get("connection_time")
-        data["last_signal_ts"] = state.get("last_signal_ts", 0)
-        data["server_atr"] = state.get("server_atr", 0.0)
-
-        self.data_updated.emit(data)
-
-# =============================================================================
-# CUSTOM WIDGETS
-# =============================================================================
-class SignalIndicator(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(14, 14)
-        self.color = QColor("#4C566A") # Inactive gray
-
-    def set_active(self, active):
-        new_color = QColor("#88C0D0") if active else QColor("#4C566A")
-        if self.color != new_color:
-            self.color = new_color
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(self.color))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(1, 1, 12, 12)
-
-class StatusCircle(QWidget):
-    def __init__(self, size=10, color="#4C566A", parent=None):
-        super().__init__(parent)
-        self.setFixedSize(size, size)
-        self.color = QColor(color)
-
-    def set_color(self, color_hex):
-        new_color = QColor(color_hex)
-        if self.color != new_color:
-            self.color = new_color
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(self.color))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(0, 0, self.width(), self.height())
-
-class SafetyButton(QPushButton):
-    """
-    A button that requires holding for 1 second to trigger.
-    Provides visual progress feedback.
-    """
-    triggered = Signal()
-
-    def __init__(self, text, parent=None, color_base="#BF616A", color_fill="#D08770"):
-        super().__init__(text, parent)
-        self.setCursor(Qt.PointingHandCursor)
-        self.color_base = QColor(color_base)
-        self.color_fill = QColor(color_fill)
-        self.progress = 0.0
-        self.is_holding = False
-        
-        self.timer = QTimer(self)
-        self.timer.setInterval(16) # ~60 FPS
-        self.timer.timeout.connect(self.update_progress)
-        
-        # Override stylesheet for custom painting
-        self.setStyleSheet("border: none;") 
-        self.setFixedHeight(30)
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self.is_holding = True
-            self.progress = 0.0
-            self.timer.start()
-        super().mousePressEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        self.is_holding = False
-        self.timer.stop()
-        if self.progress >= 1.0:
-            self.triggered.emit()
-        self.progress = 0.0
-        self.update()
-        super().mouseReleaseEvent(e)
-
-    def update_progress(self):
-        if self.is_holding:
-            self.progress += 0.016 # Approx 1 second to fill
-            if self.progress >= 1.0:
-                self.progress = 1.0
-                self.timer.stop()
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        rect = self.rect()
-        
-        # Draw Base
-        painter.setBrush(QBrush(self.color_base))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(rect, 4, 4)
-        
-        # Draw Progress
-        if self.progress > 0:
-            fill_width = rect.width() * self.progress
-            fill_rect = QRectF(0, 0, fill_width, rect.height())
-            painter.setBrush(QBrush(self.color_fill))
-            painter.drawRoundedRect(fill_rect, 4, 4) # Rounded corners might look odd if partial, but acceptable
-            
-        # Draw Text
-        painter.setPen(QColor("#ECEFF4"))
-        font = self.font()
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(rect, Qt.AlignCenter, self.text())
-
-class ToggleSwitch(QCheckBox):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(44, 24)
-        self.setCursor(Qt.PointingHandCursor)
-        self._circle_position = 2
-        self._bg_color = QColor("#4C566A")
-        self._circle_color = QColor("#ECEFF4")
-        self._active_color = QColor("#88C0D0")
-        
-        self.animation = QPropertyAnimation(self, b"circle_position", self)
-        self.animation.setDuration(200)
-        self.animation.setEasingCurve(QEasingCurve.OutQuad)
-        
-        self.stateChanged.connect(self.start_transition)
-
-    @Property(float)
-    def circle_position(self): # type: ignore
-        return self._circle_position
-
-    @circle_position.setter
-    def circle_position(self, pos):
-        self._circle_position = pos
-        self.update()
-
-    def start_transition(self, state):
-        self.animation.stop()
-        if state:
-            self.animation.setEndValue(self.width() - 22)
-        else:
-            self.animation.setEndValue(2)
-        self.animation.start()
-
-    def hitButton(self, pos):
-        return self.rect().contains(pos)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        
-        # Draw Track
-        track_color = self._active_color if self.isChecked() else self._bg_color
-        p.setBrush(track_color)
-        p.setPen(Qt.NoPen)
-        rect = self.rect()
-        p.drawRoundedRect(0, 0, rect.width(), rect.height(), rect.height() / 2, rect.height() / 2)
-        
-        # Draw Circle
-        p.setBrush(self._circle_color)
-        p.drawEllipse(int(self._circle_position), 2, 20, 20)
-
-class ModernSpinBox(QWidget):
-    def __init__(self, value, is_float=False, step=1.0, decimals=2, parent=None):
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        
-        self.btn_minus = QPushButton("-")
-        self.btn_minus.setFixedSize(28, 28)
-        self.btn_minus.setProperty("class", "SpinBtn")
-        self.btn_minus.setCursor(Qt.PointingHandCursor)
-        self.btn_minus.setFocusPolicy(Qt.NoFocus)
-        
-        if is_float:
-            self.input = QDoubleSpinBox()
-            self.input.setDecimals(decimals)
-            self.input.setSingleStep(step)
-        else:
-            self.input = QSpinBox()
-            self.input.setSingleStep(int(step))
-            
-        self.input.setRange(0, 9999)
-        self.input.setValue(value)
-        self.input.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.input.setAlignment(Qt.AlignCenter)
-        self.input.setFixedHeight(28)
-        
-        self.btn_plus = QPushButton("+")
-        self.btn_plus.setFixedSize(28, 28)
-        self.btn_plus.setProperty("class", "SpinBtn")
-        self.btn_plus.setCursor(Qt.PointingHandCursor)
-        self.btn_plus.setFocusPolicy(Qt.NoFocus)
-
-        self.btn_minus.clicked.connect(self.input.stepDown)
-        self.btn_plus.clicked.connect(self.input.stepUp)
-        
-        layout.addWidget(self.btn_minus)
-        layout.addWidget(self.input)
-        layout.addWidget(self.btn_plus)
-        
-    @property
-    def valueChanged(self):
-        return self.input.valueChanged
-        
-    def value(self):
-        return self.input.value()
-        
-    def setValue(self, val):
-        self.input.setValue(val)
-
-class AdvancedSettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Configuration")
-        self.resize(450, 600)
-        # Stylesheet inherited from parent via global app style
-        
-        layout = QVBoxLayout(self)
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background-color: transparent;")
-        
-        content = QWidget()
-        self.form_layout = QFormLayout(content)
-        self.form_layout.setSpacing(15)
-        self.form_layout.setLabelAlignment(Qt.AlignLeft)
-        
-        self.inputs = {}
-        
-        self.add_section("General Settings")
-        self.add_input("Signal Symbol", "signal_symbol", str, "Symbol to listen for signals.")
-        self.add_input("Trade Symbol", "trade_symbol", str, "Symbol to execute trades on.")
-        self.add_input("Scalp Lot Size", "fixed_lot_size", float, "Lot size for Scalp trades.")
-        self.add_input("Swing Lot Size", "swing_lot_size", float, "Lot size for Swing trades.")
-        self.add_input("Max Entries", "max_entries", int, "Maximum number of entries per signal.")
-        self.add_input("Min Conviction (%)", "min_conviction", float, "Minimum conviction score required to execute.")
-        
-        self.add_section("Trailing Stop")
-        self.add_input("Scalp Start (pips)", "trailing_start_pips_scalp", float, "Profit in pips required to activate trailing stop.")
-        self.add_input("Scalp Dist (pips)", "trailing_dist_pips_scalp", float, "Distance in pips to maintain from current price.")
-        self.add_input("Scalp Step (pips)", "trailing_step_pips_scalp", float, "Minimum price movement in pips to update stop loss.")
-        self.add_input("Swing Start (pips)", "trailing_start_pips_swing", float, "Profit in pips required to activate trailing stop.")
-        self.add_input("Swing Dist (pips)", "trailing_dist_pips_swing", float, "Distance in pips to maintain from current price.")
-        self.add_input("Swing Step (pips)", "trailing_step_pips_swing", float, "Minimum price movement in pips to update stop loss.")
-        self.add_input("Max Scalp SL (pips)", "max_scalp_sl_pips", float, "Maximum allowed Stop Loss distance for Scalp trades (Max 100).")
-        
-        self.add_section("ATR Trailing")
-        self.add_bool("Use ATR Trailing", "use_atr_trailing", "Use Server ATR for trailing distance instead of fixed pips.")
-        self.add_input("ATR Mult (Scalp)", "atr_dist_mult_scalp", float, "Multiplier for ATR to calculate trailing distance (Scalp).")
-        self.add_input("ATR Mult (Swing)", "atr_dist_mult_swing", float, "Multiplier for ATR to calculate trailing distance (Swing).")
-        self.add_input("High Vol Threshold", "atr_high_vol_threshold", float, "ATR value above which the indicator turns red.")
-        
-        self.add_section("Stagnation / Timeouts")
-        self.add_bool("Use Stagnation", "use_stagnation", "Enable partial closing of trades that stall.")
-        self.add_input("Stag. Sec", "stagnation_sec", int, "Seconds before a trade is considered stagnant.")
-        self.add_input("Time Mult", "stag_time_mult", float, "Multiplier for stagnation time on Swing trades.")
-
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
-        
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.btn_reset = btns.addButton("Reset to Defaults", QDialogButtonBox.ResetRole)
-        self.btn_reset.setCursor(Qt.PointingHandCursor)
-        self.btn_reset.setToolTip("Restore all settings to their original default values.")
-        self.btn_reset.clicked.connect(self.reset_defaults)
-        
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def add_section(self, title):
-        lbl = QLabel(title)
-        lbl.setStyleSheet("font-weight: bold; color: #88C0D0; font-size: 11pt; margin-top: 10px;")
-        self.form_layout.addRow(lbl)
-
-    def add_input(self, label, key, dtype, tooltip=None):
-        val = CONFIG.get(key, "" if dtype == str else 0)
-        
-        if dtype == str:
-            widget = QLineEdit(str(val))
-        else:
-            step = 0.1 if dtype == float and ("mult" in key or "pct" in key) else 1.0
-            if "lot" in key: step = 0.01
-            widget = ModernSpinBox(val, is_float=(dtype == float), step=step)
-            
-        if tooltip:
-            widget.setToolTip(tooltip)
-        
-        lbl = QLabel(label)
-        if tooltip:
-            lbl.setToolTip(tooltip)
-        self.form_layout.addRow(lbl, widget)
-        self.inputs[key] = (widget, dtype)
-
-    def add_bool(self, label, key, tooltip=None):
-        val = CONFIG.get(key, False)
-        widget = ToggleSwitch()
-        widget.setChecked(val)
-        if tooltip:
-            widget.setToolTip(tooltip)
-        
-        lbl = QLabel(label)
-        if tooltip:
-            lbl.setToolTip(tooltip)
-        self.form_layout.addRow(lbl, widget)
-        self.inputs[key] = (widget, bool)
-
-    def reset_defaults(self):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Confirm Reset")
-        msg.setText("Are you sure you want to reset all settings to defaults?")
-        msg.setIcon(QMessageBox.Warning)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.No)
-        
-        if msg.exec() == QMessageBox.Yes:
-            for key, (widget, dtype) in self.inputs.items():
-                if key in DEFAULT_CONFIG:
-                    val = DEFAULT_CONFIG[key]
-                    if dtype == bool:
-                        widget.setChecked(val)
-                    elif dtype == str:
-                        widget.setText(str(val))
-                    else:
-                        widget.setValue(val)
-
-    def accept(self):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Confirm Changes")
-        msg.setText("Are you sure you want to apply these advanced settings?")
-        msg.setIcon(QMessageBox.Question)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.No)
-        
-        if msg.exec() == QMessageBox.Yes:
-            for key, (widget, dtype) in self.inputs.items():
-                if dtype == bool:
-                    CONFIG[key] = widget.isChecked()
-                elif dtype == str:
-                    CONFIG[key] = widget.text()
-                else:
-                    CONFIG[key] = widget.value()
-            super().accept()
-
-class ManualExecutionDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Manual Execution")
-        self.setWindowFlags(Qt.Window) # Modeless window
-        self.resize(340, 520)
-        self.setStyleSheet(GLOBAL_STYLESHEET)
-        
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)
-        layout.setContentsMargins(15, 15, 15, 15)
-        
-        # Inputs Panel
-        input_frame = QFrame()
-        input_frame.setProperty("class", "Panel")
-        input_layout = QGridLayout(input_frame)
-        input_layout.setVerticalSpacing(12)
-        input_layout.setHorizontalSpacing(10)
-        
-        # Inputs
-        input_layout.addWidget(QLabel("Price:"), 0, 0)
-        
-        price_container = QWidget()
-        price_layout = QHBoxLayout(price_container)
-        price_layout.setContentsMargins(0,0,0,0)
-        price_layout.setSpacing(2)
-        
-        self.spin_man_price = ModernSpinBox(0, is_float=True, step=0.1)
-        self.spin_man_price.input.setRange(0, 99999)
-        self.spin_man_price.setToolTip("Entry Price. Required for Pending Orders. Leave 0 for Market execution.")
-        
-        self.btn_copy_price = QPushButton("📍")
-        self.btn_copy_price.setFixedSize(24, 28)
-        self.btn_copy_price.setCursor(Qt.PointingHandCursor)
-        self.btn_copy_price.setToolTip("Copy current market price")
-        self.btn_copy_price.clicked.connect(self.copy_current_price)
-        
-        price_layout.addWidget(self.spin_man_price)
-        price_layout.addWidget(self.btn_copy_price)
-        
-        input_layout.addWidget(price_container, 0, 1)
-        
-        input_layout.addWidget(QLabel("Volume:"), 1, 0)
-        self.spin_man_vol = ModernSpinBox(CONFIG["fixed_lot_size"], is_float=True, step=0.01)
-        self.spin_man_vol.input.setRange(0.01, 100.0)
-        input_layout.addWidget(self.spin_man_vol, 1, 1)
-        
-        input_layout.addWidget(QLabel("Count:"), 2, 0)
-        self.spin_man_count = ModernSpinBox(1, is_float=False, step=1)
-        self.spin_man_count.input.setRange(1, 100)
-        input_layout.addWidget(self.spin_man_count, 2, 1)
-        
-        input_layout.addWidget(QLabel("Stop Loss:"), 3, 0)
-        self.spin_man_sl = ModernSpinBox(0, is_float=True, step=1.0)
-        self.spin_man_sl.input.setRange(0, 99999)
-        self.spin_man_sl.setToolTip("Price for Stop Loss (0 = None)")
-        input_layout.addWidget(self.spin_man_sl, 3, 1)
-        
-        input_layout.addWidget(QLabel("Take Profit:"), 4, 0)
-        self.spin_man_tp = ModernSpinBox(0, is_float=True, step=1.0)
-        self.spin_man_tp.input.setRange(0, 99999)
-        self.spin_man_tp.setToolTip("Price for Take Profit (0 = None)")
-        input_layout.addWidget(self.spin_man_tp, 4, 1)
-        
-        layout.addWidget(input_frame)
-        
-        # Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(10)
-        
-        self.btn_buy = QPushButton("BUY")
-        self.btn_buy.setProperty("class", "Success")
-        self.btn_buy.setFixedHeight(40)
-        self.btn_buy.setStyleSheet("font-size: 12pt; font-weight: bold;")
-        self.btn_buy.setCursor(Qt.PointingHandCursor)
-        self.btn_buy.setToolTip("Execute a Market Buy order at current Ask price.")
-        self.btn_buy.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_BUY))
-        btn_layout.addWidget(self.btn_buy)
-        
-        self.btn_sell = QPushButton("SELL")
-        self.btn_sell.setProperty("class", "Danger")
-        self.btn_sell.setFixedHeight(40)
-        self.btn_sell.setStyleSheet("font-size: 12pt; font-weight: bold;")
-        self.btn_sell.setCursor(Qt.PointingHandCursor)
-        self.btn_sell.setToolTip("Execute a Market Sell order at current Bid price.")
-        self.btn_sell.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_SELL))
-        btn_layout.addWidget(self.btn_sell)
-        
-        layout.addLayout(btn_layout)
-        
-        # Pending Buttons
-        pending_layout = QGridLayout()
-        pending_layout.setSpacing(10)
-        
-        self.btn_buy_limit = QPushButton("Buy Limit")
-        self.btn_buy_limit.setToolTip("Place a Buy Order at a price LOWER than current market price.")
-        self.btn_buy_limit.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_BUY_LIMIT))
-        
-        self.btn_sell_limit = QPushButton("Sell Limit")
-        self.btn_sell_limit.setToolTip("Place a Sell Order at a price HIGHER than current market price.")
-        self.btn_sell_limit.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_SELL_LIMIT))
-        
-        self.btn_buy_stop = QPushButton("Buy Stop")
-        self.btn_buy_stop.setToolTip("Place a Buy Order at a price HIGHER than current market price.")
-        self.btn_buy_stop.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_BUY_STOP))
-        
-        self.btn_sell_stop = QPushButton("Sell Stop")
-        self.btn_sell_stop.setToolTip("Place a Sell Order at a price LOWER than current market price.")
-        self.btn_sell_stop.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_SELL_STOP))
-        
-        pending_layout.addWidget(self.btn_buy_limit, 0, 0)
-        pending_layout.addWidget(self.btn_sell_limit, 0, 1)
-        pending_layout.addWidget(self.btn_buy_stop, 1, 0)
-        pending_layout.addWidget(self.btn_sell_stop, 1, 1)
-        
-        layout.addLayout(pending_layout)
-        
-        self.load_geometry()
-
-    def load_geometry(self):
-        try:
-            if os.path.exists("manual_ui_state.json"):
-                with open("manual_ui_state.json", "r") as f:
-                    data = json.load(f)
-                    geom = QByteArray.fromBase64(data.get("geometry", "").encode())
-                    self.restoreGeometry(geom)
-        except Exception:
-            pass
-
-    def closeEvent(self, event):
-        data = {
-            "geometry": self.saveGeometry().toBase64().data().decode()
-        }
-        try:
-            with open("manual_ui_state.json", "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
-        super().closeEvent(event)
-
-    def copy_current_price(self):
-        tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
-        if tick:
-            self.spin_man_price.setValue(tick.bid)
-
-    def execute_manual_trade(self, order_type):
-        vol = self.spin_man_vol.value()
-        count = self.spin_man_count.value()
-        sl = self.spin_man_sl.value()
-        tp = self.spin_man_tp.value()
-        price_input = self.spin_man_price.value()
-        symbol = CONFIG["trade_symbol"]
-        
-        is_pending = order_type in [mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT, mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_SELL_STOP]
-        
-        if is_pending and price_input <= 0:
-             QMessageBox.warning(self, "Invalid Price", "Pending orders require a valid Price > 0.")
-             return
-        
-        type_map = {
-            mt5.ORDER_TYPE_BUY: "BUY",
-            mt5.ORDER_TYPE_SELL: "SELL",
-            mt5.ORDER_TYPE_BUY_LIMIT: "BUY LIMIT",
-            mt5.ORDER_TYPE_SELL_LIMIT: "SELL LIMIT",
-            mt5.ORDER_TYPE_BUY_STOP: "BUY STOP",
-            mt5.ORDER_TYPE_SELL_STOP: "SELL STOP"
-        }
-        type_str = type_map.get(order_type, "UNKNOWN")
-        
-        # Confirmation
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Confirm Trade")
-        price_msg = f" @ {price_input}" if is_pending else " @ Market"
-        msg.setText(f"Execute {count} x {type_str} {vol} lots on {symbol}{price_msg}?")
-        msg.setInformativeText(f"SL: {sl:.2f} | TP: {tp:.2f}")
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.No)
-        
-        if msg.exec() != QMessageBox.Yes:
-            return
-            
-        for i in range(count):
-            self._send_manual_order(symbol, order_type, vol, sl, tp, price_input)
-            time.sleep(0.05)
-
-    def _send_manual_order(self, symbol, order_type, vol, sl, tp, price_input=0.0):
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick: return
-        
-        is_pending = order_type in [mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_SELL_LIMIT, mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_SELL_STOP]
-        
-        if is_pending:
-            action = mt5.TRADE_ACTION_PENDING
-            price = float(price_input)
-        else:
-            action = mt5.TRADE_ACTION_DEAL
-            price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-        
-        # Filling mode logic
-        symbol_info = mt5.symbol_info(symbol)
-        filling_type = mt5.ORDER_FILLING_FOK # Default
-        if symbol_info:
-            if action == mt5.TRADE_ACTION_PENDING:
-                filling_type = mt5.ORDER_FILLING_RETURN
-            else:
-                # 1 = FOK, 2 = IOC
-                if symbol_info.filling_mode & 2: filling_type = mt5.ORDER_FILLING_IOC
-                elif symbol_info.filling_mode & 1: filling_type = mt5.ORDER_FILLING_FOK
-        
-        req = {
-            "action": action,
-            "symbol": symbol,
-            "volume": float(vol),
-            "type": order_type,
-            "price": price,
-            "sl": float(sl),
-            "tp": float(tp),
-            "magic": 0,
-            "comment": "GUI Manual",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_type,
-        }
-        
-        res = mt5.order_send(req)
-        with state["lock"]:
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                type_map = {
-                    mt5.ORDER_TYPE_BUY: "BUY", mt5.ORDER_TYPE_SELL: "SELL",
-                    mt5.ORDER_TYPE_BUY_LIMIT: "BUY LIMIT", mt5.ORDER_TYPE_SELL_LIMIT: "SELL LIMIT",
-                    mt5.ORDER_TYPE_BUY_STOP: "BUY STOP", mt5.ORDER_TYPE_SELL_STOP: "SELL STOP"
-                }
-                t_str = type_map.get(order_type, "EXEC")
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": str(res.order),
-                    "type": "Manual Exec",
-                    "details": f"{t_str} {vol} @ {price}"
-                })
-            else:
-                err = res.comment if res else "Unknown"
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": "-",
-                    "type": "Exec Fail",
-                    "details": err
-                })
+from config import CONFIG, state, save_config
+from gui_styles import GLOBAL_STYLESHEET
+from mt5_interface import execute_trade
+from gui_widgets import SignalIndicator, StatusCircle, SafetyButton, ToggleSwitch, ModernSpinBox
+from gui_dialogs import AdvancedSettingsDialog, ManualExecutionDialog, PositionModifyDialog, SignalDetailsDialog
+from gui_chart import ChartWindow
+from gui_workers import MT5DataWorker, SignalHistoryWorker
 
 class DashboardGUI(QMainWindow):
+    stop_worker_signal = Signal()
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("XAU Scalper v4")
-        # Set Window Icon if available
+        self.setWindowTitle("XAU Scalper v4 - Dashboard")
         if os.path.exists("icon.ico"):
             self.setWindowIcon(QIcon("icon.ico"))
-        self.resize(650, 850)
-        self.setMinimumSize(500, 600)
-        
-        self.last_price = 0.0
-        self.load_ui_state()
-        self.blink_state = False
-        self.has_active_trades = False
-        
-        # Apply Global Stylesheet
+        self.resize(1100, 750)
         self.setStyleSheet(GLOBAL_STYLESHEET)
         
-        # Threading Setup
-        self.mt5_thread = QThread()
+        # Data Worker Thread
+        self.worker_thread = QThread()
         self.worker = MT5DataWorker()
-        self.worker.moveToThread(self.mt5_thread)
+        self.worker.moveToThread(self.worker_thread)
         
-        self.mt5_thread.started.connect(self.worker.start_working)
-        self.worker.data_updated.connect(self.on_data_received)
+        self.worker.data_updated.connect(self.update_ui)
+        self.worker_thread.started.connect(self.worker.start_working)
+        self.stop_worker_signal.connect(self.worker.stop_working)
         
-        # Start Thread
-        self.mt5_thread.start()
+        # UI Components
+        self.chart_window = None
+        self.manual_dialog = None
+        self.settings_dialog = None
+        self.position_items = {}
+        self.blink_state = False
+        self._is_closing = False
+        self._last_history_sig = None
         
-        self.manual_dialog = ManualExecutionDialog(self)
-
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setSpacing(15)
-        self.main_layout.setContentsMargins(15, 15, 15, 15)
-
-        self.setup_ui()
+        self.load_ui_state()
+        self.init_ui()
         
         self.blink_timer = QTimer()
         self.blink_timer.timeout.connect(self.blink_labels)
-        self.blink_timer.start(800) # Blink every 800ms
+        self.blink_timer.start(800)
         
-        # Maps for Tree Optimization
-        self.position_items: Dict[int, QTreeWidgetItem] = {}
+        # Start Worker
+        self.worker_thread.start()
 
     def load_ui_state(self):
         try:
@@ -842,167 +71,247 @@ class DashboardGUI(QMainWindow):
         except Exception:
             pass
 
-    def closeEvent(self, event):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Confirm Exit")
-        msg.setText("Are you sure you want to exit?")
-        msg.setIcon(QMessageBox.Question)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.No)
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(15, 15, 15, 15)
         
-        if msg.exec() == QMessageBox.Yes:
-            # Stop Worker
-            self.worker.stop_working()
-            self.mt5_thread.quit()
-            self.mt5_thread.wait(2000)
-            
-            data = {
-                "geometry": self.saveGeometry().toBase64().data().decode()
-            }
-            with open("ui_state.json", "w") as f:
-                json.dump(data, f)
-            super().closeEvent(event)
-        else:
-            event.ignore()
-
-    def blink_labels(self):
-        self.blink_state = not self.blink_state
-
-    def setup_ui(self):
-        # 1. HUD Header (Simplified)
+        # --- HEADER ---
         header_frame = QFrame()
         header_frame.setProperty("class", "Panel")
-        header_layout = QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(15, 10, 15, 10)
-        header_layout.setSpacing(20)
+        header_frame.setStyleSheet("""
+            QFrame.Panel { background-color: #242933; border-radius: 6px; border: 1px solid #434C5E; }
+            QLabel { color: #D8DEE9; }
+        """)
         
-        # Symbol & Price
+        header_layout = QGridLayout(header_frame)
+        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setHorizontalSpacing(20)
+        header_layout.setVerticalSpacing(2)
+        
+        # --- SECTION 1: Market Data (Left) ---
+        # Row 0: Symbol & Delta
+        h_sec1_r0 = QHBoxLayout()
         self.lbl_symbol = QLabel(CONFIG["trade_symbol"])
-        self.lbl_symbol.setStyleSheet("font-size: 10pt; font-weight: bold; color: #88C0D0;")
-        header_layout.addWidget(self.lbl_symbol)
+        self.lbl_symbol.setStyleSheet("font-size: 16pt; font-weight: 900; color: #88C0D0;")
+        self.lbl_symbol.setToolTip("Trading Symbol")
+        self.lbl_delta = QLabel("Δ: --")
+        self.lbl_delta.setStyleSheet("font-size: 9pt; font-weight: bold; color: #D8DEE9; padding-top: 4px;")
+        self.lbl_delta.setToolTip("Price Change")
+        h_sec1_r0.addWidget(self.lbl_symbol)
+        h_sec1_r0.addSpacing(8)
+        h_sec1_r0.addWidget(self.lbl_delta)
+        h_sec1_r0.addStretch()
+        header_layout.addLayout(h_sec1_r0, 0, 0)
+
+        # Row 1: Mid Price
+        self.lbl_mid = QLabel("--")
+        self.lbl_mid.setStyleSheet("font-size: 22pt; font-weight: bold; color: #ECEFF4; font-family: Consolas;")
+        self.lbl_mid.setToolTip("Current Mid Price")
+        header_layout.addWidget(self.lbl_mid, 1, 0)
+
+        # Row 2: Bid/Ask & Spread
+        h_sec1_r2 = QHBoxLayout()
+        self.lbl_bidask = QLabel("B:-- / A:--")
+        self.lbl_bidask.setStyleSheet("font-size: 9pt; color: #A3BE8C; font-family: Consolas;")
+        self.lbl_bidask.setToolTip("Bid / Ask Prices")
+        self.lbl_spread = QLabel("Spr: --")
+        self.lbl_spread.setStyleSheet("font-size: 9pt; color: #D08770; font-weight: 600; margin-left: 8px;")
+        self.lbl_spread.setToolTip("Current Spread")
+        h_sec1_r2.addWidget(self.lbl_bidask)
+        h_sec1_r2.addWidget(self.lbl_spread)
+        h_sec1_r2.addStretch()
+        header_layout.addLayout(h_sec1_r2, 2, 0)
         
-        self.price_label = QLabel("-- / --")
-        self.price_label.setProperty("class", "Price")
-        header_layout.addWidget(self.price_label)
+        # --- SECTION 2: P/L & Account (Center) ---
+        v_sec2 = QVBoxLayout()
+        v_sec2.setSpacing(0)
+        v_sec2.setAlignment(Qt.AlignCenter)
         
-        self.lbl_atr = QLabel("ATR: 0.00")
-        self.lbl_atr.setStyleSheet("font-size: 12pt; color: #EBCB8B; font-weight: bold; margin-left: 10px;")
-        header_layout.addWidget(self.lbl_atr)
-        
-        self.atr_indicator = StatusCircle(size=12, color="#4C566A")
-        self.atr_indicator.setToolTip("Volatility Indicator (Green=Low, Red=High)")
-        header_layout.addWidget(self.atr_indicator)
-        
-        header_layout.addStretch()
-        
-        # Net P/L
         self.lbl_open_pl = QLabel("$0.00")
-        self.lbl_open_pl.setStyleSheet("font-size: 20pt; font-weight: bold; color: #ECEFF4;")
-     
+        self.lbl_open_pl.setAlignment(Qt.AlignCenter)
+        self.lbl_open_pl.setStyleSheet("font-size: 28pt; font-weight: bold; color: #ECEFF4;")
+        self.lbl_open_pl.setToolTip("Total Floating P/L")
+        self.lbl_account = QLabel("Balance: $0.00 | Equity: $0.00")
+        self.lbl_account.setAlignment(Qt.AlignCenter)
+        self.lbl_account.setStyleSheet("font-size: 9pt; color: #EBCB8B; font-weight: 600;")
+        self.lbl_account.setToolTip("Account Balance | Equity")
         
-        # Settings
+        v_sec2.addWidget(self.lbl_open_pl)
+        v_sec2.addWidget(self.lbl_account)
+        header_layout.addLayout(v_sec2, 0, 1, 3, 1)
+        
+        # --- SECTION 3: Stats & Controls (Right) ---
+        # Row 0: ATR & Status
+        h_sec3_r0 = QHBoxLayout()
+        self.lbl_atr = QLabel("ATR: --")
+        self.lbl_atr.setStyleSheet("font-weight: 600; font-size: 9pt;")
+        self.lbl_atr.setToolTip("Average True Range")
+        self.atr_indicator = StatusCircle(size=8, color="#4C566A")
+        self.atr_indicator.setToolTip("Volatility Status")
+        h_sec3_r0.addWidget(self.lbl_atr)
+        h_sec3_r0.addSpacing(5)
+        h_sec3_r0.addWidget(self.atr_indicator)
+        h_sec3_r0.addStretch()
+        header_layout.addLayout(h_sec3_r0, 0, 2)
+
+        # Row 1: Exposure
+        self.lbl_portfolio_snapshot = QLabel("Exp: -- | Mrg: --")
+        self.lbl_portfolio_snapshot.setStyleSheet("font-size: 9pt; color: #D8DEE9; font-family: Consolas;")
+        self.lbl_portfolio_snapshot.setToolTip("Net Exposure | Margin Used")
+        header_layout.addWidget(self.lbl_portfolio_snapshot, 1, 2)
+
+        # Row 2: Mode & Buttons
+        h_sec3_r2 = QHBoxLayout()
+        self.lbl_strategy_state = QLabel(self._format_strategy_state())
+        self.lbl_strategy_state.setStyleSheet("font-size: 9pt; color: #88C0D0; font-family: Consolas;")
+        self.lbl_strategy_state.setToolTip("Active Strategy Modes")
+        h_sec3_r2.addWidget(self.lbl_strategy_state)
+        h_sec3_r2.addStretch()
+        
+        self.btn_chart = QPushButton("📈")
+        self.btn_chart.setFixedSize(32, 32)
+        self.btn_chart.setStyleSheet("QPushButton { font-size: 16px; background-color: #4C566A; border-radius: 4px; } QPushButton:hover { background-color: #5E81AC; }")
+        self.btn_chart.setToolTip("Open Chart Window")
+        self.btn_chart.clicked.connect(self.open_chart)
+
         self.btn_settings = QPushButton("⚙")
         self.btn_settings.setFixedSize(32, 32)
-        self.btn_settings.setCursor(Qt.PointingHandCursor)
-        self.btn_settings.clicked.connect(self.open_advanced_settings)
-        header_layout.addWidget(self.btn_settings)
-
-        self.main_layout.addWidget(header_frame)
+        self.btn_settings.setStyleSheet("QPushButton { font-size: 16px; background-color: #4C566A; border-radius: 4px; } QPushButton:hover { background-color: #5E81AC; }")
+        self.btn_settings.setToolTip("Open Configuration Settings")
+        self.btn_settings.clicked.connect(self.open_settings)
         
-        # Counts Row
+        h_sec3_r2.addWidget(self.btn_chart)
+        h_sec3_r2.addSpacing(10)
+        h_sec3_r2.addWidget(self.btn_settings)
+        header_layout.addLayout(h_sec3_r2, 2, 2)
+        
+        # Column Stretches
+        header_layout.setColumnStretch(0, 2)
+        header_layout.setColumnStretch(1, 3)
+        header_layout.setColumnStretch(2, 2)
+        
+        main_layout.addWidget(header_frame)
+
+        # --- MAIN CONTENT (Splitter) ---
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(2)
+        splitter.setChildrenCollapsible(False)
+        
+        # Left Sidebar (Controls)
+        sidebar = QFrame()
+        sidebar.setProperty("class", "Panel")
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setSpacing(6)
+        sidebar_layout.setContentsMargins(6, 6, 6, 6)
+        
+        lbl_controls = QLabel("Control Panel")
+        lbl_controls.setProperty("class", "Header")
+        lbl_controls.setAlignment(Qt.AlignCenter)
+        sidebar_layout.addWidget(lbl_controls)
+        
+        # Action Buttons
+        btn_manual = QPushButton("Open Trade Panel")
+        btn_manual.setFixedHeight(32)
+        btn_manual.setToolTip("Open Manual Trading Panel")
+        btn_manual.clicked.connect(self.open_manual)
+        sidebar_layout.addWidget(btn_manual)
+        
+        # Divider
+        line1 = QFrame()
+        line1.setFrameShape(QFrame.HLine)
+        line1.setFrameShadow(QFrame.Sunken)
+        line1.setStyleSheet("background-color: #434C5E;")
+        sidebar_layout.addWidget(line1)
+
+        lbl_strat = QLabel("Strategy Toggles")
+        lbl_strat.setProperty("class", "SubHeader")
+        lbl_strat.setAlignment(Qt.AlignCenter)
+        sidebar_layout.addWidget(lbl_strat)
+        
+        # Toggles
+        toggles_frame = QFrame()
+        toggles_layout = QGridLayout(toggles_frame)
+        sidebar.setMinimumWidth(190)
+        sidebar.setMaximumWidth(300)
+        sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        toggles_layout.setVerticalSpacing(4)
+        toggles_layout.setHorizontalSpacing(4)
+        toggles_layout.setContentsMargins(0, 2, 0, 2)
+        
+        self.create_toggle(toggles_layout, "Scalp", "scalp_mode", 0, 0, "Enable Scalping Strategy")
+        self.create_toggle(toggles_layout, "Swing", "swing_mode", 0, 1, "Enable Swing Strategy")
+        self.create_toggle(toggles_layout, "Tr. Scalp", "use_trailing_scalp", 1, 0, "Enable Trailing Stop for Scalp Trades")
+        self.create_toggle(toggles_layout, "Tr. Swing", "use_trailing_swing", 1, 1, "Enable Trailing Stop for Swing Trades")
+        self.create_toggle(toggles_layout, "Force Mkt", "force_market", 2, 0, "Force Market Execution (Disable Limit Orders)")
+        self.create_toggle(toggles_layout, "Man. Mgmt", "manage_manual", 2, 1)
+        
+        sidebar_layout.addWidget(toggles_frame)
+        
+        # Divider
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setFrameShadow(QFrame.Sunken)
+        line2.setStyleSheet("background-color: #434C5E;")
+        sidebar_layout.addWidget(line2)
+
+        lbl_stats = QLabel("Active Positions")
+        lbl_stats.setProperty("class", "SubHeader")
+        lbl_stats.setAlignment(Qt.AlignCenter)
+        sidebar_layout.addWidget(lbl_stats)
+
+        # Counts
         counts_frame = QFrame()
-        counts_layout = QHBoxLayout(counts_frame)
-        counts_layout.setContentsMargins(0, 0, 0, 0)
+        counts_layout = QGridLayout(counts_frame)
+        counts_layout.setSpacing(4)
+        counts_layout.setContentsMargins(0, 2, 0, 2)
         
         self.lbl_scalp_count = QLabel("Scalp: 0")
         self.lbl_swing_count = QLabel("Swing: 0")
         self.lbl_manual_count = QLabel("Manual: 0")
+        self.lbl_scalp_count.setToolTip("Active Scalp Positions")
+        self.lbl_swing_count.setToolTip("Active Swing Positions")
+        self.lbl_manual_count.setToolTip("Active Manual Positions")
         
-        counts_layout.addStretch()
-        counts_layout.addWidget(self.lbl_scalp_count)
-        counts_layout.addSpacing(20)
-        counts_layout.addWidget(self.lbl_swing_count)
-        counts_layout.addSpacing(20)
-        counts_layout.addWidget(self.lbl_manual_count)
-        counts_layout.addStretch()
+        counts_layout.addWidget(self.lbl_scalp_count, 0, 0)
+        counts_layout.addWidget(self.lbl_swing_count, 0, 1)
+        counts_layout.addWidget(self.lbl_manual_count, 1, 0, 1, 2, Qt.AlignLeft)
         
-        self.main_layout.addWidget(counts_frame)
+        sidebar_layout.addWidget(counts_frame)
+        
+        # Divider
+        line3 = QFrame()
+        line3.setFrameShape(QFrame.HLine)
+        line3.setFrameShadow(QFrame.Sunken)
+        line3.setStyleSheet("background-color: #434C5E;")
+        sidebar_layout.addWidget(line3)
 
-        # 2. System State (Toggles) - Prominent
-        toggles_frame = QFrame()
-        toggles_frame.setProperty("class", "Panel")
-        toggles_layout = QGridLayout(toggles_frame)
-        toggles_layout.setVerticalSpacing(15)
-        toggles_layout.setHorizontalSpacing(20)
-        
-        self.create_toggle(toggles_layout, "Scalp Mode", "scalp_mode", 0, 0)
-        self.create_toggle(toggles_layout, "Swing Mode", "swing_mode", 0, 1)
-        self.create_toggle(toggles_layout, "Trailing Scalp", "use_trailing_scalp", 1, 0)
-        self.create_toggle(toggles_layout, "Trailing Swing", "use_trailing_swing", 1, 1)
-        self.create_toggle(toggles_layout, "Force Market", "force_market", 2, 0)
-        self.create_toggle(toggles_layout, "Manage Manual", "manage_manual", 2, 1, "Enable Trailing Stop logic for manual trades")
-        
-        self.main_layout.addWidget(toggles_frame)
+        lbl_mgmt = QLabel("Trade Management")
+        lbl_mgmt.setProperty("class", "SubHeader")
+        lbl_mgmt.setAlignment(Qt.AlignCenter)
+        sidebar_layout.addWidget(lbl_mgmt)
 
-        # NEW: Manual Trade Section
-        self.manual_btn = QPushButton("🎮 Manual Execution")
-        self.manual_btn.setCursor(Qt.PointingHandCursor)
-        self.manual_btn.clicked.connect(self.open_manual_panel)
-        self.main_layout.addWidget(self.manual_btn)
-
-
-        # 4. Tabs
-        self.tabs = QTabWidget()
-        self.main_layout.addWidget(self.tabs)
-        
-        # Tab 2: Open Positions
-        self.pos_tab = QWidget()
-        pos_layout = QVBoxLayout(self.pos_tab)
-        
-        self.tree_pos = QTreeWidget()
-        self.tree_pos.setHeaderLabels(["#", "Type", "Vol", "P/L", ""])
-        self.tree_pos.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tree_pos.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tree_pos.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tree_pos.header().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.tree_pos.header().setSectionResizeMode(4, QHeaderView.Fixed)
-        self.tree_pos.setColumnWidth(4, 40)
-        self.tree_pos.headerItem().setTextAlignment(0, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_pos.headerItem().setTextAlignment(1, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_pos.headerItem().setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
-        self.tree_pos.headerItem().setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
-        self.tree_pos.setAlternatingRowColors(True)
-        self.tree_pos.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree_pos.customContextMenuRequested.connect(self.show_context_menu)
-        pos_layout.addWidget(self.tree_pos)
-        
-        # Summary Label for Open Positions Tab
-        self.lbl_tab_open_pl = QLabel("Total P/L: $0.00")
-        self.lbl_tab_open_pl.setAlignment(Qt.AlignRight)
-        self.lbl_tab_open_pl.setStyleSheet("font-weight: bold; font-size: 12pt; color: #D8DEE9; margin-top: 5px; margin-bottom: 5px;")
-        pos_layout.addWidget(self.lbl_tab_open_pl)
-        
-        # Combined Controls Frame (Compact)
+        # Controls Frame (Moved from Open Tab)
         controls_frame = QFrame()
         controls_frame.setProperty("class", "Panel")
         controls_layout = QGridLayout(controls_frame)
-        controls_layout.setContentsMargins(5, 5, 5, 5)
-        controls_layout.setSpacing(5)
+        controls_layout.setContentsMargins(4, 4, 4, 4)
+        controls_layout.setSpacing(6)
 
-        # --- Row 0: SL/TP Controls ---
         self.spin_update_sl = QDoubleSpinBox()
         self.spin_update_sl.setDecimals(2)
         self.spin_update_sl.setRange(0, 99999)
         self.spin_update_sl.setPrefix("SL: ")
-        self.spin_update_sl.setToolTip("Set to 0.00 to keep existing SL unchanged.")
         self.spin_update_sl.setValue(0)
-        self.spin_update_sl.setFixedHeight(28)
+        self.spin_update_sl.setFixedHeight(26)
         self.spin_update_sl.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin_update_sl.setToolTip("New Stop Loss Price")
         
         self.btn_copy_sl = QPushButton("📍")
-        self.btn_copy_sl.setFixedSize(24, 28)
-        self.btn_copy_sl.setCursor(Qt.PointingHandCursor)
-        self.btn_copy_sl.setToolTip("Copy current price to SL")
+        self.btn_copy_sl.setFixedSize(26, 26)
+        self.btn_copy_sl.setToolTip("Copy Current Bid Price")
         self.btn_copy_sl.clicked.connect(lambda: self.copy_price_to_field(self.spin_update_sl))
         
         sl_container = QWidget()
@@ -1016,15 +325,14 @@ class DashboardGUI(QMainWindow):
         self.spin_update_tp.setDecimals(2)
         self.spin_update_tp.setRange(0, 99999)
         self.spin_update_tp.setPrefix("TP: ")
-        self.spin_update_tp.setToolTip("Set to 0.00 to keep existing TP unchanged.")
         self.spin_update_tp.setValue(0)
-        self.spin_update_tp.setFixedHeight(28)
+        self.spin_update_tp.setFixedHeight(26)
         self.spin_update_tp.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin_update_tp.setToolTip("New Take Profit Price")
         
         self.btn_copy_tp = QPushButton("📍")
-        self.btn_copy_tp.setFixedSize(24, 28)
-        self.btn_copy_tp.setCursor(Qt.PointingHandCursor)
-        self.btn_copy_tp.setToolTip("Copy current price to TP")
+        self.btn_copy_tp.setFixedSize(26, 26)
+        self.btn_copy_tp.setToolTip("Copy Current Bid Price")
         self.btn_copy_tp.clicked.connect(lambda: self.copy_price_to_field(self.spin_update_tp))
         
         tp_container = QWidget()
@@ -1034,123 +342,247 @@ class DashboardGUI(QMainWindow):
         tp_layout.addWidget(self.spin_update_tp)
         tp_layout.addWidget(self.btn_copy_tp)
         
-        self.btn_update_selected = QPushButton("Update TP/SL")
-        self.btn_update_selected.setFixedHeight(28)
-        self.btn_update_selected.setCursor(Qt.PointingHandCursor)
+        self.btn_update_selected = QPushButton("Update Selected")
+        self.btn_update_selected.setFixedHeight(29)
+        self.btn_update_selected.setToolTip("Apply SL/TP to Selected Trade")
         self.btn_update_selected.clicked.connect(self.update_selected_sltp)
-        self.btn_update_selected.setToolTip("Apply these SL/TP settings ONLY to the currently selected trade.")
         
-        self.btn_update_manual = QPushButton("Update Man")
-        self.btn_update_manual.setFixedHeight(28)
-        self.btn_update_manual.setCursor(Qt.PointingHandCursor)
+        self.btn_update_manual = QPushButton("Update Manual")
+        self.btn_update_manual.setFixedHeight(29)
+        self.btn_update_manual.setToolTip("Apply SL/TP to All Manual Trades")
         self.btn_update_manual.clicked.connect(self.update_manual_sltp)
-        self.btn_update_manual.setToolTip("Apply these SL/TP settings to ALL manual trades at once.")
         
         controls_layout.addWidget(sl_container, 0, 0)
         controls_layout.addWidget(tp_container, 0, 1)
-        controls_layout.addWidget(self.btn_update_selected, 0, 2)
-        controls_layout.addWidget(self.btn_update_manual, 0, 3)
+        controls_layout.addWidget(self.btn_update_selected, 1, 0)
+        controls_layout.addWidget(self.btn_update_manual, 1, 1)
         
-        # --- Row 1: Bulk Actions ---
+        # Bulk Actions
         self.close_combo = QComboBox()
         self.close_combo.addItems(["Close All Scalp", "Close All Swing", "Close All Manual", "Close Scalp Winners", "Close Scalp Losers"])
-        self.close_combo.setFixedHeight(30)
+        self.close_combo.setFixedHeight(26)
+        self.close_combo.setToolTip("Select Bulk Action")
         
         self.exec_btn = SafetyButton("HOLD TO EXECUTE")
+        self.exec_btn.setFixedHeight(26)
+        self.exec_btn.setToolTip("Hold to Execute Selected Action")
         self.exec_btn.triggered.connect(self.execute_close_action)
         
-        controls_layout.addWidget(self.close_combo, 1, 0, 1, 2)
-        controls_layout.addWidget(self.exec_btn, 1, 2, 1, 2)
+        controls_layout.addWidget(self.close_combo, 2, 0, 1, 2)
+        controls_layout.addWidget(self.exec_btn, 3, 0, 1, 2)
         
-        pos_layout.addWidget(controls_frame)
-        
-        # Auto-fill SL/TP on selection
-        self.tree_pos.itemSelectionChanged.connect(self.on_trade_selected)
+        sidebar_layout.addWidget(controls_frame)
 
+        sidebar_layout.addStretch()
+        
+        # Panic Button
+        self.btn_panic = SafetyButton("CLOSE ALL")
+        self.btn_panic.setFixedHeight(32)
+        self.btn_panic.setToolTip("Close ALL Open Positions Immediately")
+        self.btn_panic.triggered.connect(self.panic_close)
+        sidebar_layout.addWidget(self.btn_panic)
+        
+        splitter.addWidget(sidebar)
+        
+        # Right Content (Tabs)
+        self.tabs = QTabWidget()
+        
+        # Tab 1: Positions
+        self.pos_tab = QWidget()
+        pos_layout = QVBoxLayout(self.pos_tab)
+        
+        self.tree_positions = QTreeWidget()
+        self.tree_positions.setHeaderLabels(["Ticket", "Symbol", "Type", "Vol", "Open", "SL", "TP", "Profit", ""])
+        self.tree_positions.setToolTip("List of Open Positions")
+        # Configure column resize modes: allow interactive resizing like Logs
+        # Symbol column stretches to take remaining space; last column is fixed
+        for i in range(self.tree_positions.columnCount()):
+            if i == 1:
+                self.tree_positions.header().setSectionResizeMode(i, QHeaderView.Stretch)
+            elif i == 8:
+                self.tree_positions.header().setSectionResizeMode(i, QHeaderView.Fixed)
+                self.tree_positions.setColumnWidth(8, 40)
+            else:
+                self.tree_positions.header().setSectionResizeMode(i, QHeaderView.Interactive)
+        self.tree_positions.setAlternatingRowColors(True)
+        
+        # Set default widths for better alignment
+        self.tree_positions.setColumnWidth(0, 80)  # Ticket
+        self.tree_positions.setColumnWidth(2, 60)  # Type
+        self.tree_positions.setColumnWidth(3, 50)  # Vol
+        self.tree_positions.setColumnWidth(4, 70)  # Open
+        self.tree_positions.setColumnWidth(5, 70)  # SL
+        self.tree_positions.setColumnWidth(6, 70)  # TP
+        self.tree_positions.setColumnWidth(7, 70)  # Profit
+        
+        self.tree_positions.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_positions.customContextMenuRequested.connect(self.show_context_menu)
+        # Make headers interactive so user can drag to resize columns (like Logs)
+        self.tree_positions.header().setSectionsClickable(True)
+        self.tree_positions.header().setStretchLastSection(False)
+        # Allow manual resizing for non-stretch columns
+        for i in range(self.tree_positions.columnCount()):
+            if i != 1 and i != 8:
+                self.tree_positions.header().setSectionResizeMode(i, QHeaderView.Interactive)
+        self.tree_positions.itemDoubleClicked.connect(self.on_position_dbl_click)
+        self.tree_positions.itemSelectionChanged.connect(self.on_trade_selected)
+        pos_layout.addWidget(self.tree_positions)
+        # Ensure header labels align with the item text alignment for consistency
+        header_item = self.tree_positions.headerItem()
+        for c in range(self.tree_positions.columnCount()):
+            if c in [3, 4, 5, 6, 7]:
+                header_item.setTextAlignment(c, Qt.AlignRight | Qt.AlignVCenter)
+            else:
+                header_item.setTextAlignment(c, Qt.AlignCenter | Qt.AlignVCenter)
+        
+        self.lbl_tab_open_pl = QLabel("Total P/L: $0.00")
+        self.lbl_tab_open_pl.setAlignment(Qt.AlignRight)
+        self.lbl_tab_open_pl.setStyleSheet("font-weight: bold; font-size: 10pt; color: #D8DEE9; margin-top: 5px; margin-bottom: 5px;")
+        self.lbl_tab_open_pl.setToolTip("Total P/L of Listed Positions")
+        pos_layout.addWidget(self.lbl_tab_open_pl)
+        
         self.tabs.addTab(self.pos_tab, "Open")
-
-        # Tab 3: History
+        
+        # Tab 2: History
         self.hist_tab = QWidget()
         hist_layout = QVBoxLayout(self.hist_tab)
         
-        self.tree_hist = QTreeWidget()
-        self.tree_hist.setHeaderLabels(["#", "Type", "Vol", "P/L",""])
-        self.tree_hist.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tree_hist.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tree_hist.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tree_hist.header().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.tree_hist.headerItem().setTextAlignment(0, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_hist.headerItem().setTextAlignment(1, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_hist.headerItem().setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
-        self.tree_hist.headerItem().setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
-        self.tree_hist.setAlternatingRowColors(True)
-        hist_layout.addWidget(self.tree_hist)
+        # History Filter
+        hist_filter_layout = QHBoxLayout()
+        hist_filter_layout.setContentsMargins(0, 0, 0, 0)
+        self.combo_hist_filter = QComboBox()
+        self.combo_hist_filter.addItems(["All", "Profitable", "Losing"])
+        self.combo_hist_filter.setFixedWidth(100)
+        hist_filter_layout.addWidget(QLabel("Show:"))
+        hist_filter_layout.addWidget(self.combo_hist_filter)
+        hist_filter_layout.addStretch()
+        hist_layout.addLayout(hist_filter_layout)
+        
+        self.tree_history = QTreeWidget()
+        self.tree_history.setHeaderLabels(["Time", "Ticket", "Type", "Vol", "Duration", "Profit/Loss"])
+        self.tree_history.setToolTip("Trade History (Last 24h)")
+        self.tree_history.header().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(4, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.tree_history.setAlternatingRowColors(True)
+        self.tree_history.setColumnWidth(0, 130) # Time
+        self.tree_history.setColumnWidth(1, 80)  # Ticket
+        self.tree_history.setColumnWidth(2, 60)  # Type
+        self.tree_history.setColumnWidth(3, 60)  # Vol
+        self.tree_history.setColumnWidth(4, 70)  # Duration
+        hist_layout.addWidget(self.tree_history)
+        # Match header alignment to history item alignments
+        hist_header = self.tree_history.headerItem()
+        hist_align = {
+            0: Qt.AlignCenter,
+            1: Qt.AlignLeft,
+            2: Qt.AlignCenter,
+            3: Qt.AlignRight,
+            4: Qt.AlignCenter,
+            5: Qt.AlignRight,
+        }
+        for c in range(self.tree_history.columnCount()):
+            a = hist_align.get(c, Qt.AlignCenter)
+            hist_header.setTextAlignment(c, a | Qt.AlignVCenter)
+        # Allow user to resize history columns interactively and add context menu similar to logs
+        self.tree_history.header().setSectionsClickable(True)
+        self.tree_history.header().setStretchLastSection(False)
+        for i in [1,2,3,4]:
+            self.tree_history.header().setSectionResizeMode(i, QHeaderView.Interactive)
+        self.tree_history.header().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.tree_history.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_history.customContextMenuRequested.connect(self.show_history_context_menu)
         
         self.total_profit_label = QLabel("Bal: $0.00 | P/L: $0.00")
         self.total_profit_label.setAlignment(Qt.AlignRight)
         self.total_profit_label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        self.total_profit_label.setToolTip("Account Balance | 24h Profit/Loss")
         hist_layout.addWidget(self.total_profit_label)
         
         perf_btn_layout = QHBoxLayout()
-        
         self.btn_export_perf = QPushButton("Export Perf CSV")
+        self.btn_export_perf.setToolTip("Export Performance to CSV")
         self.btn_export_perf.clicked.connect(self.export_performance_csv)
         perf_btn_layout.addWidget(self.btn_export_perf)
         
         self.btn_clear_perf = QPushButton("Clear Perf CSV")
+        self.btn_clear_perf.setToolTip("Clear Performance History")
         self.btn_clear_perf.clicked.connect(self.clear_performance_csv)
         perf_btn_layout.addWidget(self.btn_clear_perf)
-        
         hist_layout.addLayout(perf_btn_layout)
         
         self.tabs.addTab(self.hist_tab, "History")
-
-        # Tab 4: Logs
+        
+        # Tab 3: Logs
         self.log_tab = QWidget()
         log_layout = QVBoxLayout(self.log_tab)
         
-        self.tree_log = QTreeWidget()
-        self.tree_log.setHeaderLabels(["Time", "Ticket", "Type", "Details"])
-        self.tree_log.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tree_log.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tree_log.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tree_log.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tree_log.headerItem().setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
-        self.tree_log.headerItem().setTextAlignment(1, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_log.headerItem().setTextAlignment(2, Qt.AlignCenter | Qt.AlignVCenter)
-        self.tree_log.headerItem().setTextAlignment(3, Qt.AlignLeft | Qt.AlignVCenter)
-        self.tree_log.setAlternatingRowColors(True)
-        self.tree_log.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree_log.customContextMenuRequested.connect(self.show_log_context_menu)
-        log_layout.addWidget(self.tree_log)
+        self.tree_logs = QTreeWidget()
+        self.tree_logs.setHeaderLabels(["Time", "Ticket", "Type", "Details"])
+        self.tree_logs.setToolTip("System Logs")
+        self.tree_logs.setColumnWidth(0, 80)
+        self.tree_logs.setColumnWidth(1, 80)
+        self.tree_logs.setColumnWidth(2, 100)
+        self.tree_logs.setAlternatingRowColors(True)
+        self.tree_logs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_logs.customContextMenuRequested.connect(self.show_log_context_menu)
+        log_layout.addWidget(self.tree_logs)
+        # Align log headers sensibly with log item columns
+        logs_header = self.tree_logs.headerItem()
+        for c in range(self.tree_logs.columnCount()):
+            if c in [0, 1, 2]:
+                logs_header.setTextAlignment(c, Qt.AlignCenter | Qt.AlignVCenter)
+            else:
+                logs_header.setTextAlignment(c, Qt.AlignLeft | Qt.AlignVCenter)
+        # Make logs header interactive too
+        self.tree_logs.header().setSectionsClickable(True)
+        self.tree_logs.header().setStretchLastSection(True)
         
-        btn_layout = QHBoxLayout()
-        
+        log_btn_layout = QHBoxLayout()
         self.btn_export_logs = QPushButton("Export CSV")
+        self.btn_export_logs.setToolTip("Export Logs to CSV")
         self.btn_export_logs.clicked.connect(self.export_logs_to_csv)
-        btn_layout.addWidget(self.btn_export_logs)
+        log_btn_layout.addWidget(self.btn_export_logs)
         
         self.btn_clear_logs = QPushButton("Clear Logs")
+        self.btn_clear_logs.setToolTip("Clear Logs")
         self.btn_clear_logs.clicked.connect(self.clear_logs)
-        btn_layout.addWidget(self.btn_clear_logs)
-        
-        log_layout.addLayout(btn_layout)
+        log_btn_layout.addWidget(self.btn_clear_logs)
+        log_layout.addLayout(log_btn_layout)
         
         self.tabs.addTab(self.log_tab, "Logs")
-
-        # 5. Status Bar (Footer)
+        
+        # Tab 4: Signals
+        self.sig_tab = QWidget()
+        self.init_signals_tab()
+        self.tabs.addTab(self.sig_tab, "Signals")
+        
+        splitter.addWidget(self.tabs)
+        splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(splitter)
+        
+        # Footer
         footer_frame = QFrame()
+        footer_frame.setFixedHeight(18)
         footer_frame.setStyleSheet("background-color: #2E3440; border-top: 1px solid #434C5E; border-radius: 0px;")
         footer_layout = QHBoxLayout(footer_frame)
-        footer_layout.setContentsMargins(4, 2, 4, 2)
+        footer_layout.setContentsMargins(4, 0, 4, 0)
         
         self.signal_indicator = SignalIndicator()
+        self.signal_indicator.setFixedSize(8, 8)
+        self.signal_indicator.setToolTip("Signal Activity Indicator")
         self.status_label = QLabel("Connecting...")
-        self.status_label.setStyleSheet("color: #D8DEE9; font-size: 8pt; font-weight: bold; padding: 2px;")
+        self.status_label.setStyleSheet("color: #D8DEE9; font-size: 7pt; font-weight: bold; padding: 0px;")
+        self.status_label.setToolTip("Connection Status")
         
-        self.ping_indicator = StatusCircle(size=10, color="#4C566A")
+        self.ping_indicator = StatusCircle(size=6, color="#4C566A")
+        self.ping_indicator.setToolTip("Latency Indicator")
         self.lbl_latency = QLabel("Ping: -- ms")
         self.lbl_latency.setStyleSheet("color: #D8DEE9; font-size: 6pt;")
+        self.lbl_latency.setToolTip("Server Latency (ms)")
         
         footer_layout.addWidget(self.signal_indicator)
         footer_layout.addWidget(self.status_label)
@@ -1159,7 +591,60 @@ class DashboardGUI(QMainWindow):
         footer_layout.addWidget(self.lbl_latency)
         footer_layout.addStretch()
         
-        self.main_layout.addWidget(footer_frame)
+        main_layout.addWidget(footer_frame)
+
+    def init_signals_tab(self):
+        layout = QVBoxLayout(self.sig_tab)
+        
+        # Controls
+        ctrl_layout = QHBoxLayout()
+        self.btn_sig_refresh = QPushButton("Refresh")
+        self.btn_sig_refresh.setFixedWidth(80)
+        self.btn_sig_refresh.clicked.connect(lambda: self.load_signals(self.sig_page))
+        
+        self.combo_sig_filter = QComboBox()
+        self.combo_sig_filter.addItems(["All", "Scalp", "Swing"])
+        self.combo_sig_filter.setFixedWidth(80)
+        self.combo_sig_filter.currentTextChanged.connect(lambda: self.render_signals())
+        
+        self.btn_sig_prev = QPushButton("< Prev")
+        self.btn_sig_prev.setFixedWidth(80)
+        self.btn_sig_prev.clicked.connect(self.prev_sig_page)
+        
+        self.lbl_sig_page = QLabel("Page 1")
+        self.lbl_sig_page.setAlignment(Qt.AlignCenter)
+        self.lbl_sig_page.setStyleSheet("font-weight: bold;")
+        
+        self.btn_sig_next = QPushButton("Next >")
+        self.btn_sig_next.setFixedWidth(80)
+        self.btn_sig_next.clicked.connect(self.next_sig_page)
+        
+        ctrl_layout.addWidget(self.btn_sig_refresh)
+        ctrl_layout.addWidget(self.combo_sig_filter)
+        ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self.btn_sig_prev)
+        ctrl_layout.addWidget(self.lbl_sig_page)
+        ctrl_layout.addWidget(self.btn_sig_next)
+        
+        layout.addLayout(ctrl_layout)
+        
+        # Tree
+        self.tree_signals = QTreeWidget()
+        self.tree_signals.setHeaderLabels(["Time", "ID", "Type", "Class", "Price", "Score"])
+        self.tree_signals.setAlternatingRowColors(True)
+        self.tree_signals.setColumnWidth(0, 130)
+        self.tree_signals.setColumnWidth(1, 180)
+        self.tree_signals.setColumnWidth(2, 60)
+        self.tree_signals.setColumnWidth(3, 60)
+        self.tree_signals.itemDoubleClicked.connect(self.on_signal_dbl_click)
+        layout.addWidget(self.tree_signals)
+        
+        self.sig_page = 1
+        self.sig_limit = 50
+        self.current_signals_list = []
+        
+        # Initial Load
+        QTimer.singleShot(2000, lambda: self.load_signals(1))
 
     def create_toggle(self, layout, label, key, row, col, tooltip=None):
         container = QWidget()
@@ -1171,6 +656,7 @@ class DashboardGUI(QMainWindow):
         cb.setChecked(CONFIG[key])
         def on_toggle(s, k=key):
             CONFIG[k] = bool(s)
+            save_config()
         cb.stateChanged.connect(on_toggle)
         
         if tooltip:
@@ -1182,61 +668,398 @@ class DashboardGUI(QMainWindow):
         
         layout.addWidget(container, row, col)
 
-    def open_advanced_settings(self):
-        dlg = AdvancedSettingsDialog(self)
-        dlg.exec()
+    def _format_strategy_state(self):
+        parts = []
+        if CONFIG.get("scalp_mode"): parts.append("Scalp")
+        if CONFIG.get("swing_mode"): parts.append("Swing")
+        if CONFIG.get("manage_manual"): parts.append("Manual")
+        if not parts: return "Idle"
+        return ",".join(parts)
 
-    def open_manual_panel(self):
+    def blink_labels(self):
+        self.blink_state = not self.blink_state
+
+    @Slot(dict)
+    def update_ui(self, data):
+        if self._is_closing:
+            return
+
+        # Safety check: ensure widgets are still valid before accessing them
+        try:
+            _ = self.lbl_scalp_count.width()
+        except RuntimeError:
+            return
+
+        # 1. Status & Footer
+        txt = data.get("status_text", "")
+        connected = data.get("connected", False)
+        trade_allowed = data.get("trade_allowed", False)
+        
+        base_style = "font-size: 7pt; font-weight: bold; padding: 0px; border-radius: 3px;"
+        if connected and not trade_allowed:
+            self.status_label.setText("⚠️ AutoTrading OFF")
+            self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
+        else:
+            self.status_label.setText(txt)
+            if "Connected" in txt: self.status_label.setStyleSheet(f"color: #A3BE8C; background-color: #3B4252; {base_style}")
+            elif any(x in txt for x in ["Error", "Disconnected", "Failed"]): self.status_label.setStyleSheet(f"color: #BF616A; background-color: #3B4252; {base_style}")
+            else: self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
+
+        # ATR
+        atr = data.get("server_atr", 0.0)
+        self.lbl_atr.setText(f"ATR: {atr:.2f}")
+        threshold = CONFIG.get("atr_high_vol_threshold", 1.0)
+        if atr > (threshold * 2.0):
+            self.atr_indicator.set_color("#BF616A" if self.blink_state else "#EBCB8B")
+        elif atr > threshold:
+            self.atr_indicator.set_color("#BF616A")
+        else:
+            self.atr_indicator.set_color("#A3BE8C")
+
+        # Ping
+        ping_ms = data.get("ping", 0)
+        self.lbl_latency.setText(f"Ping: {ping_ms} ms")
+        if ping_ms < 100: self.lbl_latency.setStyleSheet("color: #A3BE8C; font-size: 9pt;")
+        elif ping_ms < 300: self.lbl_latency.setStyleSheet("color: #EBCB8B; font-size: 9pt;")
+        else: self.lbl_latency.setStyleSheet("color: #BF616A; font-size: 9pt;")
+
+        # Counts
+        counts = data.get("counts", {"scalp": 0, "swing": 0, "manual": 0})
+        sc, sw, mn = counts["scalp"], counts["swing"], counts["manual"]
+        self.lbl_scalp_count.setText(f"Scalp: {sc}")
+        self.lbl_swing_count.setText(f"Swing: {sw}")
+        self.lbl_manual_count.setText(f"Manual: {mn}")
+        
+        base_style = "font-family: Consolas; font-size: 10pt; font-weight: bold;"
+        dim_style = "color: #4C566A; font-family: Consolas; font-size: 10pt;"
+        
+        self.lbl_scalp_count.setStyleSheet(f"color: {'#A3BE8C' if self.blink_state else '#B5D19E'}; {base_style}" if sc > 0 else dim_style)
+        self.lbl_swing_count.setStyleSheet(f"color: {'#88C0D0' if self.blink_state else '#81A1C1'}; {base_style}" if sw > 0 else dim_style)
+        self.lbl_manual_count.setStyleSheet(f"color: {'#EBCB8B' if self.blink_state else '#D08770'}; {base_style}" if mn > 0 else dim_style)
+        
+        # Open P/L (Header)
+        open_pl = data.get("open_pl", 0.0)
+        color_hex = "#A3BE8C" if open_pl >= 0 else "#BF616A"
+        self.lbl_open_pl.setText(f"${open_pl:.2f}")
+        self.lbl_open_pl.setStyleSheet(f"font-size: 28pt; font-weight: bold; color: {color_hex}; font-family: 'Segoe UI', sans-serif;")
+
+        # Account Info
+        balance = data.get("balance", 0.0)
+        equity = data.get("equity", 0.0)
+        self.lbl_account.setText(f"Balance: ${balance:.2f} | Equity: ${equity:.2f}")
+
+        # Update live price & quote details if available
+        bid = data.get("bid")
+        ask = data.get("ask")
+        if bid is not None and ask is not None:
+            mid = (bid + ask) / 2.0
+            self.lbl_mid.setText(f"{mid:.3f}")
+            
+            last = getattr(self, "_last_mid", None)
+            arrow = ""
+            color = "#A3BE8C"
+            
+            if last is not None:
+                delta = mid - last
+                pct = (delta / last * 100.0) if last != 0 else 0.0
+                sign = "+" if delta >= 0 else ""
+                
+                if delta > 0:
+                    arrow = "↑"
+                    color = "#A3BE8C"
+                elif delta < 0:
+                    arrow = "↓"
+                    color = "#BF616A"
+                
+                self.lbl_delta.setText(f"Δ: {sign}{delta:.3f} ({sign}{pct:.2f}%)")
+                self.lbl_delta.setStyleSheet("font-size: 9pt; font-family: Consolas; color: %s;" % ("#A3BE8C" if delta>=0 else "#BF616A"))
+            
+            self.lbl_bidask.setText(f"B:{bid:.3f} / A:{ask:.3f}")
+            self.lbl_bidask.setStyleSheet(f"font-size: 9pt; color: {color}; font-family: Consolas;")
+
+            try:
+                spread = (ask - bid)
+                self.lbl_spread.setText(f"Spread: {spread:.3f}")
+            except Exception:
+                self.lbl_spread.setText("Spread: --")
+
+            self._last_mid = mid
+
+        # Portfolio snapshot if provided
+        net_exposure = data.get("net_exposure")
+        margin_used = data.get("margin_used")
+        if net_exposure is not None or margin_used is not None:
+            ne = f"{net_exposure:.2f}" if net_exposure is not None else "--"
+            mu = f"{margin_used:.2f}" if margin_used is not None else "--"
+            self.lbl_portfolio_snapshot.setText(f"Exp: {ne} | Margin: {mu}")
+
+        # Strategy state
+        self.lbl_strategy_state.setText(self._format_strategy_state())
+
+        # 2. Logs
+        log_updates = data.get("log_updates", [])
+        if log_updates:
+            self.tree_logs.setUpdatesEnabled(False)
+            for log in log_updates:
+                item = QTreeWidgetItem([
+                    log.get("time", ""),
+                    str(log.get("ticket", "")),
+                    log.get("type", ""),
+                    log.get("details", "")
+                ])
+                # Color coding
+                ltype = log.get("type", "")
+                if "Error" in ltype or "Fail" in ltype:
+                    item.setForeground(2, QColor("#BF616A"))
+                elif "Open" in ltype or "Exec" in ltype:
+                    item.setForeground(2, QColor("#A3BE8C"))
+                elif "Signal" in ltype:
+                    item.setForeground(2, QColor("#EBCB8B"))
+                    
+                self.tree_logs.insertTopLevelItem(0, item)
+            
+            # Limit log size
+            while self.tree_logs.topLevelItemCount() > 100:
+                self.tree_logs.takeTopLevelItem(100)
+            self.tree_logs.setUpdatesEnabled(True)
+
+        # 3. Positions
+        positions = data.get("positions", [])
+        current_tickets = set()
+        
+        self.tree_positions.setUpdatesEnabled(False)
+        
+        for p in positions:
+            ticket = p["ticket"]
+            current_tickets.add(ticket)
+            
+            if ticket in self.position_items:
+                item = self.position_items[ticket]
+            else:
+                item = QTreeWidgetItem()
+                self.tree_positions.addTopLevelItem(item)
+                self.position_items[ticket] = item
+                
+                # Inline Close Button
+                btn_close = QPushButton("X")
+                btn_close.setFixedSize(24, 20)
+                btn_close.setCursor(Qt.PointingHandCursor)
+                btn_close.setProperty("class", "Danger")
+                btn_close.setStyleSheet("padding: 0px; font-size: 10px;")
+                btn_close.clicked.connect(lambda _, t=ticket: self.close_ticket(t))
+                self.tree_positions.setItemWidget(item, 8, btn_close)
+                
+                for c in range(9):
+                    # Numeric right, others (Ticket, Symbol, Type) center
+                    if c in [3, 4, 5, 6, 7]:
+                        align = Qt.AlignRight
+                    else:
+                        align = Qt.AlignCenter
+                    item.setTextAlignment(c, align | Qt.AlignVCenter)
+
+            t_type = p["type"]
+            magic = p["magic"]
+            if magic == 0: 
+                t_type += " (M)"
+            elif magic == CONFIG["magic_number"]:
+                t_type += " (Sc)"
+            elif magic == CONFIG["magic_number"] + 1:
+                t_type += " (Sw)"
+            
+            item.setText(0, str(ticket))
+            item.setText(1, p['symbol'])
+            item.setText(2, t_type)
+            item.setText(3, f"{p['volume']:.2f}")
+            item.setText(4, f"{p['price_open']:.2f}")
+            item.setText(5, f"{p['sl']:.2f}")
+            item.setText(6, f"{p['tp']:.2f}")
+            item.setText(7, f"{p['profit']:.2f}")
+            
+            color = QColor("#A3BE8C") if p["profit"] >= 0 else QColor("#BF616A")
+            item.setForeground(7, QBrush(color))
+            
+            if magic == 0: 
+                item.setForeground(1, QBrush(QColor("#EBCB8B")))
+            elif magic == CONFIG["magic_number"]:
+                item.setForeground(1, QBrush(QColor("#A3BE8C")))
+            elif magic == CONFIG["magic_number"] + 1:
+                item.setForeground(1, QBrush(QColor("#88C0D0")))
+
+        # Remove closed
+        for ticket in list(self.position_items.keys()):
+            if ticket not in current_tickets:
+                item = self.position_items.pop(ticket)
+                index = self.tree_positions.indexOfTopLevelItem(item)
+                self.tree_positions.takeTopLevelItem(index)
+        
+        self.tree_positions.setUpdatesEnabled(True)
+
+        # Open P/L
+        self.lbl_tab_open_pl.setText(f"Total P/L: ${open_pl:.2f}")
+        self.lbl_tab_open_pl.setStyleSheet(f"font-weight: bold; font-size: 10pt; color: {color_hex}; margin-top: 5px;")
+
+        # 4. History
+        history = data.get("history", [])
+        hist_filter = self.combo_hist_filter.currentText()
+        
+        # Optimization: Only rebuild history if data changed or minute changed (for relative time)
+        top_ts = history[0]['exit_time'] if history else 0
+        current_sig = (len(history), top_ts, hist_filter, int(time.time() // 60))
+        
+        if current_sig != self._last_history_sig:
+            self.tree_history.setUpdatesEnabled(False)
+            self.tree_history.clear()
+            
+            for h in history:
+                if hist_filter == "Profitable" and h["profit"] < 0:
+                    continue
+                if hist_filter == "Losing" and h["profit"] >= 0:
+                    continue
+                
+                ago = time.time() - h['exit_time']
+                if ago < 60:
+                    dt_str = "<1m ago"
+                elif ago < 3600:
+                    dt_str = f"{int(ago // 60)}m ago"
+                else:
+                    dt_str = f"{int(ago // 3600)}h ago"
+                
+                dur = h.get("duration", 0)
+                if dur < 60:
+                    dur_str = f"{dur}s"
+                elif dur < 3600:
+                    dur_str = f"{dur//60}m {dur%60}s"
+                else:
+                    dur_str = f"{dur//3600}h {(dur%3600)//60}m"
+
+                item = QTreeWidgetItem([
+                    dt_str,
+                    str(h["position_id"]), 
+                    h["type"],
+                    f"{h['volume']:.2f}", 
+                    dur_str,
+                    f"{h['profit']:.2f}"
+                ])
+                
+                # Tooltip for exact time
+                item.setToolTip(0, datetime.fromtimestamp(h['exit_time']).strftime("%Y-%m-%d %H:%M:%S"))
+                
+                color = QColor("#A3BE8C") if h["profit"] >= 0 else QColor("#BF616A")
+                item.setForeground(5, QBrush(color))
+                item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+                item.setTextAlignment(1, Qt.AlignLeft | Qt.AlignVCenter)
+                item.setTextAlignment(2, Qt.AlignCenter | Qt.AlignVCenter)
+                item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+                item.setTextAlignment(4, Qt.AlignCenter | Qt.AlignVCenter)
+                item.setTextAlignment(5, Qt.AlignRight | Qt.AlignVCenter)
+                
+                self.tree_history.addTopLevelItem(item)
+            
+            self.tree_history.setUpdatesEnabled(True)
+            self._last_history_sig = current_sig
+        
+        balance = data.get("balance", 0.0)
+        total_pl_24h = data.get("total_pl_24h", 0.0)
+        self.total_profit_label.setText(f"Bal: ${balance:.2f}  |  P/L (24h): ${total_pl_24h:.2f}")
+        self.total_profit_label.setStyleSheet(f"font-weight: bold; font-size: 10pt; color: {'#A3BE8C' if total_pl_24h >= 0 else '#BF616A'};")
+
+        # Signal Flash
+        diff = time.time() - data.get("last_signal_ts", 0)
+        if diff < 3.0:
+            self.signal_indicator.set_active(int(diff * 4) % 2 == 0)
+        else:
+            self.signal_indicator.set_active(False)
+
+        # 5. Pass data to Chart if open
+        if self.chart_window and self.chart_window.isVisible():
+            self.chart_window.update_data(
+                data.get("chart_data", []),
+                positions,
+                data.get("bid", 0),
+                data.get("ask", 0),
+                data.get("contract_size", 100),
+                data.get("history", [])
+            )
+
+    def open_chart(self):
+        if not self.chart_window:
+            self.chart_window = ChartWindow()
+        self.chart_window.show()
+        self.chart_window.raise_()
+        self.chart_window.activateWindow()
+
+    def open_manual(self):
+        if not self.manual_dialog:
+            self.manual_dialog = ManualExecutionDialog(self)
         self.manual_dialog.show()
+        self.manual_dialog.raise_()
         self.manual_dialog.activateWindow()
 
+    def open_settings(self):
+        dlg = AdvancedSettingsDialog(self)
+        if dlg.exec():
+            # Settings saved in CONFIG via dialog
+            pass
+
     def show_context_menu(self, pos):
-        item = self.tree_pos.itemAt(pos)
+        item = self.tree_positions.itemAt(pos)
         if item:
             menu = QMenu(self)
             menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            copy_action = menu.addAction("Copy Row")
             close_action = menu.addAction("Close Position")
-            action = menu.exec(self.tree_pos.mapToGlobal(pos))
-            if action == close_action:
-                self.close_selected(item)
+            action = menu.exec(self.tree_positions.mapToGlobal(pos))
+            if action == copy_action:
+                text = " | ".join([item.text(i) for i in range(self.tree_positions.columnCount())])
+                QApplication.clipboard().setText(text)
+            elif action == close_action:
+                self.close_ticket(int(item.text(0)))
+
+    def show_log_context_menu(self, pos):
+        item = self.tree_logs.itemAt(pos)
+        if item:
+            menu = QMenu(self)
+            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            copy_action = menu.addAction("Copy Log")
+            action = menu.exec(self.tree_logs.mapToGlobal(pos))
+            if action == copy_action:
+                text = f"[{item.text(0)}] Ticket:{item.text(1)} Type:{item.text(2)} - {item.text(3)}"
+                QApplication.clipboard().setText(text)
+
+    def show_history_context_menu(self, pos):
+        item = self.tree_history.itemAt(pos)
+        if item:
+            menu = QMenu(self)
+            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            copy_action = menu.addAction("Copy Row")
+            action = menu.exec(self.tree_history.mapToGlobal(pos))
+            if action == copy_action:
+                text = " | ".join([item.text(i) for i in range(self.tree_history.columnCount())])
+                QApplication.clipboard().setText(text)
 
     def on_trade_selected(self):
-        items = self.tree_pos.selectedItems()
-        if not items:
-            return
-            
-        item = items[0]
-        ticket_str = item.text(0)
+        items = self.tree_positions.selectedItems()
+        if not items: return
+        ticket_str = items[0].text(0)
         if not ticket_str.isdigit(): return
-        
         positions = mt5.positions_get(ticket=int(ticket_str))
         if positions:
             self.spin_update_sl.setValue(positions[0].sl)
             self.spin_update_tp.setValue(positions[0].tp)
 
+    def copy_price_to_field(self, field):
+        tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
+        if tick: field.setValue(tick.bid)
+
     def close_ticket(self, ticket):
         positions = mt5.positions_get(ticket=ticket)
-        if positions:
-            self._send_close_request(positions[0])
-
-    def show_log_context_menu(self, pos):
-        item = self.tree_log.itemAt(pos)
-        if item:
-            menu = QMenu(self)
-            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
-            copy_action = menu.addAction("Copy Log")
-            action = menu.exec(self.tree_log.mapToGlobal(pos))
-            if action == copy_action:
-                text = f"[{item.text(0)}] Ticket:{item.text(1)} Type:{item.text(2)} - {item.text(3)}"
-                QApplication.clipboard().setText(text)
+        if positions: self._send_close_request(positions[0])
 
     def _send_close_request(self, pos):
         tick = mt5.symbol_info_tick(pos.symbol)
         if not tick: return
-        
         type_close = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price_close = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-        
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": pos.symbol,
@@ -1247,28 +1070,7 @@ class DashboardGUI(QMainWindow):
             "magic": pos.magic,
             "comment": "GUI Close"
         }
-        res = mt5.order_send(req)
-        
-        with state["lock"]:
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": str(pos.ticket),
-                    "type": "Manual Close",
-                    "details": f"Closed {pos.volume} lots"
-                })
-            else:
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": str(pos.ticket),
-                    "type": "Close Fail",
-                    "details": res.comment if res else "Unknown Error"
-                })
-
-    def close_selected(self, item):
-        ticket = int(item.text(0))
-        positions = mt5.positions_get(ticket=ticket)
-        if positions: self._send_close_request(positions[0])
+        mt5.order_send(req)
 
     def execute_close_action(self):
         action = self.close_combo.currentText()
@@ -1279,176 +1081,9 @@ class DashboardGUI(QMainWindow):
         elif action == "Close Scalp Winners": mode = "scalp_profit"
         elif action == "Close Scalp Losers": mode = "scalp_loss"
         
-        if mode: self.close_bulk(mode)
-
-    def _send_sltp_update(self, pos, new_sl, new_tp):
-        symbol_info = mt5.symbol_info(pos.symbol)
-        if not symbol_info: return
-        
-        tick_size = symbol_info.trade_tick_size
-        digits = symbol_info.digits
-        
-        def normalize(val):
-            return round(round(val / tick_size) * tick_size, digits)
-
-        # If 0, keep existing
-        sl = new_sl if new_sl > 0 else pos.sl
-        tp = new_tp if new_tp > 0 else pos.tp
-        
-        sl = normalize(sl)
-        tp = normalize(tp)
-        
-        if abs(sl - pos.sl) < tick_size and abs(tp - pos.tp) < tick_size:
-            return
-
-        req = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": pos.ticket,
-            "sl": float(sl),
-            "tp": float(tp),
-            "symbol": pos.symbol
-        }
-        
-        res = mt5.order_send(req)
-        with state["lock"]:
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": str(pos.ticket),
-                    "type": "SL/TP Update",
-                    "details": f"SL: {sl} TP: {tp}"
-                })
-            else:
-                err = res.comment if res else "Unknown"
-                state["gui_logs"].append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "ticket": str(pos.ticket),
-                    "type": "Update Fail",
-                    "details": err
-                })
-
-    def update_manual_sltp(self):
-        sl = self.spin_update_sl.value()
-        tp = self.spin_update_tp.value()
-        
-        if sl == 0 and tp == 0:
-            QMessageBox.warning(self, "Warning", "Please enter a SL or TP value.")
-            return
-        
-        positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
-        if not positions: return
-        
-        count = 0
-        for pos in positions:
-            if pos.magic == 0: # Manual
-                self._send_sltp_update(pos, sl, tp)
-                count += 1
-        
-        if count == 0:
-             QMessageBox.information(self, "Info", "No manual trades found.")
-
-    def update_selected_sltp(self):
-        sl = self.spin_update_sl.value()
-        tp = self.spin_update_tp.value()
-        
-        if sl == 0 and tp == 0:
-            QMessageBox.warning(self, "Warning", "Please enter a SL or TP value.")
-            return
-        
-        item = self.tree_pos.currentItem()
-        if not item:
-            QMessageBox.warning(self, "Warning", "No trade selected.")
-            return
-            
-        ticket_str = item.text(0)
-        if not ticket_str.isdigit(): return
-        
-        ticket = int(ticket_str)
-        positions = mt5.positions_get(ticket=ticket)
-        if positions:
-            self._send_sltp_update(positions[0], sl, tp)
-
-    def copy_price_to_field(self, field):
-        tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
-        if tick:
-            field.setValue(tick.bid)
-
-    def export_logs_to_csv(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "Export Logs", "logs_export.csv", "CSV Files (*.csv)")
-        if not filename:
-            return
-            
-        try:
-            with open(filename, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                # Write Header
-                headers = []
-                for i in range(self.tree_log.columnCount()):
-                    headers.append(self.tree_log.headerItem().text(i))
-                writer.writerow(headers)
-                
-                # Write Rows
-                root = self.tree_log.invisibleRootItem()
-                for i in range(root.childCount()):
-                    item = root.child(i)
-                    row = []
-                    for c in range(self.tree_log.columnCount()):
-                        row.append(item.text(c))
-                    writer.writerow(row)
-            
-            QMessageBox.information(self, "Export Successful", f"Logs exported to {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Error exporting logs: {str(e)}")
-
-    def clear_logs(self):
-        self.tree_log.clear()
-
-    def export_performance_csv(self):
-        src_filename = "strategy_performance.csv"
-        if not os.path.exists(src_filename):
-            QMessageBox.information(self, "Export Failed", "No performance data found.")
-            return
-
-        filename, _ = QFileDialog.getSaveFileName(self, "Export Performance", "performance_export.csv", "CSV Files (*.csv)")
-        if not filename:
-            return
-            
-        try:
-            shutil.copy2(src_filename, filename)
-            QMessageBox.information(self, "Export Successful", f"Performance data exported to {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Error exporting data: {str(e)}")
-
-    def clear_performance_csv(self):
-        src_filename = "strategy_performance.csv"
-        if not os.path.exists(src_filename):
-            QMessageBox.information(self, "Clear Failed", "No performance data found.")
-            return
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Confirm Clear")
-        msg.setText("Are you sure you want to clear the performance history CSV?")
-        msg.setIcon(QMessageBox.Warning)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.No)
-        
-        if msg.exec() == QMessageBox.Yes:
-            try:
-                os.remove(src_filename)
-                QMessageBox.information(self, "Clear Successful", "Performance history cleared.")
-            except Exception as e:
-                QMessageBox.critical(self, "Clear Failed", f"Error clearing data: {str(e)}")
-
-    def close_bulk(self, mode):
-        # SafetyButton already handles the "Confirm" aspect via hold-to-trigger.
-        # We can skip the popup for smoother UX, or keep it for "loss" only if strictly needed.
-        # Given the requirement to remove popups for SafetyButton, we proceed directly.
-
         positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
         if not positions: return
         for pos in positions:
-            if pos.magic not in [CONFIG["magic_number"], CONFIG["magic_number"]+1, 0]: continue
-            
             is_scalp = pos.magic == CONFIG["magic_number"]
             is_swing = pos.magic == CONFIG["magic_number"] + 1
             is_manual = pos.magic == 0
@@ -1459,199 +1094,164 @@ class DashboardGUI(QMainWindow):
             elif mode == "scalp_profit" and is_scalp and pos.profit > 0: self._send_close_request(pos)
             elif mode == "scalp_loss" and is_scalp and pos.profit < 0: self._send_close_request(pos)
 
-    @Slot(dict)
-    def on_data_received(self, data: Dict[str, Any]):
-        # Status
-        txt = data.get("status_text", "")
-        connected = data.get("connected", False)
-        trade_allowed = data.get("trade_allowed", False)
-        
-        base_style = "font-size: 8pt; font-weight: bold; padding: 2px; border-radius: 3px;"
-        if connected and not trade_allowed:
-            self.status_label.setText("⚠️ AutoTrading OFF")
-            self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
-        else:
-            self.status_label.setText(txt)
-            if "Connected" in txt: self.status_label.setStyleSheet(f"color: #A3BE8C; background-color: #3B4252; {base_style}")
-            elif any(x in txt for x in ["Error", "Disconnected", "Failed"]): self.status_label.setStyleSheet(f"color: #BF616A; background-color: #3B4252; {base_style}")
-            else: self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
-        
-        # ATR
-        atr = data.get("server_atr", 0.0)
-        self.lbl_atr.setText(f"ATR: {atr:.2f}")
-        
-        # ATR Indicator Color
-        threshold = CONFIG.get("atr_high_vol_threshold", 1.0)
-        if atr > (threshold * 2.0):
-            # Extreme Volatility: Blink Red/Yellow
-            if self.blink_state:
-                self.atr_indicator.set_color("#BF616A") # Red
-            else:
-                self.atr_indicator.set_color("#EBCB8B") # Yellow
-        elif atr > threshold:
-            self.atr_indicator.set_color("#BF616A") # Red (High Volatility)
-        else:
-            self.atr_indicator.set_color("#A3BE8C") # Green (Normal)
-        
-        # Update Footer
-        ping_ms = data.get("ping", 0)
-        self.lbl_latency.setText(f"Ping: {ping_ms} ms")
-        if ping_ms < 100: self.lbl_latency.setStyleSheet("color: #A3BE8C; font-size: 9pt;")
-        elif ping_ms < 300: self.lbl_latency.setStyleSheet("color: #EBCB8B; font-size: 9pt;")
-        else: self.lbl_latency.setStyleSheet("color: #BF616A; font-size: 9pt;")
+    def _send_sltp_update(self, pos, sl, tp):
+        req = {"action": mt5.TRADE_ACTION_SLTP, "position": pos.ticket, "sl": float(sl), "tp": float(tp), "symbol": pos.symbol}
+        mt5.order_send(req)
+
+    def update_manual_sltp(self):
+        sl = self.spin_update_sl.value()
+        tp = self.spin_update_tp.value()
+        positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
+        if positions:
+            for pos in positions:
+                if pos.magic == 0: self._send_sltp_update(pos, sl, tp)
+
+    def update_selected_sltp(self):
+        sl = self.spin_update_sl.value()
+        tp = self.spin_update_tp.value()
+        items = self.tree_positions.selectedItems()
+        if items:
+            ticket = int(items[0].text(0))
+            positions = mt5.positions_get(ticket=ticket)
+            if positions: self._send_sltp_update(positions[0], sl, tp)
+
+    def export_logs_to_csv(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Export Logs", "logs_export.csv", "CSV Files (*.csv)")
+        if filename:
+            with open(filename, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Time", "Ticket", "Type", "Details"])
+                root = self.tree_logs.invisibleRootItem()
+                for i in range(root.childCount()):
+                    item = root.child(i)
+                    writer.writerow([item.text(0), item.text(1), item.text(2), item.text(3)])
+
+    def clear_logs(self):
+        self.tree_logs.clear()
+
+    def export_performance_csv(self):
+        src = "strategy_performance.csv"
+        if os.path.exists(src):
+            filename, _ = QFileDialog.getSaveFileName(self, "Export Performance", "performance_export.csv", "CSV Files (*.csv)")
+            if filename: shutil.copy2(src, filename)
+
+    def clear_performance_csv(self):
+        if os.path.exists("strategy_performance.csv"):
+            if QMessageBox.question(self, "Confirm", "Clear history?") == QMessageBox.Yes:
+                os.remove("strategy_performance.csv")
+
+    def on_position_dbl_click(self, item, column):
+        ticket = item.text(0)
+        symbol = item.text(1)
+        try:
+            sl = float(item.text(5))
+            tp = float(item.text(6))
+        except ValueError:
+            sl = 0.0
+            tp = 0.0
             
-        # Price
-        bid = data.get("bid", 0.0)
-        ask = data.get("ask", 0.0)
-        self.price_label.setText(f"{bid:.2f} / {ask:.2f}")
+        dlg = PositionModifyDialog(ticket, symbol, sl, tp, self)
+        dlg.exec()
+
+    def panic_close(self):
+        # This would ideally send a signal to the controller or worker to close all
+        # For now, we can just log it or implement a direct MT5 call if thread-safe
+        # Since MT5 is thread-safe for simple calls, we can try, but better to flag state.
+        # Let's just log for now as the worker handles logic usually.
+        positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
+        if positions:
+            for pos in positions:
+                self._send_close_request(pos)
+
+    def closeEvent(self, event):
+        self._is_closing = True
+        self.blink_timer.stop()
+        try:
+            self.worker.data_updated.disconnect(self.update_ui)
+        except Exception:
+            pass
+
+        data = {"geometry": self.saveGeometry().toBase64().data().decode()}
+        with open("ui_state.json", "w") as f: json.dump(data, f)
+        self.stop_worker_signal.emit()
+        self.worker_thread.quit()
+        self.worker_thread.wait()
+        if self.chart_window:
+            self.chart_window.close()
+        if self.manual_dialog:
+            self.manual_dialog.close()
+        super().closeEvent(event)
+
+    def load_signals(self, page):
+        self.btn_sig_refresh.setEnabled(False)
+        self.status_label.setText(f"Loading Signals Page {page}...")
         
-        if self.last_price > 0:
-            if bid > self.last_price:
-                self.price_label.setStyleSheet('font-family: "Consolas"; font-weight: bold; font-size: 20pt; color: #A3BE8C;')
-            elif bid < self.last_price:
-                self.price_label.setStyleSheet('font-family: "Consolas"; font-weight: bold; font-size: 20pt; color: #BF616A;')
+        self.worker_sig = SignalHistoryWorker(page, self.sig_limit)
+        self.worker_sig.data_received.connect(self.on_signals_loaded)
+        self.worker_sig.error_occurred.connect(self.on_signals_error)
+        self.worker_sig.finished.connect(lambda: self.btn_sig_refresh.setEnabled(True))
+        self.worker_sig.start()
+
+    def on_signals_loaded(self, data):
+        self.current_signals_list = data.get("signals", [])
+        self.sig_page = data.get("page", 1)
         
-        self.last_price = bid
+        self.lbl_sig_page.setText(f"Page {self.sig_page}")
+        self.render_signals()
         
-        # Counts
-        counts = data.get("counts", {"scalp": 0, "swing": 0, "manual": 0})
-        sc, sw, mn = counts["scalp"], counts["swing"], counts["manual"]
+        self.btn_sig_prev.setEnabled(self.sig_page > 1)
+        self.btn_sig_next.setEnabled(len(self.current_signals_list) == self.sig_limit)
+        self.status_label.setText("Signals Loaded")
+
+    def render_signals(self):
+        self.tree_signals.clear()
+        filter_txt = self.combo_sig_filter.currentText().lower()
         
-        self.lbl_scalp_count.setText(f"Scalp: {sc}")
-        self.lbl_swing_count.setText(f"Swing: {sw}")
-        self.lbl_manual_count.setText(f"Manual: {mn}")
-        self.has_active_trades = (sc > 0 or sw > 0 or mn > 0)
-        
-        # Dynamic Styling with Blink
-        base_style = "font-family: Consolas; font-size: 10pt; font-weight: bold;"
-        dim_style = "color: #4C566A; font-family: Consolas; font-size: 10pt;"
-        
-        if sc > 0:
-            color = "#A3BE8C" if self.blink_state else "#B5D19E"
-            self.lbl_scalp_count.setStyleSheet(f"color: {color}; {base_style}")
-        else:
-            self.lbl_scalp_count.setStyleSheet(dim_style)
+        for s in self.current_signals_list:
+            s_class = s.get("classification", "").lower()
+            if filter_txt != "all" and filter_txt not in s_class:
+                continue
+
+            ts = s.get("createdAt", 0)
+            dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
             
-        if sw > 0:
-            color = "#88C0D0" if self.blink_state else "#81A1C1"
-            self.lbl_swing_count.setStyleSheet(f"color: {color}; {base_style}")
-        else:
-            self.lbl_swing_count.setStyleSheet(dim_style)
+            # Format Type (Check for Limit)
+            e_type = s.get("entryType", "").upper()
+            rec_type = s.get("recommendedOrderType", "").lower()
+            if "limit" in rec_type:
+                e_type = f"LIMIT {e_type}"
             
-        if mn > 0:
-            color = "#EBCB8B" if self.blink_state else "#D08770"
-            self.lbl_manual_count.setStyleSheet(f"color: {color}; {base_style}")
-        else:
-            self.lbl_manual_count.setStyleSheet(dim_style)
-        
-        # Positions Tree Optimization
-        positions = data.get("positions", [])
-        current_tickets = set()
-        
-        for pos in positions:
-            ticket = pos["ticket"]
-            current_tickets.add(ticket)
+            item = QTreeWidgetItem([
+                dt,
+                s.get("signalId", ""),
+                e_type,
+                s.get("classification", ""),
+                str(s.get("entryPrice", "")),
+                f"{s.get('convictionScore', 0):.1f}"
+            ])
             
-            # Update or Create
-            if ticket in self.position_items:
-                item = self.position_items[ticket]
-            else:
-                item = QTreeWidgetItem()
-                self.tree_pos.addTopLevelItem(item)
-                self.position_items[ticket] = item
+            # Color coding
+            if "long" in s.get("entryType", ""):
+                item.setForeground(2, QBrush(QColor("#A3BE8C")))
+            elif "short" in s.get("entryType", ""):
+                item.setForeground(2, QBrush(QColor("#BF616A")))
                 
-                # Add Close Button
-                btn_close = QPushButton("X")
-                btn_close.setFixedSize(24, 20)
-                btn_close.setCursor(Qt.PointingHandCursor)
-                btn_close.setProperty("class", "Danger")
-                btn_close.setStyleSheet("padding: 0px; font-size: 10px;")
-                btn_close.clicked.connect(lambda _, t=ticket: self.close_ticket(t))
-                self.tree_pos.setItemWidget(item, 4, btn_close)
-                
-                # Alignments
-                for c in range(5):
-                    align = Qt.AlignRight if c in [2,3] else Qt.AlignCenter
-                    item.setTextAlignment(c, align | Qt.AlignVCenter)
+            item.setData(0, Qt.UserRole, s) # Store full data
+            self.tree_signals.addTopLevelItem(item)
 
-            # Update Data
-            t_type = pos["type"]
-            if pos["magic"] == 0: t_type += " (M)"
-            
-            item.setText(0, str(ticket))
-            item.setText(1, t_type)
-            item.setText(2, str(pos["volume"]))
-            item.setText(3, f"{pos['profit']:.2f}")
-            
-            color = QColor("#A3BE8C") if pos["profit"] >= 0 else QColor("#BF616A")
-            if pos["magic"] == 0:
-                item.setForeground(1, QBrush(QColor("#EBCB8B")))
-            else:
-                item.setForeground(1, QBrush(QColor("#D8DEE9")))
-            item.setForeground(3, QBrush(color))
+    def on_signals_error(self, err):
+        QMessageBox.warning(self, "Signal Error", f"Failed to load signals: {err}")
+        self.status_label.setText("Signal Load Failed")
 
-        # Remove closed positions
-        tickets_to_remove = []
-        for ticket in self.position_items:
-            if ticket not in current_tickets:
-                tickets_to_remove.append(ticket)
-        
-        for ticket in tickets_to_remove:
-            item = self.position_items.pop(ticket)
-            index = self.tree_pos.indexOfTopLevelItem(item)
-            self.tree_pos.takeTopLevelItem(index)
-        
-        # Open P/L
-        open_pl = data.get("open_pl", 0.0)
-        color_hex = "#A3BE8C" if open_pl >= 0 else "#BF616A"
-        self.lbl_open_pl.setText(f"${open_pl:.2f}")
-        self.lbl_open_pl.setStyleSheet(f"font-size: 20pt; font-weight: bold; color: {color_hex};")
-        self.lbl_tab_open_pl.setText(f"Total P/L: ${open_pl:.2f}")
-        self.lbl_tab_open_pl.setStyleSheet(f"font-weight: bold; font-size: 12pt; color: {color_hex}; margin-top: 5px;")
-        
-        # History Tree
-        # For simplicity, we clear history if count differs, or just rebuild.
-        # Since history is append-only mostly, we could optimize, but clear/fill is safer for now given low frequency.
-        self.tree_hist.clear()
-        history = data.get("history", [])
-        for h in history:
-            item = QTreeWidgetItem([str(h["ticket"]), h["type"], str(h["volume"]), f"{h['profit']:.2f}"])
-            color = QColor("#A3BE8C") if h["profit"] >= 0 else QColor("#BF616A")
-            item.setForeground(3, QBrush(color))
-            item.setTextAlignment(0, Qt.AlignCenter | Qt.AlignVCenter)
-            item.setTextAlignment(1, Qt.AlignCenter | Qt.AlignVCenter)
-            item.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
-            item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
-            self.tree_hist.addTopLevelItem(item)
-        
-        balance = data.get("balance", 0.0)
-        total_pl_24h = data.get("total_pl_24h", 0.0)
-        self.total_profit_label.setText(f"Bal: ${balance:.2f}  |  P/L (24h): ${total_pl_24h:.2f}")
-        color_hex = "#A3BE8C" if total_pl_24h >= 0 else "#BF616A"
-        self.total_profit_label.setStyleSheet(f"font-weight: bold; font-size: 10pt; color: {color_hex};")
-        
-        # Update Logs
-        logs_to_add = data.get("new_logs", [])
-        
-        for log in logs_to_add:
-            item = QTreeWidgetItem([log["time"], str(log["ticket"]), log["type"], log["details"]])
-            item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
-            item.setTextAlignment(1, Qt.AlignCenter | Qt.AlignVCenter)
-            item.setTextAlignment(2, Qt.AlignCenter | Qt.AlignVCenter)
-            item.setTextAlignment(3, Qt.AlignLeft | Qt.AlignVCenter)
-            self.tree_log.insertTopLevelItem(0, item)
-            # Limit log size in UI to 100 items
-            if self.tree_log.topLevelItemCount() > 100:
-                self.tree_log.takeTopLevelItem(100)
-        
-        if logs_to_add:
-            self.tree_log.scrollToItem(self.tree_log.topLevelItem(0))
+    def prev_sig_page(self):
+        if self.sig_page > 1:
+            self.load_signals(self.sig_page - 1)
 
-        # Flash Signal Indicator
-        diff = time.time() - data.get("last_signal_ts", 0)
-        if diff < 3.0: # Flash for 3 seconds
-            # Blink rapidly (approx every 250ms)
-            is_active = (int(diff * 4) % 2 == 0)
-            self.signal_indicator.set_active(is_active)
-        else:
-            self.signal_indicator.set_active(False)
+    def next_sig_page(self):
+        self.load_signals(self.sig_page + 1)
+
+    def on_signal_dbl_click(self, item, col):
+        data = item.data(0, Qt.UserRole)
+        if data:
+            dlg = SignalDetailsDialog(data, self)
+            dlg.exec()

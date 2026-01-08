@@ -49,6 +49,40 @@ def calculate_local_atr(symbol, period=14):
         
     return tr_sum / period
 
+def get_chart_data(symbol, timeframe_str="M1", count=100):
+    """Fetch recent candles for charting."""
+    tf_map = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+    }
+    tf = tf_map.get(timeframe_str, mt5.TIMEFRAME_M1)
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    
+    if rates is None:
+        # Try selecting symbol and retry
+        if mt5.symbol_select(symbol, True):
+             rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+
+    if rates is None or len(rates) == 0:
+        return []
+    
+    data = []
+    for r in rates:
+        data.append({
+            "time": int(r['time']),
+            "open": float(r['open']),
+            "high": float(r['high']),
+            "low": float(r['low']),
+            "close": float(r['close']),
+            "tick_volume": int(r['tick_volume']),
+        })
+    return data
+
 # =============================================================================
 # PERFORMANCE LOGGING
 # =============================================================================
@@ -138,6 +172,45 @@ def execute_trade(signal):
     if limit_price == 0.0:
         limit_price = entry_price
     expiration_sec = signal.get("expirationSeconds")
+    
+    # --- Pre-Execution Checks ---
+    term_info = mt5.terminal_info()
+    if not term_info or not term_info.trade_allowed:
+        msg = "AutoTrading disabled in Terminal (Click 'Algo Trading' button)"
+        print(f"[EXEC] Error: {msg}")
+        with state["lock"]:
+            state["gui_logs"].append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "ticket": "-",
+                "type": "Exec Error",
+                "details": msg
+            })
+        return
+
+    acct_info = mt5.account_info()
+    if acct_info:
+        if not acct_info.trade_allowed:
+            msg = "Trading disabled for this Account (Check Broker/Password)"
+            print(f"[EXEC] Error: {msg}")
+            with state["lock"]:
+                state["gui_logs"].append({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "ticket": "-",
+                    "type": "Exec Error",
+                    "details": msg
+                })
+            return
+        if not acct_info.trade_expert:
+            msg = f"AutoTrading disabled by Server for Acct {acct_info.login} (Broker restricted)"
+            print(f"[EXEC] Error: {msg}")
+            with state["lock"]:
+                state["gui_logs"].append({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "ticket": "-",
+                    "type": "Exec Error",
+                    "details": msg
+                })
+            return
     
     # Simple Filters
     ask, bid = get_ask_bid()
@@ -262,20 +335,6 @@ def execute_trade(signal):
             
         price = normalize(price)
         
-        # Enforce Max Risk (100 pips) for Scalp
-        if "scalp" in classification:
-            max_risk_pips = min(CONFIG.get("max_scalp_sl_pips", 100.0), 100.0)
-            max_risk_pts = max_risk_pips * 10 * point
-            
-            if is_long:
-                limit_sl = price - max_risk_pts
-                if raw_sl == 0.0 or raw_sl < limit_sl:
-                    raw_sl = limit_sl
-            else:
-                limit_sl = price + max_risk_pts
-                if raw_sl == 0.0 or raw_sl > limit_sl:
-                    raw_sl = limit_sl
-
         if raw_sl > 0: raw_sl = normalize(raw_sl)
         if raw_tp1 > 0: raw_tp1 = normalize(raw_tp1)
         if raw_tp2 > 0: raw_tp2 = normalize(raw_tp2)
@@ -406,6 +465,9 @@ def manage_positions():
     # Fetch all positions for the symbol (including Manual with magic=0)
     all_positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
     
+    if all_positions is None:
+        return
+
     # Check for closed trades
     monitor_closed_trades(all_positions)
     

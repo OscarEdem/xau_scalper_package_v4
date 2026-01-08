@@ -49,6 +49,7 @@ pub struct ExecutionManager {
     pub last_notified_direction: SignalDirection, // "long", "short", "none"
     pub last_notified_time: i64,         // Unix timestamp
     pub last_notified_price: f64,
+    pub last_notified_conviction: f64,
     pub pyramiding_enabled: bool,
     pub last_notified_scalp_mode: Option<String>,
     #[serde(default)]
@@ -66,6 +67,7 @@ impl ExecutionManager {
             last_notified_direction: SignalDirection::None,
             last_notified_time: 0,
             last_notified_price: 0.0,
+            last_notified_conviction: 0.0,
             pyramiding_enabled,
             last_notified_scalp_mode: None,
             last_pushed_signal_id: None,
@@ -92,8 +94,12 @@ impl ExecutionManager {
 
         // Check if this is the same signal ID we are already tracking
         if self.last_notified_signal_id.as_ref() == Some(&signal.signal_id) {
+            // If conviction increased since last notification, allow update (higher-confidence heartbeat)
+            let current_conv = signal.conviction_score.unwrap_or(0.0);
+            if current_conv > self.last_notified_conviction {
+                return true;
+            }
             // Reminder Logic: Re-broadcast every 15 minutes (900 seconds) if signal persists
-            // This ensures new WS clients eventually see the active signal.
             if current_time - self.last_reminder_time > 900 {
                 return true;
             }
@@ -157,6 +163,7 @@ impl ExecutionManager {
         self.last_notified_price = signal.entry_price;
         self.last_notified_scalp_mode = signal.scalp_mode.clone();
         self.last_reminder_time = current_time;
+        self.last_notified_conviction = signal.conviction_score.unwrap_or(0.0);
     }
 }
 
@@ -340,6 +347,8 @@ pub struct TradingSession {
     // --- State Data ---
     last_evaluation_timestamp: i64,
     swing_trend: TrendDirection,
+    // Timestamp of last time we ran the full swing evaluation
+    last_swing_eval_time: i64,
 
     // --- Data Buffers ---
     pub market_data: MarketDataBuffer,
@@ -380,6 +389,7 @@ impl TradingSession {
             latest_swing_signal: None,
             active_swing_trade_id: None,
             active_trade_latch_time: 0,
+            last_swing_eval_time: 0,
             pending_re_entry: None,
             execution: ExecutionManager::new(true, false), // Scalp: Allow pyramiding, Normal mode
             swing_execution: ExecutionManager::new(true, true), // Swing: Pyramiding YES, Strict Reversal YES
@@ -435,9 +445,131 @@ impl TradingSession {
 
         let mut notifications = Vec::new();
 
-        // 2. Run Swing Engine & Logic
-        let swing_notifications = self.process_swing_logic(&req, predictor_cache, &settings);
-        notifications.extend(swing_notifications);
+        // 2. Run Swing Engine & Logic (gated for HTF stability)
+        // Run full Swing evaluation only on H1 boundary, on ATR/interval triggers, or force.
+        let mut run_swing = false;
+        let eval_interval = 3600; // seconds fallback
+        let atr_multiplier = settings.swing.eval_atr_multiplier; // trigger multiplier (configurable)
+
+        // Trigger on new H1 candle
+        if let Some(last_h1_ts) = req.last_h1_timestamp {
+            if last_h1_ts > self.last_swing_eval_time {
+                run_swing = true;
+            }
+        }
+
+        // Time-based fallback (in case H1 timestamps are missing)
+        if !run_swing && (self.last_swing_eval_time == 0 || (req.last_m1_timestamp - self.last_swing_eval_time) > eval_interval) {
+            run_swing = true;
+        }
+
+        // Cheap structure-level breach (uses stored external_high/external_low in debug_info)
+        if !run_swing {
+            let mut struct_break = false;
+            if let Some(existing) = &self.latest_swing_signal {
+                if let Some(info) = &existing.debug_info {
+                    if let (Some(eh), Some(el)) = (info.get("external_high"), info.get("external_low")) {
+                        if let (Ok(eh_v), Ok(el_v)) = (eh.parse::<f64>(), el.parse::<f64>()) {
+                            let last_atr = crate::atr(&Cow::Borrowed(self.market_data.h1_highs.make_contiguous()),
+                                                      &Cow::Borrowed(self.market_data.h1_lows.make_contiguous()),
+                                                      &Cow::Borrowed(self.market_data.h1_closes.make_contiguous()), 14)
+                                                      .last().cloned().unwrap_or(0.0);
+                            if last_atr > 0.0 {
+                                let margin = last_atr * settings.swing.eval_struct_margin_atr; // config knob (e.g. 0.5)
+                                if req.current_price > eh_v + margin || req.current_price < el_v - margin {
+                                    struct_break = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // M15 quick confirmation fallback (lightweight): check for a small breakout on M15
+            if !struct_break && settings.swing.eval_m15_check_enabled {
+                if !self.market_data.m15_closes.is_empty() {
+                    let lookback = settings.swing.m15_swing_lookback.min(self.market_data.m15_closes.len());
+                    if lookback >= 2 {
+                        let start = self.market_data.m15_closes.len() - lookback;
+                        let slice = &self.market_data.m15_closes.as_slices().0[start..];
+                        if slice.len() >= 2 {
+                            let last = slice[slice.len()-1];
+                            let prev_max = slice[..slice.len()-1].iter().cloned().fold(f64::MIN, f64::max);
+                            let prev_min = slice[..slice.len()-1].iter().cloned().fold(f64::MAX, f64::min);
+                            if last > prev_max || last < prev_min {
+                                struct_break = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if struct_break {
+                run_swing = true;
+            } else {
+                // ATR-move trigger: if price moved enough vs last swing entry
+                if !self.market_data.h1_closes.is_empty() {
+                    let last_atr = crate::atr(&Cow::Borrowed(self.market_data.h1_highs.make_contiguous()),
+                                              &Cow::Borrowed(self.market_data.h1_lows.make_contiguous()),
+                                              &Cow::Borrowed(self.market_data.h1_closes.make_contiguous()), 14)
+                                              .last().cloned().unwrap_or(0.0);
+                    if last_atr > 0.0 {
+                        if let Some(existing) = &self.latest_swing_signal {
+                            if existing.entry_type != SignalDirection::None {
+                                let dist = (req.current_price - existing.entry_price).abs();
+                                if dist > last_atr * atr_multiplier {
+                                    run_swing = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if run_swing {
+            let swing_notifications = self.process_swing_logic(&req, predictor_cache, &settings);
+            notifications.extend(swing_notifications);
+            // mark last eval time
+            self.last_swing_eval_time = req.last_h1_timestamp.unwrap_or(req.last_m1_timestamp);
+        } else {
+            // Lightweight per-tick trade management: check existing active swing for SL hits only.
+            if let Some(existing) = &self.latest_swing_signal {
+                if existing.entry_type != SignalDirection::None {
+                    let h1_atr = crate::atr(&Cow::Borrowed(self.market_data.h1_highs.make_contiguous()), 
+                                            &Cow::Borrowed(self.market_data.h1_lows.make_contiguous()), 
+                                            &Cow::Borrowed(self.market_data.h1_closes.make_contiguous()), 14)
+                                            .last().cloned().unwrap_or(0.0);
+                    let mut managed = existing.clone();
+                    self.manage_active_swing_trade(&mut managed, req.current_price, req.last_m1_timestamp, h1_atr);
+                    if managed.entry_type == SignalDirection::None {
+                        // SL hit -> notify/close
+                        let mut close_notification = managed.clone();
+                        close_notification.should_push = settings.swing.push_notifications_enabled;
+                        if close_notification.should_push { Self::format_push_notification(&mut close_notification, &self.symbol); }
+                        if let Some(db) = &self.db {
+                            let sig_clone = close_notification.clone();
+                            let sym_clone = self.symbol.clone();
+                            let db_clone = db.clone();
+                            let metrics_clone = self.metrics.clone();
+                            tokio::spawn(async move { 
+                                if let Err(e) = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
+                                    tracing::error!(symbol = %sym_clone, signal_id = %sig_clone.signal_id, error = %e, "Failed to save swing close signal to DB");
+                                }
+                            });
+                        }
+                        self.broadcast_signal(&close_notification);
+                        notifications.push(close_notification);
+                        // clear execution state
+                        self.swing_execution.last_notified_signal_id = None;
+                        self.swing_execution.last_notified_direction = SignalDirection::None;
+                    } else {
+                        // update latest_swing_signal to keep latch/debug info fresh
+                        self.latest_swing_signal = Some(managed);
+                    }
+                }
+            }
+        }
 
         // 3. Run Scalp Engine & Logic
         let scalp_notifications = self.process_scalp_logic(&req, predictor_cache, &settings);
@@ -523,17 +655,15 @@ impl TradingSession {
         // --- Trade Management & Persistence Logic ---
         // 1. Check if we have an existing active trade
         let mut active_trade_closed = false;
-        let mut sl_changed = false;
-        let prev_sl = self.latest_swing_signal.as_ref().filter(|s| s.entry_type != SignalDirection::None).map(|s| s.sl_price).unwrap_or(0.0);
 
         if let Some(existing) = &self.latest_swing_signal {
             if existing.entry_type != SignalDirection::None {
 
                 // Case A: Engine confirms the SAME trade (ID matches)
                 if swing_signal.signal_id == existing.signal_id {
-                    // Run standard management (Trailing SL, Latching) on the NEW signal
+                    // Run standard management (Latch & SL-hit detection) on the NEW signal.
+                    // NOTE: We DO NOT move SLs here; SL adjustments are managed externally by the user.
                     self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp, h1_atr);
-                    sl_changed = (swing_signal.sl_price - prev_sl).abs() > 0.0001;
                 } 
                 // Case B: Engine says "None" or "New ID", but we are holding a trade.
                 // We must manually check the EXISTING trade for SL/TP hits.
@@ -554,7 +684,6 @@ impl TradingSession {
                         if swing_signal.entry_type == SignalDirection::None {
                             swing_signal = managed_existing; // Keep holding
                             // Don't treat this as a "new" signal for notification, just persistence.
-                            sl_changed = (swing_signal.sl_price - prev_sl).abs() > 0.0001;
                         } else {
                             // Engine found a NEW trade. 
                             // For this system (Single Trade per Session), we usually ignore new if old is active,
@@ -660,38 +789,7 @@ impl TradingSession {
                 self.broadcast_signal(&swing_signal);
             }
 
-            // Notify on SL Update (Move to BE, Trailing)
-            if sl_changed && settings.swing.push_notifications_enabled {
-                let mut reason_text = format!("Update: Stop Loss moved to {:.2}", swing_signal.sl_price);
-                // Check if it was a move to Breakeven by comparing the new SL to the entry price
-                let is_breakeven_move = (swing_signal.sl_price - swing_signal.entry_price).abs() < 0.0001;
-                if is_breakeven_move {
-                    reason_text = format!("Update: TP1 Hit. Stop Loss moved to Breakeven at {:.2}", swing_signal.sl_price);
-                }
-
-                let mut update_signal = swing_signal.clone();
-                update_signal.reason = reason_text;
-                update_signal.should_push = true;
-                Self::format_push_notification(&mut update_signal, &self.symbol);
-                // We push this as a notification. The ID is the same, but the reason is different.
-                
-                // Save Update Signal to DB
-                if let Some(db) = &self.db {
-                    let sig_clone = update_signal.clone();
-                    let sym_clone = self.symbol.clone();
-                    let db_clone = db.clone();
-                    let metrics_clone = self.metrics.clone();
-                    tokio::spawn(async move { 
-                        if let Err(e) = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
-                            tracing::error!(symbol = %sym_clone, signal_id = %sig_clone.signal_id, error = %e, "Failed to save swing update signal to DB");
-                        }
-                    });
-                }
-
-                // Broadcast SL Update to WebSocket
-                self.broadcast_signal(&update_signal);
-                notifications.push(update_signal);
-            }
+            // SL updates are intentionally disabled here; SL/TP adjustments are handled externally by the user.
         } else if swing_signal.entry_type != SignalDirection::None {
             // Fallback: Broadcast valid signals even if execution manager suppressed them (e.g. Strict Mode repeats with new ID).
             // This ensures the UI shows the active signal even if it's not a "new entry" notification.
@@ -922,7 +1020,10 @@ impl TradingSession {
                 swing_signal.tp3_price = existing.tp3_price;
 
                 // 2. SL Management (Lock & Trail)
-                let mut managed_sl = existing.sl_price; // Start with locked SL
+                let managed_sl = existing.sl_price; // Start with locked SL
+
+                // Ensure we always start with the existing SL (prevents accidental per-tick drift)
+                swing_signal.sl_price = existing.sl_price;
 
                 // --- NEW: Persistence for High/Low Watermark ---
                 // Track best price to ensure trailing triggers even if price retraces immediately.
@@ -987,11 +1088,8 @@ impl TradingSession {
                         // Reset execution memory to allow re-entry if structure holds
                         self.swing_execution.last_notified_signal_id = None;
                     } else {
-                        // Trailing: Move SL up if targets reached
-                        if best_price >= swing_signal.tp1_price { managed_sl = managed_sl.max(swing_signal.entry_price); }
-                        if best_price >= swing_signal.tp2_price { managed_sl = managed_sl.max(swing_signal.tp1_price); }
-                        // Lock: Ensure SL never drops
-                        swing_signal.sl_price = managed_sl.max(swing_signal.sl_price);
+                        // Do NOT move SL on ticks. Keep the original SL provided by the engine/user.
+                        swing_signal.sl_price = existing.sl_price;
                     }
                 } else if swing_signal.entry_type == SignalDirection::Short {
                     // Invalidation
@@ -1021,11 +1119,8 @@ impl TradingSession {
                         // Reset execution memory to allow re-entry if structure holds
                         self.swing_execution.last_notified_signal_id = None;
                     } else {
-                        // Trailing
-                        if best_price <= swing_signal.tp1_price { managed_sl = managed_sl.min(swing_signal.entry_price); }
-                        if best_price <= swing_signal.tp2_price { managed_sl = managed_sl.min(swing_signal.tp1_price); }
-                        // Lock: Ensure SL never rises
-                        swing_signal.sl_price = managed_sl.min(swing_signal.sl_price);
+                        // Do NOT move SL on ticks. Keep the original SL provided by the engine/user.
+                        swing_signal.sl_price = existing.sl_price;
                     }
                 }
             }

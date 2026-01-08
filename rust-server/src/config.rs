@@ -176,6 +176,7 @@ pub struct ScalpSettings {
     pub push_notifications_enabled: bool,
     #[serde(default = "default_push_notification_threshold")]
     pub push_notification_threshold: f64,
+    // (swing evaluation knobs moved to `SwingSettings`)
 }
 
 impl Default for ScalpSettings {
@@ -194,8 +195,8 @@ impl Default for ScalpSettings {
             inducement_weight: 0.6,
             risk_reward_ratio_tp1: 1.25,
             risk_reward_ratio_tp2: 2.5,
-            sl_atr_multiplier_inducement: 1.0,
-            sl_atr_multiplier_flow: 2.0,
+            sl_atr_multiplier_inducement: 0.6,
+            sl_atr_multiplier_flow: 1.2,
             logistic_scale: 2.93,
             logistic_offset: 0.75,
             limit_order_expiration: 180,
@@ -209,17 +210,17 @@ impl Default for ScalpSettings {
             fade_sma_period: 20,
             fade_std_dev_mult: 3.0,
             fade_parabolic_atr_mult: 0.8,
-            fade_sl_atr_mult: 0.5,
+            fade_sl_atr_mult: 0.3,
             fade_tp1_atr_mult: 1.0,
             fade_max_adx: 30.0,
-            momentum_risk_atr_mult: 0.4,
+            momentum_risk_atr_mult: 0.24,
             momentum_tp1_atr_mult: 0.7,
             momentum_tp2_atr_mult: 1.3,
-            pullback_sl_atr_mult: 0.15,
+            pullback_sl_atr_mult: 0.09,
             pullback_tp1_atr_mult: 0.5,
             pullback_tp2_atr_mult: 1.0,
-            min_sl_atr_mult: 0.25,
-            max_sl_atr_mult: 2.5,
+            min_sl_atr_mult: 0.15,
+            max_sl_atr_mult: 1.5,
             kalman_weight: 0.6,
             m1_surge_weight: 0.35,
             
@@ -232,13 +233,19 @@ impl Default for ScalpSettings {
             vol_regime_clamp_max: 2.0,
             flow_threshold_mult: 0.5,
             inducement_opposing_reduction: 0.5,
-            momentum_min_risk_atr: 0.35,
+            momentum_min_risk_atr: 0.21,
             filter_scalp_by_swing: false,
             push_notifications_enabled: true,
             push_notification_threshold: 60.0,
+            // note: swing evaluation knobs belong to `SwingSettings`
         }
     }
 }
+
+fn default_eval_on_h1_only() -> bool { false }
+fn default_eval_atr_multiplier() -> f64 { 1.5 }
+fn default_eval_struct_margin_atr() -> f64 { 0.5 }
+fn default_eval_m15_check_enabled() -> bool { true }
 
 impl ScalpSettings {
     pub fn validate(&self) -> Result<(), String> {
@@ -301,6 +308,15 @@ pub struct SwingSettings {
     pub push_notifications_enabled: bool,
     #[serde(default = "default_push_notification_threshold")]
     pub push_notification_threshold: f64,
+    // Evaluation tuning knobs
+    #[serde(default = "default_eval_on_h1_only")]
+    pub eval_on_h1_only: bool,
+    #[serde(default = "default_eval_atr_multiplier")]
+    pub eval_atr_multiplier: f64,
+    #[serde(default = "default_eval_struct_margin_atr")]
+    pub eval_struct_margin_atr: f64,
+    #[serde(default = "default_eval_m15_check_enabled")]
+    pub eval_m15_check_enabled: bool,
 }
 
 impl Default for SwingSettings {
@@ -348,6 +364,10 @@ impl Default for SwingSettings {
             fractal_penalty_score: 25.0,
             push_notifications_enabled: true,
             push_notification_threshold: 60.0,
+            eval_on_h1_only: false,
+            eval_atr_multiplier: 1.5,
+            eval_struct_margin_atr: 0.5,
+            eval_m15_check_enabled: true,
         }
     }
 }

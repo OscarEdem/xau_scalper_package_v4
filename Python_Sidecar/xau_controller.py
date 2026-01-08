@@ -33,8 +33,14 @@ class TradingWorker(QObject):
 
     @Slot()
     def run(self):
-        if not mt5.initialize():
-            state["status_text"] = "MT5 Init Failed!"
+        # Retry initialization loop
+        while state["running"]:
+            if mt5.initialize():
+                break
+            state["status_text"] = "MT5 Init Failed! Retrying..."
+            time.sleep(1)
+        
+        if not state["running"]:
             self.finished.emit()
             return
         
@@ -87,7 +93,7 @@ class TradingWorker(QObject):
                         state["latest_signal"] = data
                         state["last_signal_ts"] = time.time()
                         
-                        # Check for New Signal
+                        # Check for Signal
                         sig_id = data.get("signalId")
                         e_type = data.get("entryType", "none")
                         classification = data.get("classification", "unknown")
@@ -153,7 +159,10 @@ class TradingWorker(QObject):
                 state["status_text"] = "Connection Failed"
             
             if state["running"]:
-                time.sleep(5) # Wait before reconnecting if run_forever exits
+                # Wait before reconnecting, but allow quick exit
+                for _ in range(50):
+                    if not state["running"]: break
+                    time.sleep(0.1)
         
         self.finished.emit()
 
@@ -166,6 +175,7 @@ class TradingWorker(QObject):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
+
     # Setup QThread for Trading Logic
     thread = QThread()
     worker = TradingWorker()

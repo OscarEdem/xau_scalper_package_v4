@@ -1,4 +1,6 @@
 import threading
+import json
+import os
 
 # --- DEFAULT CONFIGURATION ---
 DEFAULT_CONFIG = {
@@ -13,7 +15,7 @@ DEFAULT_CONFIG = {
     "update_interval": 1.0,
     
     # -- Mutable Settings (Controlled by GUI) --
-    "fixed_lot_size": 0.05,
+    "fixed_lot_size": 0.01,
     "swing_lot_size": 0.03,
     "max_entries": 10,
     "min_conviction": 20.0,
@@ -28,7 +30,7 @@ DEFAULT_CONFIG = {
     "velocity_lookback_sec": 10,
     
     # -- Stops --
-    "trailing_start_pips_scalp": 50.0,
+    "trailing_start_pips_scalp": 30.0,
     "trailing_start_pips_swing": 450.0,
     "trailing_dist_pips_scalp": 80.0,
     "trailing_dist_pips_swing": 200.0,
@@ -44,10 +46,32 @@ DEFAULT_CONFIG = {
     "atr_dist_mult_scalp": 1.5,
     "atr_dist_mult_swing": 2.5,
     "atr_high_vol_threshold": 1.0,
-    "max_scalp_sl_pips": 100.0,
+    "chart_rr_ratio": 1.5,
+    "chart_timeframe": "M1",
 }
 
 CONFIG = DEFAULT_CONFIG.copy()
+CONFIG_FILE = "user_config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+                for k, v in saved.items():
+                    if k in CONFIG:
+                        CONFIG[k] = v
+        except Exception as e:
+            print(f"Failed to load config: {e}")
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(CONFIG, f, indent=4)
+    except Exception as e:
+        print(f"Failed to save config: {e}")
+
+load_config()
 
 # --- GLOBAL STATE ---
 state = {
