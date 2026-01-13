@@ -5170,5 +5170,53 @@
         "tp": 4677.653,
         "conviction": 37.5,
         "classification": "swing"
+    },
+    "2182281722": {
+        "signalId": "XAUUSDm-long-1768303200",
+        "timestamp": "2026-01-13 11:21:01",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.01,
+        "price": 4585.604,
+        "sl": 4579.977,
+        "tp": 4586.726,
+        "conviction": 48.16956836809629,
+        "classification": "scalp"
+    },
+    "2182281728": {
+        "signalId": "XAUUSDm-long-1768303200",
+        "timestamp": "2026-01-13 11:21:02",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.01,
+        "price": 4585.604,
+        "sl": 4579.977,
+        "tp": 4586.726,
+        "conviction": 48.16956836809629,
+        "classification": "scalp"
+    },
+    "2182281750": {
+        "signalId": "XAUUSDm-long-1768303200",
+        "timestamp": "2026-01-13 11:21:02",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.01,
+        "price": 4585.604,
+        "sl": 4579.977,
+        "tp": 4588.148,
+        "conviction": 48.16956836809629,
+        "classification": "scalp"
+    },
+    "2182281788": {
+        "signalId": "XAUUSDm-long-1768303200",
+        "timestamp": "2026-01-13 11:21:02",
+        "symbol": "XAUUSD",
+        "entryType": "long",
+        "volume": 0.01,
+        "price": 4585.604,
+        "sl": 4579.977,
+        "tp": 4588.148,
+        "conviction": 48.16956836809629,
+        "classification": "scalp"
     }
 }
