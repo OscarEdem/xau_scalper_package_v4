@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta
 import MetaTrader5 as mt5 # type: ignore
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QScrollArea, QFrame, QWidget,  # type: ignore
-                               QFormLayout, QLabel, QLineEdit, QDialogButtonBox, 
+                               QFormLayout, QLabel, QLineEdit, QDialogButtonBox, QComboBox,
                                QMessageBox, QGridLayout, QHBoxLayout, QPushButton, QTextEdit, QTabWidget, QApplication, QGraphicsOpacityEffect)
 from PySide6.QtCore import Qt, QByteArray, QPointF, QPoint, QTimer, QPropertyAnimation, QEasingCurve # type: ignore
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QPolygonF # type: ignore
@@ -24,11 +24,11 @@ class ModernToast(QWidget):
         
         # Colors & Icon
         if style == "success":
-            bg, fg, icon = "#A3BE8C", "#2E3440", "✓"
+            bg, fg, icon = "#81C995", "#000000", "✓"
         elif style == "error":
-            bg, fg, icon = "#BF616A", "#ECEFF4", "✕"
+            bg, fg, icon = "#F28B82", "#000000", "✕"
         else:
-            bg, fg, icon = "#EBCB8B", "#2E3440", "!"
+            bg, fg, icon = "#FDD663", "#000000", "!"
 
         self.setStyleSheet(f"""
             QWidget {{
@@ -137,20 +137,16 @@ class AdvancedSettingsDialog(QDialog):
         
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #434C5E; background: #3B4252; border-radius: 4px; }
-            QTabBar::tab { background: #2E3440; color: #D8DEE9; padding: 8px 20px; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }
-            QTabBar::tab:selected { background: #88C0D0; color: #2E3440; font-weight: bold; }
+            QTabWidget::pane { border: 1px solid #444746; background: #1E1F20; border-radius: 4px; }
+            QTabBar::tab { background: #131314; color: #C4C7C5; padding: 8px 20px; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }
+            QTabBar::tab:selected { background: #A8C7FA; color: #000000; font-weight: bold; }
         """)
         layout.addWidget(self.tabs)
         
         self.inputs = {}
         
         # --- Tab 1: General ---
-        self.tab_general = QWidget()
-        self.layout_general = QFormLayout(self.tab_general)
-        self.layout_general.setSpacing(15)
-        self.layout_general.setContentsMargins(20, 20, 20, 20)
-        self.layout_general.setLabelAlignment(Qt.AlignLeft)
+        self.tab_general, self.layout_general = self.create_scrollable_tab()
         
         self.add_input(self.layout_general, "Signal Symbol", "signal_symbol", str, "Symbol to listen for signals.")
         self.add_input(self.layout_general, "Trade Symbol", "trade_symbol", str, "Symbol to execute trades on.")
@@ -164,54 +160,80 @@ class AdvancedSettingsDialog(QDialog):
         self.tabs.addTab(self.tab_general, "General")
         
         # --- Tab 2: Trailing ---
-        self.tab_trailing = QWidget()
-        self.layout_trailing = QFormLayout(self.tab_trailing)
-        self.layout_trailing.setSpacing(15)
-        self.layout_trailing.setContentsMargins(20, 20, 20, 20)
-        self.layout_trailing.setLabelAlignment(Qt.AlignLeft)
+        self.tab_trailing, self.layout_trailing = self.create_scrollable_tab()
         
         self.add_header(self.layout_trailing, "Scalp Settings")
         self.add_input(self.layout_trailing, "Start (pips)", "trailing_start_pips_scalp", float, "Profit in pips required to activate trailing stop.")
-        self.add_input(self.layout_trailing, "Dist (pips)", "trailing_dist_pips_scalp", float, "Distance in pips to maintain from current price.")
+        self.add_input(self.layout_trailing, "Dist (pips)", "trailing_dist_pips_scalp", float, "Distance in pips (Overridden if ATR Trailing is enabled).")
         self.add_input(self.layout_trailing, "Step (pips)", "trailing_step_pips_scalp", float, "Minimum price movement in pips to update stop loss.")
         
         self.add_separator(self.layout_trailing)
         self.add_header(self.layout_trailing, "Swing Settings")
         self.add_input(self.layout_trailing, "Start (pips)", "trailing_start_pips_swing", float, "Profit in pips required to activate trailing stop.")
-        self.add_input(self.layout_trailing, "Dist (pips)", "trailing_dist_pips_swing", float, "Distance in pips to maintain from current price.")
+        self.add_input(self.layout_trailing, "Dist (pips)", "trailing_dist_pips_swing", float, "Distance in pips (Overridden if ATR Trailing is enabled).")
         self.add_input(self.layout_trailing, "Step (pips)", "trailing_step_pips_swing", float, "Minimum price movement in pips to update stop loss.")
         
         self.tabs.addTab(self.tab_trailing, "Trailing")
         
         # --- Tab 3: ATR & Risk ---
-        self.tab_atr = QWidget()
-        self.layout_atr = QFormLayout(self.tab_atr)
-        self.layout_atr.setSpacing(15)
-        self.layout_atr.setContentsMargins(20, 20, 20, 20)
-        self.layout_atr.setLabelAlignment(Qt.AlignLeft)
+        self.tab_atr, self.layout_atr = self.create_scrollable_tab()
         
         self.add_bool(self.layout_atr, "Use ATR Trailing", "use_atr_trailing", "Use Server ATR for trailing distance instead of fixed pips.")
-        self.add_input(self.layout_atr, "ATR Mult (Scalp)", "atr_dist_mult_scalp", float, "Multiplier for ATR to calculate trailing distance (Scalp).")
-        self.add_input(self.layout_atr, "ATR Mult (Swing)", "atr_dist_mult_swing", float, "Multiplier for ATR to calculate trailing distance (Swing).")
+        self.add_combo(self.layout_atr, "ATR TF (Scalp)", "atr_timeframe_scalp", ["M1", "M5", "M15", "M30", "H1", "H4", "D1"], "Timeframe for Scalp ATR.")
+        
+        self.add_combo(self.layout_atr, "ATR TF (Swing)", "atr_timeframe_swing", ["M1", "M5", "M15", "M30", "H1", "H4", "D1"], "Timeframe for Swing ATR.")
+        
         self.add_separator(self.layout_atr)
-        self.add_input(self.layout_atr, "High Vol Threshold", "atr_high_vol_threshold", float, "ATR value above which the indicator turns red.")
+        self.add_combo(self.layout_atr, "Gauge Timeframe", "atr_timeframe", ["M1", "M5", "M15", "M30", "H1", "H4", "D1"], "Timeframe used for Dashboard Gauge.")
+        self.add_separator(self.layout_atr)
+        self.add_input(self.layout_atr, "High Vol Threshold", "atr_high_vol_threshold", float, "Base ATR threshold (M5). Scales with timeframe.")
         self.add_input(self.layout_atr, "Chart R:R Ratio", "chart_rr_ratio", float, "Default Risk:Reward ratio for the Chart R/R tool.")
         
         self.tabs.addTab(self.tab_atr, "ATR / Risk")
         
         # --- Tab 4: Management ---
-        self.tab_mgmt = QWidget()
-        self.layout_mgmt = QFormLayout(self.tab_mgmt)
-        self.layout_mgmt.setSpacing(15)
-        self.layout_mgmt.setContentsMargins(20, 20, 20, 20)
-        self.layout_mgmt.setLabelAlignment(Qt.AlignLeft)
+        self.tab_mgmt, self.layout_mgmt = self.create_scrollable_tab()
         
         self.add_bool(self.layout_mgmt, "Use Stagnation", "use_stagnation", "Enable partial closing of trades that stall.")
         self.add_input(self.layout_mgmt, "Stag. Sec", "stagnation_sec", int, "Seconds before a trade is considered stagnant.")
         self.add_input(self.layout_mgmt, "Time Mult", "stag_time_mult", float, "Multiplier for stagnation time on Swing trades.")
+        self.add_bool(self.layout_mgmt, "Netting: Close Manual", "allow_manual_closure_on_netting", "Allow bot to close opposite Manual trades on Netting accounts.")
         
         self.tabs.addTab(self.tab_mgmt, "Management")
         
+        # --- Tab 5: Sessions ---
+        self.tab_sessions, self.layout_sessions = self.create_scrollable_tab()
+        
+        self.add_header(self.layout_sessions, "Scalp Sessions")
+        self.add_bool(self.layout_sessions, "Sydney (21:00-06:00 UTC)", "session_scalp_syd")
+        self.add_bool(self.layout_sessions, "Tokyo (00:00-09:00 UTC)", "session_scalp_tok")
+        self.add_bool(self.layout_sessions, "London (08:00-17:00 UTC)", "session_scalp_lon")
+        self.add_bool(self.layout_sessions, "New York (13:00-22:00 UTC)", "session_scalp_ny")
+        self.add_bool(self.layout_sessions, "Overlap: TOK/LON (08:00-09:00 UTC)", "session_scalp_overlap_tok_lon")
+        self.add_bool(self.layout_sessions, "Overlap: LON/NY (13:00-17:00 UTC)", "session_scalp_overlap_lon_ny")
+        
+        self.add_separator(self.layout_sessions)
+        self.add_header(self.layout_sessions, "Swing Sessions")
+        self.add_bool(self.layout_sessions, "Sydney (21:00-06:00 UTC)", "session_swing_syd")
+        self.add_bool(self.layout_sessions, "Tokyo (00:00-09:00 UTC)", "session_swing_tok")
+        self.add_bool(self.layout_sessions, "London (08:00-17:00 UTC)", "session_swing_lon")
+        self.add_bool(self.layout_sessions, "New York (13:00-22:00 UTC)", "session_swing_ny")
+        self.add_bool(self.layout_sessions, "Overlap: TOK/LON (08:00-09:00 UTC)", "session_swing_overlap_tok_lon")
+        self.add_bool(self.layout_sessions, "Overlap: LON/NY (13:00-17:00 UTC)", "session_swing_overlap_lon_ny")
+        
+        self.add_separator(self.layout_sessions)
+        self.add_header(self.layout_sessions, "Auto-Close at Session End")
+        self.add_bool(self.layout_sessions, "Close Scalp at Sydney End (06:00 UTC)", "close_scalp_syd_end")
+        self.add_bool(self.layout_sessions, "Close Scalp at Tokyo End (09:00 UTC)", "close_scalp_tok_end")
+        self.add_bool(self.layout_sessions, "Close Scalp at London End (17:00 UTC)", "close_scalp_lon_end")
+        self.add_bool(self.layout_sessions, "Close Scalp at NY End (22:00 UTC)", "close_scalp_ny_end")
+        
+        self.add_bool(self.layout_sessions, "Close Swing at Sydney End (06:00 UTC)", "close_swing_syd_end")
+        self.add_bool(self.layout_sessions, "Close Swing at Tokyo End (09:00 UTC)", "close_swing_tok_end")
+        self.add_bool(self.layout_sessions, "Close Swing at London End (17:00 UTC)", "close_swing_lon_end")
+        self.add_bool(self.layout_sessions, "Close Swing at NY End (22:00 UTC)", "close_swing_ny_end")
+        
+        self.tabs.addTab(self.tab_sessions, "Sessions")
         
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.btn_reset = btns.addButton("Reset to Defaults", QDialogButtonBox.ResetRole)
@@ -223,16 +245,41 @@ class AdvancedSettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+        self.load_geometry()
+
+    def create_scrollable_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        form = QFormLayout(content)
+        form.setSpacing(15)
+        form.setContentsMargins(20, 20, 20, 20)
+        form.setLabelAlignment(Qt.AlignLeft)
+        
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+        
+        return tab, form
+
     def add_header(self, layout, text):
         lbl = QLabel(text)
-        lbl.setStyleSheet("font-weight: bold; color: #88C0D0; font-size: 10pt; margin-top: 5px;")
+        lbl.setStyleSheet("font-weight: bold; color: #A8C7FA; font-size: 10pt; margin-top: 5px;")
         layout.addRow(lbl)
 
     def add_separator(self, layout):
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Sunken)
-        line.setStyleSheet("background-color: #434C5E; margin-top: 5px; margin-bottom: 5px;")
+        line.setStyleSheet("background-color: #444746; margin-top: 5px; margin-bottom: 5px;")
         layout.addRow(line)
 
     def add_input(self, layout, label, key, dtype, tooltip=None):
@@ -267,6 +314,20 @@ class AdvancedSettingsDialog(QDialog):
         layout.addRow(lbl, widget)
         self.inputs[key] = (widget, bool)
 
+    def add_combo(self, layout, label, key, items, tooltip=None):
+        val = CONFIG.get(key, items[0])
+        widget = QComboBox()
+        widget.addItems(items)
+        widget.setCurrentText(str(val))
+        if tooltip:
+            widget.setToolTip(tooltip)
+        
+        lbl = QLabel(label)
+        if tooltip:
+            lbl.setToolTip(tooltip)
+        layout.addRow(lbl, widget)
+        self.inputs[key] = (widget, list)
+
     def reset_defaults(self):
         msg = QMessageBox(self)
         msg.setWindowTitle("Confirm Reset")
@@ -281,6 +342,8 @@ class AdvancedSettingsDialog(QDialog):
                     val = DEFAULT_CONFIG[key]
                     if dtype == bool:
                         widget.setChecked(val)
+                    elif dtype == list:
+                        widget.setCurrentText(str(val))
                     elif dtype == str:
                         widget.setText(str(val))
                     else:
@@ -299,6 +362,8 @@ class AdvancedSettingsDialog(QDialog):
             for key, (widget, dtype) in self.inputs.items():
                 if dtype == bool:
                     CONFIG[key] = widget.isChecked()
+                elif dtype == list:
+                    CONFIG[key] = widget.currentText()
                 elif dtype == str:
                     CONFIG[key] = widget.text()
                 else:
@@ -306,12 +371,29 @@ class AdvancedSettingsDialog(QDialog):
             save_config()
             super().accept()
 
-class ManualExecutionDialog(QDialog):
+    def load_geometry(self):
+        try:
+            if os.path.exists("settings_ui_state.json"):
+                with open("settings_ui_state.json", "r") as f:
+                    data = json.load(f)
+                    geom = QByteArray.fromBase64(data.get("geometry", "").encode())
+                    self.restoreGeometry(geom)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        data = {"geometry": self.saveGeometry().toBase64().data().decode()}
+        try:
+            with open("settings_ui_state.json", "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+class ManualExecutionDialog(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Trade Panel")
-        self.setWindowFlags(Qt.Window) # Modeless window
-        self.resize(360, 550)
+        self.setMinimumWidth(320)
         self.setStyleSheet(GLOBAL_STYLESHEET)
         
         layout = QVBoxLayout(self)
@@ -352,15 +434,6 @@ class ManualExecutionDialog(QDialog):
         # Row 1.5: Risk Calculator
         row_risk = QHBoxLayout()
         
-        risk_container = QWidget()
-        risk_layout = QVBoxLayout(risk_container)
-        risk_layout.setContentsMargins(0,0,0,0)
-        risk_layout.setSpacing(2)
-        risk_layout.addWidget(QLabel("Risk (Pips)"))
-        self.spin_risk_pips = ModernSpinBox(30.0, is_float=True, step=1.0)
-        self.spin_risk_pips.input.setRange(1.0, 9999.0)
-        risk_layout.addWidget(self.spin_risk_pips)
-        
         rr_container = QWidget()
         rr_layout = QVBoxLayout(rr_container)
         rr_layout.setContentsMargins(0,0,0,0)
@@ -374,27 +447,26 @@ class ManualExecutionDialog(QDialog):
         calc_layout = QVBoxLayout(calc_container)
         calc_layout.setContentsMargins(0,0,0,0)
         calc_layout.setSpacing(2)
-        calc_layout.addWidget(QLabel("Auto-Fill SL/TP"))
+        calc_layout.addWidget(QLabel("Auto-Fill TP"))
         
         calc_btns = QHBoxLayout()
         calc_btns.setSpacing(4)
         self.btn_calc_long = QPushButton("Long")
         self.btn_calc_long.setCursor(Qt.PointingHandCursor)
         self.btn_calc_long.setToolTip("Calculate SL/TP for Long position")
-        self.btn_calc_long.setStyleSheet("background-color: #A3BE8C; color: #2E3440; font-weight: bold; padding: 2px;")
+        self.btn_calc_long.setStyleSheet("background-color: #81C995; color: #000000; font-weight: bold; padding: 2px;")
         self.btn_calc_long.clicked.connect(lambda: self.calc_sltp("long"))
         
         self.btn_calc_short = QPushButton("Short")
         self.btn_calc_short.setCursor(Qt.PointingHandCursor)
         self.btn_calc_short.setToolTip("Calculate SL/TP for Short position")
-        self.btn_calc_short.setStyleSheet("background-color: #BF616A; color: #ECEFF4; font-weight: bold; padding: 2px;")
+        self.btn_calc_short.setStyleSheet("background-color: #F28B82; color: #000000; font-weight: bold; padding: 2px;")
         self.btn_calc_short.clicked.connect(lambda: self.calc_sltp("short"))
         
         calc_btns.addWidget(self.btn_calc_long)
         calc_btns.addWidget(self.btn_calc_short)
         calc_layout.addLayout(calc_btns)
         
-        row_risk.addWidget(risk_container)
         row_risk.addWidget(rr_container)
         row_risk.addWidget(calc_container)
         
@@ -409,7 +481,7 @@ class ManualExecutionDialog(QDialog):
         sl_layout.setSpacing(2)
         sl_layout.addWidget(QLabel("Stop Loss"))
         self.spin_man_sl = ModernSpinBox(0, is_float=True, step=1.0)
-        self.spin_man_sl.input.setRange(0, 99999)
+        self.spin_man_sl.input.setRange(0, 1000000)
         sl_layout.addWidget(self.spin_man_sl)
         
         tp_container = QWidget()
@@ -418,7 +490,7 @@ class ManualExecutionDialog(QDialog):
         tp_layout.setSpacing(2)
         tp_layout.addWidget(QLabel("Take Profit"))
         self.spin_man_tp = ModernSpinBox(0, is_float=True, step=1.0)
-        self.spin_man_tp.input.setRange(0, 99999)
+        self.spin_man_tp.input.setRange(0, 1000000)
         tp_layout.addWidget(self.spin_man_tp)
         
         row2.addWidget(sl_container)
@@ -434,11 +506,11 @@ class ManualExecutionDialog(QDialog):
         
         p_inner = QHBoxLayout()
         self.spin_man_price = ModernSpinBox(0, is_float=True, step=0.1)
-        self.spin_man_price.input.setRange(0, 99999)
+        self.spin_man_price.input.setRange(0, 1000000)
         self.spin_man_price.setToolTip("Entry Price. Required for Pending Orders. Leave 0 for Market execution.")
         
         self.btn_copy_price = QPushButton("📍")
-        self.btn_copy_price.setFixedSize(28, 28)
+        self.btn_copy_price.setFixedSize(32, 32)
         self.btn_copy_price.setCursor(Qt.PointingHandCursor)
         self.btn_copy_price.setToolTip("Copy Current Price")
         self.btn_copy_price.clicked.connect(self.copy_current_price)
@@ -452,10 +524,15 @@ class ManualExecutionDialog(QDialog):
         layout.addWidget(settings_frame)
         
         # --- MARKET EXECUTION ---
+        mkt_frame = QFrame()
+        mkt_frame.setProperty("class", "Panel")
+        mkt_layout = QVBoxLayout(mkt_frame)
+        mkt_layout.setSpacing(10)
+        
         mkt_label = QLabel("Market Execution")
         mkt_label.setAlignment(Qt.AlignCenter)
-        mkt_label.setStyleSheet("font-weight: bold; color: #88C0D0; margin-top: 5px;")
-        layout.addWidget(mkt_label)
+        mkt_label.setStyleSheet("font-weight: bold; color: #A8C7FA; margin-top: 5px;")
+        mkt_layout.addWidget(mkt_label)
         
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
@@ -476,13 +553,19 @@ class ManualExecutionDialog(QDialog):
         self.btn_sell.clicked.connect(lambda: self.execute_manual_trade(mt5.ORDER_TYPE_SELL))
         btn_layout.addWidget(self.btn_sell)
         
-        layout.addLayout(btn_layout)
+        mkt_layout.addLayout(btn_layout)
+        layout.addWidget(mkt_frame)
         
         # --- PENDING EXECUTION ---
+        pend_frame = QFrame()
+        pend_frame.setProperty("class", "Panel")
+        pend_layout = QVBoxLayout(pend_frame)
+        pend_layout.setSpacing(10)
+        
         pend_label = QLabel("Pending Orders")
         pend_label.setAlignment(Qt.AlignCenter)
-        pend_label.setStyleSheet("font-weight: bold; color: #EBCB8B; margin-top: 10px;")
-        layout.addWidget(pend_label)
+        pend_label.setStyleSheet("font-weight: bold; color: #FDD663; margin-top: 10px;")
+        pend_layout.addWidget(pend_label)
         
         pending_layout = QGridLayout()
         pending_layout.setSpacing(8)
@@ -492,7 +575,7 @@ class ManualExecutionDialog(QDialog):
             b = QPushButton(text)
             b.setFixedHeight(30)
             b.setCursor(Qt.PointingHandCursor)
-            b.setStyleSheet("background-color: #3B4252; border: 1px solid #4C566A;")
+            b.setStyleSheet("background-color: #1E1F20; border: 1px solid #444746;")
             b.clicked.connect(slot)
             return b
 
@@ -506,31 +589,9 @@ class ManualExecutionDialog(QDialog):
         pending_layout.addWidget(self.btn_buy_stop, 1, 0)
         pending_layout.addWidget(self.btn_sell_stop, 1, 1)
         
-        layout.addLayout(pending_layout)
+        pend_layout.addLayout(pending_layout)
+        layout.addWidget(pend_frame)
         layout.addStretch()
-        
-        self.load_geometry()
-
-    def load_geometry(self):
-        try:
-            if os.path.exists("manual_ui_state.json"):
-                with open("manual_ui_state.json", "r") as f:
-                    data = json.load(f)
-                    geom = QByteArray.fromBase64(data.get("geometry", "").encode())
-                    self.restoreGeometry(geom)
-        except Exception:
-            pass
-
-    def closeEvent(self, event):
-        data = {
-            "geometry": self.saveGeometry().toBase64().data().decode()
-        }
-        try:
-            with open("manual_ui_state.json", "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
-        super().closeEvent(event)
 
     def copy_current_price(self):
         tick = mt5.symbol_info_tick(CONFIG["trade_symbol"])
@@ -545,34 +606,31 @@ class ManualExecutionDialog(QDialog):
         
         sym_info = mt5.symbol_info(symbol)
         if not sym_info: return
-        point = sym_info.point
-        
-        # Determine Pip Size (Standardize for XAU)
-        pip_size = 10 * point
-        if "XAU" in symbol.upper() or "GOLD" in symbol.upper():
-            pip_size = 0.1
         
         # Determine Entry Price (User input or Current Market)
         entry_price = self.spin_man_price.value()
         if entry_price <= 0:
             entry_price = tick.ask if direction == "long" else tick.bid
             
-        risk_pips = self.spin_risk_pips.value()
         rr = self.spin_rr.value()
         
-        # Calculate distance
-        dist_price = risk_pips * pip_size
+        # Calculate distance from SL
+        sl_price = self.spin_man_sl.value()
+        if sl_price <= 0:
+            ModernToast.show_message(self, "Set SL first to calc TP", style="error")
+            return
+            
+        dist_price = abs(entry_price - sl_price)
         
         if direction == "long":
-            sl = entry_price - dist_price
+            # sl = entry_price - dist_price
             tp = entry_price + (dist_price * rr)
         else:
-            sl = entry_price + dist_price
+            # sl = entry_price + dist_price
             tp = entry_price - (dist_price * rr)
             
-        self.spin_man_sl.setValue(round(sl, sym_info.digits))
         self.spin_man_tp.setValue(round(tp, sym_info.digits))
-        ModernToast.show_message(self, f"{direction.title()} SL/TP Calculated", style="success")
+        ModernToast.show_message(self, f"{direction.title()} TP Calculated", style="success")
 
     def execute_manual_trade(self, order_type):
         vol = self.spin_man_vol.value()
@@ -777,6 +835,104 @@ class PositionModifyDialog(QDialog):
         else:
             ModernToast.show_message(self, f"Error: {res.comment}", style="error")
 
+class CalculatorDialog(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setStyleSheet(GLOBAL_STYLESHEET)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Input Frame
+        input_frame = QFrame()
+        input_frame.setProperty("class", "Panel")
+        input_layout = QVBoxLayout(input_frame)
+        input_layout.setSpacing(15)
+        
+        # Inputs
+        form = QFormLayout()
+        form.setSpacing(10)
+        
+        self.spin_lots = ModernSpinBox(CONFIG["fixed_lot_size"], is_float=True, step=0.01)
+        self.spin_tp = ModernSpinBox(50.0, is_float=True, step=1.0)
+        self.spin_sl = ModernSpinBox(30.0, is_float=True, step=1.0)
+        
+        form.addRow("Lot Size:", self.spin_lots)
+        form.addRow("TP (Pips):", self.spin_tp)
+        form.addRow("SL (Pips):", self.spin_sl)
+        
+        input_layout.addLayout(form)
+        
+        # Calculate Button
+        self.btn_calc = QPushButton("Calculate")
+        self.btn_calc.setProperty("class", "Success")
+        self.btn_calc.setCursor(Qt.PointingHandCursor)
+        self.btn_calc.clicked.connect(self.calculate)
+        input_layout.addWidget(self.btn_calc)
+        layout.addWidget(input_frame)
+        
+        # Results
+        res_frame = QFrame()
+        res_frame.setProperty("class", "Panel")
+        res_layout = QVBoxLayout(res_frame)
+        res_layout.setSpacing(5)
+        
+        self.lbl_profit = QLabel("Potential Profit: $0.00")
+        self.lbl_profit.setStyleSheet("color: #81C995; font-weight: bold; font-size: 11pt;")
+        self.lbl_profit.setAlignment(Qt.AlignCenter)
+        
+        self.lbl_loss = QLabel("Potential Loss: $0.00")
+        self.lbl_loss.setStyleSheet("color: #F28B82; font-weight: bold; font-size: 11pt;")
+        self.lbl_loss.setAlignment(Qt.AlignCenter)
+        
+        res_layout.addWidget(self.lbl_profit)
+        res_layout.addWidget(self.lbl_loss)
+        
+        layout.addWidget(res_frame)
+        layout.addStretch()
+        
+    def calculate(self):
+        symbol = CONFIG["trade_symbol"]
+        info = mt5.symbol_info(symbol)
+        if not info:
+            self.lbl_profit.setText("Error: Symbol info unavailable")
+            self.lbl_loss.setText("")
+            return
+            
+        lots = self.spin_lots.value()
+        tp_pips = self.spin_tp.value()
+        sl_pips = self.spin_sl.value()
+        
+        # Determine Pip Size logic
+        point = info.point
+        pip_size = 10 * point
+        if "XAU" in symbol.upper() or "GOLD" in symbol.upper():
+            pip_size = 0.1
+        elif "JPY" in symbol.upper() and point > 0.001:
+             pip_size = 0.01
+             
+        tick_size = info.trade_tick_size
+        tick_value = info.trade_tick_value
+        
+        if tick_size == 0: 
+            self.lbl_profit.setText("Error: Tick size 0")
+            return
+
+        # Profit = (Distance / TickSize) * TickValue * Volume
+        
+        # TP
+        tp_dist = tp_pips * pip_size
+        tp_val = (tp_dist / tick_size) * tick_value * lots
+        
+        # SL
+        sl_dist = sl_pips * pip_size
+        sl_val = (sl_dist / tick_size) * tick_value * lots
+        
+        self.lbl_profit.setText(f"Potential Profit: ${tp_val:.2f}")
+        self.lbl_loss.setText(f"Potential Loss: -${sl_val:.2f}")
+
 class SignalMiniChart(QWidget):
     def __init__(self, signal_data, parent=None):
         super().__init__(parent)
@@ -794,14 +950,14 @@ class SignalMiniChart(QWidget):
         self.btn_zoom_in = QPushButton("+", self)
         self.btn_zoom_in.setFixedSize(24, 24)
         self.btn_zoom_in.setCursor(Qt.PointingHandCursor)
-        self.btn_zoom_in.setStyleSheet("background-color: rgba(46, 52, 64, 180); color: #D8DEE9; border: 1px solid #4C566A; border-radius: 4px; font-weight: bold;")
+        self.btn_zoom_in.setStyleSheet("background-color: rgba(46, 52, 64, 180); color: #E3E3E3; border: 1px solid #444746; border-radius: 4px; font-weight: bold;")
         self.btn_zoom_in.clicked.connect(self.zoom_in)
         self.btn_zoom_in.show()
 
         self.btn_zoom_out = QPushButton("-", self)
         self.btn_zoom_out.setFixedSize(24, 24)
         self.btn_zoom_out.setCursor(Qt.PointingHandCursor)
-        self.btn_zoom_out.setStyleSheet("background-color: rgba(46, 52, 64, 180); color: #D8DEE9; border: 1px solid #4C566A; border-radius: 4px; font-weight: bold;")
+        self.btn_zoom_out.setStyleSheet("background-color: rgba(46, 52, 64, 180); color: #E3E3E3; border: 1px solid #444746; border-radius: 4px; font-weight: bold;")
         self.btn_zoom_out.clicked.connect(self.zoom_out)
         self.btn_zoom_out.show()
         
@@ -903,10 +1059,10 @@ class SignalMiniChart(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#2E3440"))
+        painter.fillRect(self.rect(), QColor("#131314"))
         
         if len(self.candles) == 0:
-            painter.setPen(QColor("#D8DEE9"))
+            painter.setPen(QColor("#E3E3E3"))
             painter.drawText(self.rect(), Qt.AlignCenter, "No Chart Data Available")
             return
             
@@ -961,7 +1117,7 @@ class SignalMiniChart(QWidget):
                 y_c = to_y(c['close'])
                 
                 is_bull = c['close'] >= c['open']
-                color = QColor("#A3BE8C") if is_bull else QColor("#BF616A")
+                color = QColor("#81C995") if is_bull else QColor("#F28B82")
                 
                 painter.setPen(color)
                 painter.drawLine(int(cx), int(y_h), int(cx), int(y_l))
@@ -984,7 +1140,7 @@ class SignalMiniChart(QWidget):
                     interval_sec = 300
 
                 if c['time'] <= signal_ts < c['time'] + interval_sec:
-                    painter.setBrush(QBrush(QColor("#EBCB8B")))
+                    painter.setBrush(QBrush(QColor("#FDD663")))
                     painter.setPen(Qt.NoPen)
                     arrow_size = 6
                     if "long" in self.signal.get("entryType", "").lower():
@@ -1004,10 +1160,10 @@ class SignalMiniChart(QWidget):
             painter.drawLine(0, int(y), w, int(y))
             painter.drawText(5, int(y) - 2, f"{label} {price:.2f}")
             
-        draw_level(entry, "#ECEFF4", "ENTRY")
-        draw_level(sl, "#BF616A", "SL")
-        draw_level(tp1, "#A3BE8C", "TP1")
-        if tp2 > 0: draw_level(tp2, "#A3BE8C", "TP2")
+        draw_level(entry, "#F1F1F1", "ENTRY")
+        draw_level(sl, "#F28B82", "SL")
+        draw_level(tp1, "#81C995", "TP1")
+        if tp2 > 0: draw_level(tp2, "#81C995", "TP2")
 
 class SignalDetailsDialog(QDialog):
     def __init__(self, signal_data, parent=None):
@@ -1027,9 +1183,9 @@ class SignalDetailsDialog(QDialog):
         dt_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         
         lbl_id = QLabel(f"ID: {signal_data.get('signalId', 'N/A')}")
-        lbl_id.setStyleSheet("color: #88C0D0; font-weight: bold;")
+        lbl_id.setStyleSheet("color: #A8C7FA; font-weight: bold;")
         lbl_time = QLabel(f"Time: {dt_str}")
-        lbl_time.setStyleSheet("color: #D8DEE9;")
+        lbl_time.setStyleSheet("color: #E3E3E3;")
         
         header_layout.addWidget(lbl_id)
         header_layout.addStretch()
@@ -1050,7 +1206,7 @@ class SignalDetailsDialog(QDialog):
         info_layout.setHorizontalSpacing(10)
         
         e_type = signal_data.get("entryType", "").upper()
-        type_color = "#A3BE8C" if "LONG" in e_type else "#BF616A"
+        type_color = "#81C995" if "LONG" in e_type else "#F28B82"
         
         # Row 0: Type, Price, Score
         info_layout.addWidget(QLabel("Type:"), 0, 0)
@@ -1063,30 +1219,30 @@ class SignalDetailsDialog(QDialog):
         
         info_layout.addWidget(QLabel("Score:"), 0, 4)
         lbl_score = QLabel(f"{signal_data.get('convictionScore', 0):.1f}%")
-        lbl_score.setStyleSheet("color: #EBCB8B;")
+        lbl_score.setStyleSheet("color: #FDD663;")
         info_layout.addWidget(lbl_score, 0, 5)
         
         # Row 1: SL, TP1, TP2
         info_layout.addWidget(QLabel("SL:"), 1, 0)
         lbl_sl = QLabel(str(signal_data.get("slPrice", 0.0)))
-        lbl_sl.setStyleSheet("color: #BF616A;")
+        lbl_sl.setStyleSheet("color: #F28B82;")
         info_layout.addWidget(lbl_sl, 1, 1)
         
         info_layout.addWidget(QLabel("TP1:"), 1, 2)
         lbl_tp1 = QLabel(str(signal_data.get("tp1Price", 0.0)))
-        lbl_tp1.setStyleSheet("color: #A3BE8C;")
+        lbl_tp1.setStyleSheet("color: #81C995;")
         info_layout.addWidget(lbl_tp1, 1, 3)
         
         info_layout.addWidget(QLabel("TP2:"), 1, 4)
         lbl_tp2 = QLabel(str(signal_data.get("tp2Price", 0.0)))
-        lbl_tp2.setStyleSheet("color: #A3BE8C;")
+        lbl_tp2.setStyleSheet("color: #81C995;")
         info_layout.addWidget(lbl_tp2, 1, 5)
         
         # Row 2: Reason
         info_layout.addWidget(QLabel("Reason:"), 2, 0)
         lbl_reason = QLabel(str(signal_data.get("reason", "-")))
         lbl_reason.setWordWrap(True)
-        lbl_reason.setStyleSheet("font-size: 9pt; color: #D8DEE9;")
+        lbl_reason.setStyleSheet("font-size: 9pt; color: #E3E3E3;")
         info_layout.addWidget(lbl_reason, 2, 1, 1, 5)
         
         layout.addWidget(info_frame)
@@ -1097,7 +1253,7 @@ class SignalDetailsDialog(QDialog):
             self.btn_toggle_debug = QPushButton("Show Debug Info ▼")
             self.btn_toggle_debug.setCheckable(True)
             self.btn_toggle_debug.setChecked(False)
-            self.btn_toggle_debug.setStyleSheet("text-align: left; font-weight: bold; padding: 4px; background-color: #434C5E;")
+            self.btn_toggle_debug.setStyleSheet("text-align: left; font-weight: bold; padding: 4px; background-color: #2D2E31;")
             layout.addWidget(self.btn_toggle_debug)
 
             self.dbg_frame = QFrame()
@@ -1111,7 +1267,7 @@ class SignalDetailsDialog(QDialog):
                 k_clean = k.replace("_", " ").title()
                 dbg_layout.addWidget(QLabel(f"{k_clean}:"), row, col)
                 val_lbl = QLabel(str(v))
-                val_lbl.setStyleSheet("font-family: Consolas; color: #EBCB8B;")
+                val_lbl.setStyleSheet("font-family: Consolas; color: #FDD663;")
                 dbg_layout.addWidget(val_lbl, row, col + 1)
                 
                 col += 2
@@ -1162,3 +1318,57 @@ class SignalDetailsDialog(QDialog):
             if parent.manual_dialog:
                 parent.manual_dialog.setup_from_signal(self.signal_data)
         self.accept()
+
+class UnifiedSidePanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("UnifiedSidePanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        # Modern card-like background with subtle gradient and soft border
+        self.setStyleSheet("""
+            #UnifiedSidePanel {
+                background-color: #1E1F20;
+                border: 1px solid #444746;
+                border-radius: 8px;
+            }
+            #UnifiedSidePanel QTabWidget::pane {
+                background: transparent;
+                border: none;
+            }
+            #UnifiedSidePanel QTabBar::tab {
+                background: transparent;
+                color: #C4C7C5;
+                padding: 6px 8px;
+                min-width: 60px;
+                margin-right: 2px;
+                border-radius: 6px;
+                border: 1px solid transparent;
+                font-size: 9pt;
+            }
+            #UnifiedSidePanel QTabBar::tab:selected {
+                background: #A8C7FA;
+                color: #000000;
+                font-weight: 700;
+                border: 1px solid rgba(168,199,250,0.12);
+            }
+            #UnifiedSidePanel QTabBar::tab:!selected:hover {
+                background: rgba(67,76,94,0.25);
+                border: 1px solid rgba(67,76,94,0.6);
+            }
+            /* Small card style for inner panels */
+            #UnifiedSidePanel QFrame[class="Panel"] { background-color: #252628; border-radius: 8px; border: 1px solid #5F6368; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self.tabs = QTabWidget()
+
+        self.trade_panel = ManualExecutionDialog()
+        self.calc_panel = CalculatorDialog()
+
+        self.tabs.addTab(self.trade_panel, "Trade")
+        self.tabs.addTab(self.calc_panel, "Calculator")
+
+        layout.addWidget(self.tabs)

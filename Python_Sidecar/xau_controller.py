@@ -18,12 +18,47 @@ except ImportError as e:
     sys.exit(1)
 
 from config import CONFIG, state
-from mt5_interface import execute_trade, manage_positions, init_trade_tracking
+from mt5_interface import execute_trade, manage_positions, init_trade_tracking, close_all_positions
 from gui import DashboardGUI
 
 # =============================================================================
 # WORKER CLASS
 # =============================================================================
+
+def check_session_closures():
+    """Checks if current time matches session end and triggers auto-close."""
+    now = datetime.utcnow()
+    h = now.hour
+    m = now.minute
+    
+    # Session End Hours (UTC)
+    ends = {
+        "syd": 6,
+        "tok": 9,
+        "lon": 17,
+        "ny": 22
+    }
+    
+    # Run logic only in the first minute of the hour
+    if m == 0:
+        for sess, end_h in ends.items():
+            if h == end_h:
+                # Check Scalp
+                key_scalp = f"close_scalp_{sess}_end"
+                last_run_key = f"last_close_{sess}_scalp"
+                if CONFIG.get(key_scalp, False) and time.time() - state.get(last_run_key, 0) > 120:
+                    print(f"[AUTO-CLOSE] Closing Scalp trades for {sess.upper()} session end.")
+                    close_all_positions("scalp")
+                    state[last_run_key] = time.time()
+                
+                # Check Swing
+                key_swing = f"close_swing_{sess}_end"
+                last_run_key = f"last_close_{sess}_swing"
+                if CONFIG.get(key_swing, False) and time.time() - state.get(last_run_key, 0) > 120:
+                    print(f"[AUTO-CLOSE] Closing Swing trades for {sess.upper()} session end.")
+                    close_all_positions("swing")
+                    state[last_run_key] = time.time()
+
 class TradingWorker(QObject):
     finished = Signal()
 
@@ -119,6 +154,46 @@ class TradingWorker(QObject):
                             print(f"[FILTER] Swing signal ignored (Swing Mode OFF)")
                             continue
                         
+                        # Session Filtering
+                        h = datetime.utcnow().hour
+                        
+                        # Define Overlaps
+                        is_overlap_lon_ny = 13 <= h < 17
+                        is_overlap_tok_lon = 8 <= h < 9
+                        
+                        # Define Sessions
+                        is_syd = 21 <= h or h < 6
+                        is_tok = 0 <= h < 9
+                        is_lon = 8 <= h < 17
+                        is_ny = 13 <= h < 22
+                        
+                        session_allowed = False
+                        
+                        def check_session(mode):
+                            # Check Overlaps First (Priority)
+                            if is_overlap_lon_ny:
+                                return CONFIG.get(f"session_{mode}_overlap_lon_ny", True)
+                            if is_overlap_tok_lon:
+                                return CONFIG.get(f"session_{mode}_overlap_tok_lon", True)
+                            
+                            # Check Individual Sessions
+                            if is_syd and CONFIG.get(f"session_{mode}_syd", True): return True
+                            if is_tok and CONFIG.get(f"session_{mode}_tok", True): return True
+                            if is_lon and CONFIG.get(f"session_{mode}_lon", True): return True
+                            if is_ny and CONFIG.get(f"session_{mode}_ny", True): return True
+                            return False
+
+                        if classification == "scalp":
+                            session_allowed = check_session("scalp")
+                        elif "swing" in classification:
+                            session_allowed = check_session("swing")
+                        else:
+                            session_allowed = True # Allow unknown types or manual
+                            
+                        if not session_allowed:
+                            print(f"[FILTER] {classification} signal ignored (Session Disabled)")
+                            continue
+                        
                         if sig_id not in state["processed_ids"] and e_type in ["long", "short"]:
                             state["processed_ids"].add(sig_id)
                             state["last_processed_id"] = sig_id
@@ -126,6 +201,7 @@ class TradingWorker(QObject):
                 
                     # Throttled Management (Max 10 times per second) to prevent freezing
                     if time.time() - state["last_manage_time"] > 0.1:
+                        check_session_closures()
                         manage_positions()
                         state["last_manage_time"] = time.time()
                 

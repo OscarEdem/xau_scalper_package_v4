@@ -5,26 +5,28 @@ import shutil
 import json
 import time
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,  # type: ignore
                                QLabel, QFrame, QMessageBox, QGridLayout, QHeaderView, 
                                QTreeWidget, QTreeWidgetItem, QPushButton, QTabWidget, QSplitter,
-                               QFileDialog, QMenu, QDoubleSpinBox, QAbstractSpinBox, QComboBox, QSizePolicy)
+                               QFileDialog, QMenu, QDoubleSpinBox, QAbstractSpinBox, QComboBox, QSizePolicy,
+                               QScrollArea)
 from PySide6.QtCore import Qt, QThread, Slot, QTimer, QByteArray, Signal, QEvent # type: ignore
-from PySide6.QtGui import QColor, QIcon, QAction, QBrush # type: ignore
+from PySide6.QtGui import QColor, QIcon, QAction, QBrush, QShortcut, QKeySequence, QFontMetrics # type: ignore
 import MetaTrader5 as mt5 # type: ignore
 
 from config import CONFIG, state, save_config
 from gui_styles import GLOBAL_STYLESHEET
 from mt5_interface import execute_trade
-from gui_widgets import SignalIndicator, StatusCircle, SafetyButton, ToggleSwitch, ModernSpinBox
-from gui_dialogs import AdvancedSettingsDialog, ManualExecutionDialog, PositionModifyDialog, SignalDetailsDialog, ModernToast
+from gui_widgets import SignalIndicator, StatusCircle, SafetyButton, ToggleSwitch, ModernSpinBox, ATRGauge, PortfolioStats, StrategyChips, SessionPanel
+from gui_dialogs import AdvancedSettingsDialog, ManualExecutionDialog, PositionModifyDialog, SignalDetailsDialog, ModernToast, CalculatorDialog, UnifiedSidePanel
 from gui_chart import ChartWindow
 from gui_workers import MT5DataWorker, SignalHistoryWorker
 
 class DashboardGUI(QMainWindow):
     stop_worker_signal = Signal()
+    toggle_chart_data_signal = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -42,15 +44,18 @@ class DashboardGUI(QMainWindow):
         self.worker.data_updated.connect(self.update_ui)
         self.worker_thread.started.connect(self.worker.start_working)
         self.stop_worker_signal.connect(self.worker.stop_working)
+        self.toggle_chart_data_signal.connect(self.worker.set_chart_data_enabled)
         
         # UI Components
         self.chart_window = None
         self.manual_dialog = None
+        self.calc_dialog = None
         self.settings_dialog = None
         self.position_items = {}
         self.blink_state = False
         self._is_closing = False
         self._last_history_sig = None
+        self._last_signal_ts = 0
         
         self.load_ui_state()
         self.init_ui()
@@ -68,125 +73,149 @@ class DashboardGUI(QMainWindow):
                 data = json.load(f)
                 geom = QByteArray.fromBase64(data.get("geometry", "").encode())
                 self.restoreGeometry(geom)
+                if data.get("state"):
+                    self.restoreState(QByteArray.fromBase64(data.get("state").encode()))
+                # Restore chart window if it was open
+                if data.get("chart_open", False):
+                    QTimer.singleShot(0, self.open_chart)
         except Exception:
             pass
 
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        
+        root_layout = QVBoxLayout(central)
+        root_layout.setSpacing(0)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        
+        upper_area = QWidget()
+        upper_layout = QHBoxLayout(upper_area)
+        upper_layout.setSpacing(15)
+        upper_layout.setContentsMargins(15, 15, 15, 15)
+        
+        root_layout.addWidget(upper_area)
+        
+        main_content = QWidget()
+        main_layout = QVBoxLayout(main_content)
         main_layout.setSpacing(15)
-        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        upper_layout.addWidget(main_content)
         
         # --- HEADER ---
         header_frame = QFrame()
         header_frame.setProperty("class", "Panel")
+        header_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         header_frame.setStyleSheet("""
-            QFrame.Panel { background-color: #242933; border-radius: 6px; border: 1px solid #434C5E; }
-            QLabel { color: #D8DEE9; }
+            QFrame[class="Panel"] { background-color: #1E1F20; border-radius: 8px; border: 1px solid #444746; }
+            QLabel { color: #E3E3E3; }
         """)
         
         header_layout = QGridLayout(header_frame)
-        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setContentsMargins(10, 2, 10, 2)
         header_layout.setHorizontalSpacing(20)
-        header_layout.setVerticalSpacing(2)
+        header_layout.setVerticalSpacing(0)
         
         # --- SECTION 1: Market Data (Left) ---
-        # Row 0: Symbol & Delta
+        # Row 0: Session Panel (Sidebar Toggle via Ctrl+B)
         h_sec1_r0 = QHBoxLayout()
-        self.lbl_symbol = QLabel(CONFIG["trade_symbol"])
-        self.lbl_symbol.setStyleSheet("font-size: 16pt; font-weight: 900; color: #88C0D0;")
-        self.lbl_symbol.setToolTip("Trading Symbol")
-        self.lbl_delta = QLabel("Δ: --")
-        self.lbl_delta.setStyleSheet("font-size: 9pt; font-weight: bold; color: #D8DEE9; padding-top: 4px;")
-        self.lbl_delta.setToolTip("Price Change")
-        h_sec1_r0.addWidget(self.lbl_symbol)
-        h_sec1_r0.addSpacing(8)
-        h_sec1_r0.addWidget(self.lbl_delta)
+        
+        self.shortcut_sidebar = QShortcut(QKeySequence("Ctrl+B"), self)
+        self.shortcut_sidebar.activated.connect(self.toggle_sidebar)
+        
+        self.session_panel = SessionPanel()
+        h_sec1_r0.addWidget(self.session_panel)
         h_sec1_r0.addStretch()
         header_layout.addLayout(h_sec1_r0, 0, 0)
+        
+        # Row 1: Symbol & Delta
+        h_sec1_r1 = QHBoxLayout()
+        self.lbl_symbol = QLabel(CONFIG["trade_symbol"])
+        self.lbl_symbol.setStyleSheet("font-size: 16pt; font-weight: 900; color: #A8C7FA;")
+        self.lbl_symbol.setToolTip("Trading Symbol")
+        self.lbl_delta = QLabel("Δ: --")
+        self.lbl_delta.setStyleSheet("font-size: 9pt; font-weight: bold; color: #E3E3E3; padding-top: 4px;")
+        self.lbl_delta.setToolTip("Price Change")
+        h_sec1_r1.addWidget(self.lbl_symbol)
+        h_sec1_r1.addSpacing(8)
+        h_sec1_r1.addWidget(self.lbl_delta)
+        h_sec1_r1.addStretch()
+        header_layout.addLayout(h_sec1_r1, 1, 0)
 
-        # Row 1: Mid Price
+        # Row 2: Mid Price
         self.lbl_mid = QLabel("--")
-        self.lbl_mid.setStyleSheet("font-size: 22pt; font-weight: bold; color: #ECEFF4; font-family: Consolas;")
+        self.lbl_mid.setStyleSheet("font-size: 22pt; font-weight: bold; color: #F1F1F1; font-family: Consolas;")
         self.lbl_mid.setToolTip("Current Mid Price")
-        header_layout.addWidget(self.lbl_mid, 1, 0)
+        header_layout.addWidget(self.lbl_mid, 2, 0)
 
-        # Row 2: Bid/Ask & Spread
-        h_sec1_r2 = QHBoxLayout()
+        # Row 3: Bid/Ask & Spread
+        h_sec1_r3 = QHBoxLayout()
         self.lbl_bidask = QLabel("B:-- / A:--")
-        self.lbl_bidask.setStyleSheet("font-size: 9pt; color: #A3BE8C; font-family: Consolas;")
+        self.lbl_bidask.setStyleSheet("font-size: 9pt; color: #81C995; font-family: Consolas;")
         self.lbl_bidask.setToolTip("Bid / Ask Prices")
         self.lbl_spread = QLabel("Spr: --")
-        self.lbl_spread.setStyleSheet("font-size: 9pt; color: #D08770; font-weight: 600; margin-left: 8px;")
+        self.lbl_spread.setStyleSheet("font-size: 9pt; color: #F28B82; font-weight: 600; margin-left: 8px;")
         self.lbl_spread.setToolTip("Current Spread")
-        h_sec1_r2.addWidget(self.lbl_bidask)
-        h_sec1_r2.addWidget(self.lbl_spread)
-        h_sec1_r2.addStretch()
-        header_layout.addLayout(h_sec1_r2, 2, 0)
+        h_sec1_r3.addWidget(self.lbl_bidask)
+        h_sec1_r3.addWidget(self.lbl_spread)
+        h_sec1_r3.addStretch()
+        header_layout.addLayout(h_sec1_r3, 3, 0)
         
         # --- SECTION 2: P/L & Account (Center) ---
         v_sec2 = QVBoxLayout()
-        v_sec2.setSpacing(0)
+        v_sec2.setSpacing(2)
         v_sec2.setAlignment(Qt.AlignCenter)
         
         self.lbl_open_pl = QLabel("$0.00")
         self.lbl_open_pl.setAlignment(Qt.AlignCenter)
-        self.lbl_open_pl.setStyleSheet("font-size: 28pt; font-weight: bold; color: #ECEFF4;")
+        self.lbl_open_pl.setStyleSheet("font-size: 28pt; font-weight: bold; color: #F1F1F1;")
         self.lbl_open_pl.setToolTip("Total Floating P/L")
         self.lbl_account = QLabel("Balance: $0.00 | Equity: $0.00")
         self.lbl_account.setAlignment(Qt.AlignCenter)
-        self.lbl_account.setStyleSheet("font-size: 9pt; color: #EBCB8B; font-weight: 600;")
+        self.lbl_account.setStyleSheet("font-size: 9pt; color: #FDD663; font-weight: 600;")
         self.lbl_account.setToolTip("Account Balance | Equity")
+        
+        self.portfolio_stats = PortfolioStats()
         
         v_sec2.addWidget(self.lbl_open_pl)
         v_sec2.addWidget(self.lbl_account)
-        header_layout.addLayout(v_sec2, 0, 1, 3, 1)
+        v_sec2.addWidget(self.portfolio_stats)
+        header_layout.addLayout(v_sec2, 0, 1, 4, 1)
         
         # --- SECTION 3: Stats & Controls (Right) ---
         # Row 0: ATR & Status
         h_sec3_r0 = QHBoxLayout()
-        self.lbl_atr = QLabel("ATR: --")
-        self.lbl_atr.setStyleSheet("font-weight: 600; font-size: 9pt;")
-        self.lbl_atr.setToolTip("Average True Range")
-        self.atr_indicator = StatusCircle(size=8, color="#4C566A")
-        self.atr_indicator.setToolTip("Volatility Status")
-        h_sec3_r0.addWidget(self.lbl_atr)
-        h_sec3_r0.addSpacing(5)
-        h_sec3_r0.addWidget(self.atr_indicator)
         h_sec3_r0.addStretch()
+        self.atr_gauge = ATRGauge()
+        self.atr_gauge.setToolTip("ATR Volatility Meter")
+        h_sec3_r0.addWidget(self.atr_gauge)
         header_layout.addLayout(h_sec3_r0, 0, 2)
 
-        # Row 1: Exposure
-        self.lbl_portfolio_snapshot = QLabel("Exp: -- | Mrg: --")
-        self.lbl_portfolio_snapshot.setStyleSheet("font-size: 9pt; color: #D8DEE9; font-family: Consolas;")
-        self.lbl_portfolio_snapshot.setToolTip("Net Exposure | Margin Used")
-        header_layout.addWidget(self.lbl_portfolio_snapshot, 1, 2)
-
-        # Row 2: Mode & Buttons
-        h_sec3_r2 = QHBoxLayout()
-        self.lbl_strategy_state = QLabel(self._format_strategy_state())
-        self.lbl_strategy_state.setStyleSheet("font-size: 9pt; color: #88C0D0; font-family: Consolas;")
-        self.lbl_strategy_state.setToolTip("Active Strategy Modes")
-        h_sec3_r2.addWidget(self.lbl_strategy_state)
-        h_sec3_r2.addStretch()
+        # Row 3: Mode & Buttons
+        h_sec3_r3 = QHBoxLayout()
+        self.strategy_chips = StrategyChips()
+        self.strategy_chips.setToolTip("Active Strategy Modes")
+        h_sec3_r3.addWidget(self.strategy_chips)
+        h_sec3_r3.addStretch()
         
         self.btn_chart = QPushButton("📈")
         self.btn_chart.setFixedSize(32, 32)
-        self.btn_chart.setStyleSheet("QPushButton { font-size: 16px; background-color: #4C566A; border-radius: 4px; } QPushButton:hover { background-color: #5E81AC; }")
+        self.btn_chart.setStyleSheet("QPushButton { font-size: 16px; background-color: #2D2E31; border-radius: 6px; border: 1px solid #444746; } QPushButton:hover { background-color: #444746; }")
         self.btn_chart.setToolTip("Open Chart Window")
         self.btn_chart.clicked.connect(self.open_chart)
 
         self.btn_settings = QPushButton("⚙")
         self.btn_settings.setFixedSize(32, 32)
-        self.btn_settings.setStyleSheet("QPushButton { font-size: 16px; background-color: #4C566A; border-radius: 4px; } QPushButton:hover { background-color: #5E81AC; }")
+        self.btn_settings.setStyleSheet("QPushButton { font-size: 16px; background-color: #2D2E31; border-radius: 6px; border: 1px solid #444746; } QPushButton:hover { background-color: #444746; }")
         self.btn_settings.setToolTip("Open Configuration Settings")
         self.btn_settings.clicked.connect(self.open_settings)
         
-        h_sec3_r2.addWidget(self.btn_chart)
-        h_sec3_r2.addSpacing(10)
-        h_sec3_r2.addWidget(self.btn_settings)
-        header_layout.addLayout(h_sec3_r2, 2, 2)
+        h_sec3_r3.addSpacing(10)
+        h_sec3_r3.addWidget(self.btn_chart)
+        h_sec3_r3.addSpacing(10)
+        h_sec3_r3.addWidget(self.btn_settings)
+        header_layout.addLayout(h_sec3_r3, 3, 2)
         
         # Column Stretches
         header_layout.setColumnStretch(0, 2)
@@ -201,45 +230,34 @@ class DashboardGUI(QMainWindow):
         splitter.setChildrenCollapsible(False)
         
         # Left Sidebar (Controls)
-        sidebar = QFrame()
-        sidebar.setProperty("class", "Panel")
-        sidebar_layout = QVBoxLayout(sidebar)
+        self.sidebar = QFrame()
+        self.sidebar.setProperty("class", "Panel")
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setSpacing(0)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        
         sidebar_layout.setSpacing(6)
         sidebar_layout.setContentsMargins(6, 6, 6, 6)
         
-        lbl_controls = QLabel("Control Panel")
-        lbl_controls.setProperty("class", "Header")
-        lbl_controls.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(lbl_controls)
-        
-        # Action Buttons
-        btn_manual = QPushButton("Open Trade Panel")
-        btn_manual.setFixedHeight(32)
-        btn_manual.setToolTip("Open Manual Trading Panel")
-        btn_manual.clicked.connect(self.open_manual)
-        sidebar_layout.addWidget(btn_manual)
-        
-        # Divider
-        line1 = QFrame()
-        line1.setFrameShape(QFrame.HLine)
-        line1.setFrameShadow(QFrame.Sunken)
-        line1.setStyleSheet("background-color: #434C5E;")
-        sidebar_layout.addWidget(line1)
 
         lbl_strat = QLabel("Strategy Toggles")
         lbl_strat.setProperty("class", "SubHeader")
         lbl_strat.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(lbl_strat)
+        # moved into the right-side Controls tab
         
         # Toggles
         toggles_frame = QFrame()
+        toggles_frame.setProperty("class", "Panel")
+        toggles_frame.setStyleSheet("background-color: #252628; border-radius: 8px; border: 1px solid #5F6368;")
         toggles_layout = QGridLayout(toggles_frame)
-        sidebar.setMinimumWidth(190)
-        sidebar.setMaximumWidth(300)
-        sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        toggles_layout.setVerticalSpacing(4)
-        toggles_layout.setHorizontalSpacing(4)
-        toggles_layout.setContentsMargins(0, 2, 0, 2)
+        self.sidebar.setMinimumWidth(190)
+        self.sidebar.setMaximumWidth(300)
+        self.sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        toggles_layout.setVerticalSpacing(6)
+        toggles_layout.setHorizontalSpacing(6)
+        toggles_layout.setContentsMargins(6, 6, 6, 6)
+        toggles_layout.setColumnStretch(0, 1)
+        toggles_layout.setColumnStretch(1, 1)
         
         self.create_toggle(toggles_layout, "Scalp", "scalp_mode", 0, 0, "Enable Scalping Strategy")
         self.create_toggle(toggles_layout, "Swing", "swing_mode", 0, 1, "Enable Swing Strategy")
@@ -247,30 +265,27 @@ class DashboardGUI(QMainWindow):
         self.create_toggle(toggles_layout, "Tr. Swing", "use_trailing_swing", 1, 1, "Enable Trailing Stop for Swing Trades")
         self.create_toggle(toggles_layout, "Force Mkt", "force_market", 2, 0, "Force Market Execution (Disable Limit Orders)")
         self.create_toggle(toggles_layout, "Man. Mgmt", "manage_manual", 2, 1)
-        
-        sidebar_layout.addWidget(toggles_frame)
-        
-        # Divider
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.HLine)
-        line2.setFrameShadow(QFrame.Sunken)
-        line2.setStyleSheet("background-color: #434C5E;")
-        sidebar_layout.addWidget(line2)
 
         lbl_stats = QLabel("Active Positions")
         lbl_stats.setProperty("class", "SubHeader")
         lbl_stats.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(lbl_stats)
+        # moved into the right-side Controls tab
 
         # Counts
         counts_frame = QFrame()
+        counts_frame.setProperty("class", "Panel")
+        counts_frame.setStyleSheet("background-color: #252628; border-radius: 8px; border: 1px solid #5F6368;")
         counts_layout = QGridLayout(counts_frame)
-        counts_layout.setSpacing(4)
-        counts_layout.setContentsMargins(0, 2, 0, 2)
+        counts_layout.setSpacing(6)
+        counts_layout.setContentsMargins(6, 6, 6, 6)
         
         self.lbl_scalp_count = QLabel("Scalp: 0")
         self.lbl_swing_count = QLabel("Swing: 0")
         self.lbl_manual_count = QLabel("Manual: 0")
+        # use compact font for counts to reduce horizontal width
+        self.lbl_scalp_count.setStyleSheet("font-size:9pt;")
+        self.lbl_swing_count.setStyleSheet("font-size:9pt;")
+        self.lbl_manual_count.setStyleSheet("font-size:9pt;")
         self.lbl_scalp_count.setToolTip("Active Scalp Positions")
         self.lbl_swing_count.setToolTip("Active Swing Positions")
         self.lbl_manual_count.setToolTip("Active Manual Positions")
@@ -278,26 +293,18 @@ class DashboardGUI(QMainWindow):
         counts_layout.addWidget(self.lbl_scalp_count, 0, 0)
         counts_layout.addWidget(self.lbl_swing_count, 0, 1)
         counts_layout.addWidget(self.lbl_manual_count, 1, 0, 1, 2, Qt.AlignLeft)
-        
-        sidebar_layout.addWidget(counts_frame)
-        
-        # Divider
-        line3 = QFrame()
-        line3.setFrameShape(QFrame.HLine)
-        line3.setFrameShadow(QFrame.Sunken)
-        line3.setStyleSheet("background-color: #434C5E;")
-        sidebar_layout.addWidget(line3)
 
         lbl_mgmt = QLabel("Trade Management")
         lbl_mgmt.setProperty("class", "SubHeader")
         lbl_mgmt.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(lbl_mgmt)
+        # moved into the right-side Controls tab
 
         # Controls Frame (Moved from Open Tab)
         controls_frame = QFrame()
         controls_frame.setProperty("class", "Panel")
+        controls_frame.setStyleSheet("background-color: #252628; border-radius: 8px; border: 1px solid #5F6368;")
         controls_layout = QGridLayout(controls_frame)
-        controls_layout.setContentsMargins(4, 4, 4, 4)
+        controls_layout.setContentsMargins(6, 6, 6, 6)
         controls_layout.setSpacing(6)
 
         self.spin_update_sl = QDoubleSpinBox()
@@ -305,12 +312,12 @@ class DashboardGUI(QMainWindow):
         self.spin_update_sl.setRange(0, 99999)
         self.spin_update_sl.setPrefix("SL: ")
         self.spin_update_sl.setValue(0)
-        self.spin_update_sl.setFixedHeight(26)
+        self.spin_update_sl.setFixedHeight(32)
         self.spin_update_sl.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.spin_update_sl.setToolTip("New Stop Loss Price")
         
         self.btn_copy_sl = QPushButton("📍")
-        self.btn_copy_sl.setFixedSize(26, 26)
+        self.btn_copy_sl.setFixedSize(32, 32)
         self.btn_copy_sl.setToolTip("Copy Current Bid Price")
         self.btn_copy_sl.clicked.connect(lambda: self.copy_price_to_field(self.spin_update_sl))
         
@@ -326,12 +333,12 @@ class DashboardGUI(QMainWindow):
         self.spin_update_tp.setRange(0, 99999)
         self.spin_update_tp.setPrefix("TP: ")
         self.spin_update_tp.setValue(0)
-        self.spin_update_tp.setFixedHeight(26)
+        self.spin_update_tp.setFixedHeight(32)
         self.spin_update_tp.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.spin_update_tp.setToolTip("New Take Profit Price")
         
         self.btn_copy_tp = QPushButton("📍")
-        self.btn_copy_tp.setFixedSize(26, 26)
+        self.btn_copy_tp.setFixedSize(32, 32)
         self.btn_copy_tp.setToolTip("Copy Current Bid Price")
         self.btn_copy_tp.clicked.connect(lambda: self.copy_price_to_field(self.spin_update_tp))
         
@@ -343,12 +350,12 @@ class DashboardGUI(QMainWindow):
         tp_layout.addWidget(self.btn_copy_tp)
         
         self.btn_update_selected = QPushButton("Update Selected")
-        self.btn_update_selected.setFixedHeight(29)
+        self.btn_update_selected.setFixedHeight(34)
         self.btn_update_selected.setToolTip("Apply SL/TP to Selected Trade")
         self.btn_update_selected.clicked.connect(self.update_selected_sltp)
         
         self.btn_update_manual = QPushButton("Update Manual")
-        self.btn_update_manual.setFixedHeight(29)
+        self.btn_update_manual.setFixedHeight(34)
         self.btn_update_manual.setToolTip("Apply SL/TP to All Manual Trades")
         self.btn_update_manual.clicked.connect(self.update_manual_sltp)
         
@@ -359,30 +366,21 @@ class DashboardGUI(QMainWindow):
         
         # Bulk Actions
         self.close_combo = QComboBox()
-        self.close_combo.addItems(["Close All Scalp", "Close All Swing", "Close All Manual", "Close Scalp Winners", "Close Scalp Losers"])
-        self.close_combo.setFixedHeight(26)
+        self.close_combo.addItems(["Close All Scalp", "Close All Swing", "Close All Manual", "Close Scalp Winners", "Close Scalp Losers", "Close ALL Positions"])
+        self.close_combo.setFixedHeight(32)
         self.close_combo.setToolTip("Select Bulk Action")
         
         self.exec_btn = SafetyButton("HOLD TO EXECUTE")
-        self.exec_btn.setFixedHeight(26)
+        self.exec_btn.setFixedHeight(32)
         self.exec_btn.setToolTip("Hold to Execute Selected Action")
         self.exec_btn.triggered.connect(self.execute_close_action)
         
         controls_layout.addWidget(self.close_combo, 2, 0, 1, 2)
         controls_layout.addWidget(self.exec_btn, 3, 0, 1, 2)
-        
-        sidebar_layout.addWidget(controls_frame)
 
-        sidebar_layout.addStretch()
-        
-        # Panic Button
-        self.btn_panic = SafetyButton("CLOSE ALL")
-        self.btn_panic.setFixedHeight(32)
-        self.btn_panic.setToolTip("Close ALL Open Positions Immediately")
-        self.btn_panic.triggered.connect(self.panic_close)
-        sidebar_layout.addWidget(self.btn_panic)
-        
-        splitter.addWidget(sidebar)
+        # controls_frame and panic button will be moved into the right-side
+        # unified panel as a separate tab (see below) so they are not added
+        # to the left sidebar here.
         
         # Right Content (Tabs)
         self.tabs = QTabWidget()
@@ -437,7 +435,7 @@ class DashboardGUI(QMainWindow):
         
         self.lbl_tab_open_pl = QLabel("Total P/L: $0.00")
         self.lbl_tab_open_pl.setAlignment(Qt.AlignRight)
-        self.lbl_tab_open_pl.setStyleSheet("font-weight: bold; font-size: 10pt; color: #D8DEE9; margin-top: 5px; margin-bottom: 5px;")
+        self.lbl_tab_open_pl.setStyleSheet("font-weight: bold; font-size: 10pt; color: #E3E3E3; margin-top: 5px; margin-bottom: 5px;")
         self.lbl_tab_open_pl.setToolTip("Total P/L of Listed Positions")
         pos_layout.addWidget(self.lbl_tab_open_pl)
         
@@ -561,13 +559,14 @@ class DashboardGUI(QMainWindow):
         self.tabs.addTab(self.sig_tab, "Signals")
         
         splitter.addWidget(self.tabs)
+        
         splitter.setStretchFactor(1, 1)
         main_layout.addWidget(splitter)
         
         # Footer
         footer_frame = QFrame()
         footer_frame.setFixedHeight(18)
-        footer_frame.setStyleSheet("background-color: #2E3440; border-top: 1px solid #434C5E; border-radius: 0px;")
+        footer_frame.setStyleSheet("background-color: #131314; border-top: 1px solid #444746; border-radius: 0px;")
         footer_layout = QHBoxLayout(footer_frame)
         footer_layout.setContentsMargins(4, 0, 4, 0)
         
@@ -575,13 +574,13 @@ class DashboardGUI(QMainWindow):
         self.signal_indicator.setFixedSize(8, 8)
         self.signal_indicator.setToolTip("Signal Activity Indicator")
         self.status_label = QLabel("Connecting...")
-        self.status_label.setStyleSheet("color: #D8DEE9; font-size: 7pt; font-weight: bold; padding: 0px;")
+        self.status_label.setStyleSheet("color: #E3E3E3; font-size: 7pt; font-weight: bold; padding: 0px;")
         self.status_label.setToolTip("Connection Status")
         
-        self.ping_indicator = StatusCircle(size=6, color="#4C566A")
+        self.ping_indicator = StatusCircle(size=6, color="#444746")
         self.ping_indicator.setToolTip("Latency Indicator")
         self.lbl_latency = QLabel("Ping: -- ms")
-        self.lbl_latency.setStyleSheet("color: #D8DEE9; font-size: 6pt;")
+        self.lbl_latency.setStyleSheet("color: #E3E3E3; font-size: 6pt;")
         self.lbl_latency.setToolTip("Server Latency (ms)")
         
         footer_layout.addWidget(self.signal_indicator)
@@ -591,7 +590,51 @@ class DashboardGUI(QMainWindow):
         footer_layout.addWidget(self.lbl_latency)
         footer_layout.addStretch()
         
-        main_layout.addWidget(footer_frame)
+        # --- Right Sidebar (Unified Panel) ---
+        self.side_panel = UnifiedSidePanel()
+        # make sidebar a compact column that expands vertically
+        self.side_panel.setFixedWidth(360)
+        self.side_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        upper_layout.addWidget(self.side_panel)
+        
+        root_layout.addWidget(footer_frame)
+
+        # Move the existing controls_frame and panic button into a new
+        # 'Controls' tab on the right unified panel so the control panel
+        # feels integrated with the rest of the right-side tools.
+        try:
+            controls_tab = QWidget()
+            ct_layout = QVBoxLayout(controls_tab)
+            ct_layout.setContentsMargins(6, 6, 6, 6)
+            ct_layout.setSpacing(6)
+            # attach previously-created control widgets into the tab
+            ct_layout.addWidget(lbl_strat)
+            ct_layout.addWidget(toggles_frame)
+            ct_layout.addWidget(lbl_stats)
+            ct_layout.addWidget(counts_frame)
+            # now add the trade management controls and panic button
+            ct_layout.addWidget(lbl_mgmt)
+            ct_layout.addWidget(controls_frame)
+            ct_layout.addStretch()
+            # Wrap controls in a scroll area to avoid horizontal scrolling
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setStyleSheet("background: transparent; border: none;")
+            controls_tab.setStyleSheet("background: transparent;")
+            scroll.setWidget(controls_tab)
+            # Insert Controls as first tab
+            self.side_panel.tabs.insertTab(0, scroll, "Controls")
+            self.side_panel.tabs.setCurrentIndex(0)
+        except Exception:
+            # If something goes wrong keep running without crash
+            pass
+        
+        # Aliases for compatibility
+        self.manual_dialog = self.side_panel.trade_panel
+        self.calc_dialog = self.side_panel.calc_panel
+        
 
     def init_signals_tab(self):
         layout = QVBoxLayout(self.sig_tab)
@@ -646,13 +689,19 @@ class DashboardGUI(QMainWindow):
         # Initial Load
         QTimer.singleShot(2000, lambda: self.load_signals(1))
 
+    def toggle_sidebar(self):
+        self.sidebar.setVisible(not self.sidebar.isVisible())
+
     def create_toggle(self, layout, label, key, row, col, tooltip=None):
         container = QWidget()
         h_layout = QHBoxLayout(container)
         h_layout.setContentsMargins(0,0,0,0)
         
         lbl = QLabel(label)
+        lbl.setStyleSheet("font-size:9pt;")
+        lbl.setMaximumWidth(110)
         cb = ToggleSwitch()
+        cb.setFixedWidth(44)
         cb.setChecked(CONFIG[key])
         def on_toggle(s, k=key):
             CONFIG[k] = bool(s)
@@ -695,33 +744,40 @@ class DashboardGUI(QMainWindow):
         connected = data.get("connected", False)
         trade_allowed = data.get("trade_allowed", False)
         
+        # Elide text to prevent layout expansion
+        fm = QFontMetrics(self.status_label.font())
+        elided_txt = fm.elidedText(txt, Qt.ElideRight, 400)
+        self.status_label.setToolTip(txt)
+        
         base_style = "font-size: 7pt; font-weight: bold; padding: 0px; border-radius: 3px;"
         if connected and not trade_allowed:
             self.status_label.setText("⚠️ AutoTrading OFF")
-            self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
+            self.status_label.setStyleSheet(f"color: #FDD663; background-color: #1E1F20; {base_style}")
         else:
-            self.status_label.setText(txt)
-            if "Connected" in txt: self.status_label.setStyleSheet(f"color: #A3BE8C; background-color: #3B4252; {base_style}")
-            elif any(x in txt for x in ["Error", "Disconnected", "Failed"]): self.status_label.setStyleSheet(f"color: #BF616A; background-color: #3B4252; {base_style}")
-            else: self.status_label.setStyleSheet(f"color: #EBCB8B; background-color: #3B4252; {base_style}")
+            self.status_label.setText(elided_txt)
+            if "Connected" in txt: self.status_label.setStyleSheet(f"color: #81C995; background-color: #1E1F20; {base_style}")
+            elif any(x in txt for x in ["Error", "Disconnected", "Failed"]): self.status_label.setStyleSheet(f"color: #F28B82; background-color: #1E1F20; {base_style}")
+            else: self.status_label.setStyleSheet(f"color: #FDD663; background-color: #1E1F20; {base_style}")
 
         # ATR
         atr = data.get("server_atr", 0.0)
-        self.lbl_atr.setText(f"ATR: {atr:.2f}")
-        threshold = CONFIG.get("atr_high_vol_threshold", 1.0)
-        if atr > (threshold * 2.0):
-            self.atr_indicator.set_color("#BF616A" if self.blink_state else "#EBCB8B")
-        elif atr > threshold:
-            self.atr_indicator.set_color("#BF616A")
-        else:
-            self.atr_indicator.set_color("#A3BE8C")
+        base_threshold = CONFIG.get("atr_high_vol_threshold", 2.0)
+        tf = CONFIG.get("atr_timeframe", "M5")
+        
+        # Scale threshold based on timeframe to keep gauge meaningful
+        tf_mult = {
+            "M1": 0.4, "M5": 1.0, "M15": 1.6, "M30": 3.0,
+            "H1": 5.0, "H4": 12.0, "D1": 20.0
+        }.get(tf, 1.0)
+        
+        self.atr_gauge.set_value(atr, base_threshold * tf_mult, tf)
 
         # Ping
         ping_ms = data.get("ping", 0)
         self.lbl_latency.setText(f"Ping: {ping_ms} ms")
-        if ping_ms < 100: self.lbl_latency.setStyleSheet("color: #A3BE8C; font-size: 9pt;")
-        elif ping_ms < 300: self.lbl_latency.setStyleSheet("color: #EBCB8B; font-size: 9pt;")
-        else: self.lbl_latency.setStyleSheet("color: #BF616A; font-size: 9pt;")
+        if ping_ms < 100: self.lbl_latency.setStyleSheet("color: #81C995; font-size: 9pt;")
+        elif ping_ms < 300: self.lbl_latency.setStyleSheet("color: #FDD663; font-size: 9pt;")
+        else: self.lbl_latency.setStyleSheet("color: #F28B82; font-size: 9pt;")
 
         # Counts
         counts = data.get("counts", {"scalp": 0, "swing": 0, "manual": 0})
@@ -731,22 +787,30 @@ class DashboardGUI(QMainWindow):
         self.lbl_manual_count.setText(f"Manual: {mn}")
         
         base_style = "font-family: Consolas; font-size: 10pt; font-weight: bold;"
-        dim_style = "color: #4C566A; font-family: Consolas; font-size: 10pt;"
+        dim_style = "color: #444746; font-family: Consolas; font-size: 10pt;"
         
-        self.lbl_scalp_count.setStyleSheet(f"color: {'#A3BE8C' if self.blink_state else '#B5D19E'}; {base_style}" if sc > 0 else dim_style)
-        self.lbl_swing_count.setStyleSheet(f"color: {'#88C0D0' if self.blink_state else '#81A1C1'}; {base_style}" if sw > 0 else dim_style)
-        self.lbl_manual_count.setStyleSheet(f"color: {'#EBCB8B' if self.blink_state else '#D08770'}; {base_style}" if mn > 0 else dim_style)
+        self.lbl_scalp_count.setStyleSheet(f"color: {'#81C995' if self.blink_state else '#66BB6A'}; {base_style}" if sc > 0 else dim_style)
+        self.lbl_swing_count.setStyleSheet(f"color: {'#A8C7FA' if self.blink_state else '#669DF6'}; {base_style}" if sw > 0 else dim_style)
+        self.lbl_manual_count.setStyleSheet(f"color: {'#FDD663' if self.blink_state else '#F28B82'}; {base_style}" if mn > 0 else dim_style)
         
         # Open P/L (Header)
         open_pl = data.get("open_pl", 0.0)
-        color_hex = "#A3BE8C" if open_pl >= 0 else "#BF616A"
+        color_hex = "#81C995" if open_pl >= 0 else "#F28B82"
         self.lbl_open_pl.setText(f"${open_pl:.2f}")
         self.lbl_open_pl.setStyleSheet(f"font-size: 28pt; font-weight: bold; color: {color_hex}; font-family: 'Segoe UI', sans-serif;")
 
         # Account Info
         balance = data.get("balance", 0.0)
         equity = data.get("equity", 0.0)
+        
+        margin_mode = data.get("margin_mode", -1)
+        mode_str = "Unknown"
+        if margin_mode == mt5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: mode_str = "Hedging"
+        elif margin_mode == mt5.ACCOUNT_MARGIN_MODE_RETAIL_NETTING: mode_str = "Netting"
+        elif margin_mode == mt5.ACCOUNT_MARGIN_MODE_EXCHANGE: mode_str = "Exchange"
+        
         self.lbl_account.setText(f"Balance: ${balance:.2f} | Equity: ${equity:.2f}")
+        self.lbl_account.setToolTip(f"Account Balance | Equity\nAccount Mode: {mode_str}")
 
         # Update live price & quote details if available
         bid = data.get("bid")
@@ -755,24 +819,17 @@ class DashboardGUI(QMainWindow):
             mid = (bid + ask) / 2.0
             self.lbl_mid.setText(f"{mid:.3f}")
             
-            last = getattr(self, "_last_mid", None)
-            arrow = ""
-            color = "#A3BE8C"
-            
-            if last is not None:
-                delta = mid - last
-                pct = (delta / last * 100.0) if last != 0 else 0.0
+            # Daily Change Calculation
+            daily_open = data.get("daily_open", 0.0)
+            if daily_open > 0:
+                delta = mid - daily_open
+                pct = (delta / daily_open) * 100.0
                 sign = "+" if delta >= 0 else ""
-                
-                if delta > 0:
-                    arrow = "↑"
-                    color = "#A3BE8C"
-                elif delta < 0:
-                    arrow = "↓"
-                    color = "#BF616A"
-                
-                self.lbl_delta.setText(f"Δ: {sign}{delta:.3f} ({sign}{pct:.2f}%)")
-                self.lbl_delta.setStyleSheet("font-size: 9pt; font-family: Consolas; color: %s;" % ("#A3BE8C" if delta>=0 else "#BF616A"))
+                color = "#81C995" if delta >= 0 else "#F28B82"
+                self.lbl_delta.setText(f"Δ: {sign}{delta:.2f} ({sign}{pct:.2f}%)")
+                self.lbl_delta.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {color}; padding-top: 4px;")
+            else:
+                self.lbl_delta.setText("Δ: --")
             
             self.lbl_bidask.setText(f"B:{bid:.3f} / A:{ask:.3f}")
             self.lbl_bidask.setStyleSheet(f"font-size: 9pt; color: {color}; font-family: Consolas;")
@@ -782,19 +839,23 @@ class DashboardGUI(QMainWindow):
                 self.lbl_spread.setText(f"Spread: {spread:.3f}")
             except Exception:
                 self.lbl_spread.setText("Spread: --")
-
-            self._last_mid = mid
+        
+        self.update_session_display()
 
         # Portfolio snapshot if provided
         net_exposure = data.get("net_exposure")
         margin_used = data.get("margin_used")
         if net_exposure is not None or margin_used is not None:
-            ne = f"{net_exposure:.2f}" if net_exposure is not None else "--"
-            mu = f"{margin_used:.2f}" if margin_used is not None else "--"
-            self.lbl_portfolio_snapshot.setText(f"Exp: {ne} | Margin: {mu}")
+            ne = net_exposure if net_exposure is not None else 0.0
+            mu = margin_used if margin_used is not None else 0.0
+            self.portfolio_stats.update_data(ne, mu, equity)
 
         # Strategy state
-        self.lbl_strategy_state.setText(self._format_strategy_state())
+        modes = []
+        if CONFIG.get("scalp_mode"): modes.append("Scalp")
+        if CONFIG.get("swing_mode"): modes.append("Swing")
+        if CONFIG.get("manage_manual"): modes.append("Manual")
+        self.strategy_chips.set_modes(modes)
 
         # 2. Logs
         log_updates = data.get("log_updates", [])
@@ -810,11 +871,11 @@ class DashboardGUI(QMainWindow):
                 # Color coding
                 ltype = log.get("type", "")
                 if "Error" in ltype or "Fail" in ltype:
-                    item.setForeground(2, QColor("#BF616A"))
+                    item.setForeground(2, QColor("#F28B82"))
                 elif "Open" in ltype or "Exec" in ltype:
-                    item.setForeground(2, QColor("#A3BE8C"))
+                    item.setForeground(2, QColor("#81C995"))
                 elif "Signal" in ltype:
-                    item.setForeground(2, QColor("#EBCB8B"))
+                    item.setForeground(2, QColor("#FDD663"))
                     
                 self.tree_logs.insertTopLevelItem(0, item)
             
@@ -875,15 +936,20 @@ class DashboardGUI(QMainWindow):
             item.setText(6, f"{p['tp']:.2f}")
             item.setText(7, f"{p['profit']:.2f}")
             
-            color = QColor("#A3BE8C") if p["profit"] >= 0 else QColor("#BF616A")
-            item.setForeground(7, QBrush(color))
+            if p.get("is_pending", False):
+                item.setText(7, "-")
+                item.setForeground(7, QBrush(QColor("#E3E3E3")))
+                item.setForeground(2, QBrush(QColor("#FDD663"))) # Highlight pending type
+            else:
+                color = QColor("#81C995") if p["profit"] >= 0 else QColor("#F28B82")
+                item.setForeground(7, QBrush(color))
             
             if magic == 0: 
-                item.setForeground(1, QBrush(QColor("#EBCB8B")))
+                item.setForeground(1, QBrush(QColor("#FDD663")))
             elif magic == CONFIG["magic_number"]:
-                item.setForeground(1, QBrush(QColor("#A3BE8C")))
+                item.setForeground(1, QBrush(QColor("#81C995")))
             elif magic == CONFIG["magic_number"] + 1:
-                item.setForeground(1, QBrush(QColor("#88C0D0")))
+                item.setForeground(1, QBrush(QColor("#A8C7FA")))
 
         # Remove closed
         for ticket in list(self.position_items.keys()):
@@ -944,7 +1010,7 @@ class DashboardGUI(QMainWindow):
                 # Tooltip for exact time
                 item.setToolTip(0, datetime.fromtimestamp(h['exit_time']).strftime("%Y-%m-%d %H:%M:%S"))
                 
-                color = QColor("#A3BE8C") if h["profit"] >= 0 else QColor("#BF616A")
+                color = QColor("#81C995") if h["profit"] >= 0 else QColor("#F28B82")
                 item.setForeground(5, QBrush(color))
                 item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
                 item.setTextAlignment(1, Qt.AlignLeft | Qt.AlignVCenter)
@@ -961,14 +1027,23 @@ class DashboardGUI(QMainWindow):
         balance = data.get("balance", 0.0)
         total_pl_24h = data.get("total_pl_24h", 0.0)
         self.total_profit_label.setText(f"Bal: ${balance:.2f}  |  P/L (24h): ${total_pl_24h:.2f}")
-        self.total_profit_label.setStyleSheet(f"font-weight: bold; font-size: 10pt; color: {'#A3BE8C' if total_pl_24h >= 0 else '#BF616A'};")
+        self.total_profit_label.setStyleSheet(f"font-weight: bold; font-size: 10pt; color: {'#81C995' if total_pl_24h >= 0 else '#F28B82'};")
 
         # Signal Flash
-        diff = time.time() - data.get("last_signal_ts", 0)
+        last_ts = data.get("last_signal_ts", 0)
+        diff = time.time() - last_ts
         if diff < 3.0:
             self.signal_indicator.set_active(int(diff * 4) % 2 == 0)
         else:
             self.signal_indicator.set_active(False)
+            
+        # Strategy Chips Flash
+        if last_ts > self._last_signal_ts:
+            self._last_signal_ts = last_ts
+            if diff < 5.0: # Only flash if signal is recent
+                sig_class = data.get("last_signal_class", "").lower()
+                if "scalp" in sig_class: self.strategy_chips.flash("Scalp")
+                elif "swing" in sig_class: self.strategy_chips.flash("Swing")
 
         # 5. Pass data to Chart if open
         if self.chart_window and self.chart_window.isVisible():
@@ -981,19 +1056,98 @@ class DashboardGUI(QMainWindow):
                 data.get("history", [])
             )
 
+    def update_session_display(self):
+        now = datetime.utcnow()
+        h = now.hour
+        
+        # Define sessions: Name, Start, End (UTC), Color
+        sessions = [
+            {"name": "SYD", "start": 21, "end": 6, "color": "#C58AF9"},
+            {"name": "TOK", "start": 0, "end": 9, "color": "#FDD663"},
+            {"name": "LON", "start": 8, "end": 17, "color": "#81C995"},
+            {"name": "NY", "start": 13, "end": 22, "color": "#F28B82"}
+        ]
+        
+        active = []
+        for s in sessions:
+            is_active = False
+            if s["start"] < s["end"]:
+                if s["start"] <= h < s["end"]: is_active = True
+            else: # Crosses midnight
+                if h >= s["start"] or h < s["end"]: is_active = True
+                
+            if is_active:
+                t_end = now.replace(hour=s["end"], minute=0, second=0, microsecond=0)
+                if s["start"] > s["end"] and h >= s["start"]:
+                    t_end += timedelta(days=1)
+                
+                left = t_end - now
+                active.append({"name": s["name"], "color": s["color"], "left": left})
+        
+        if not active:
+            self.session_panel.set_data("QUIET", "--:--", "#444746")
+            self.session_panel.setToolTip("No major market session active")
+            return
+
+        active.sort(key=lambda x: x["left"])
+        primary = active[0]
+        
+        names = "/".join([x["name"] for x in active])
+        
+        # Check Overlaps for Disabled Status
+        overlap_warn = ""
+        is_tok_lon = 8 <= h < 9
+        is_lon_ny = 13 <= h < 17
+        
+        if is_tok_lon:
+            sc = CONFIG.get("session_scalp_overlap_tok_lon", True)
+            sw = CONFIG.get("session_swing_overlap_tok_lon", True)
+            if not sc and not sw: overlap_warn = "⛔"
+            elif not sc: overlap_warn = "⚠️Sc"
+            elif not sw: overlap_warn = "⚠️Sw"
+        elif is_lon_ny:
+            sc = CONFIG.get("session_scalp_overlap_lon_ny", True)
+            sw = CONFIG.get("session_swing_overlap_lon_ny", True)
+            if not sc and not sw: overlap_warn = "⛔"
+            elif not sc: overlap_warn = "⚠️Sc"
+            elif not sw: overlap_warn = "⚠️Sw"
+            
+        if overlap_warn:
+            names += f" {overlap_warn}"
+        
+        times = []
+        tooltips = []
+        for s in active:
+            left_sec = int(s["left"].total_seconds())
+            hours = left_sec // 3600
+            mins = (left_sec % 3600) // 60
+            times.append(f"{hours}:{mins:02d}")
+            tooltips.append(f"{s['name']} closes in {hours}h {mins}m")
+            
+        if overlap_warn:
+            tooltips.append(f"Overlap Status: {overlap_warn} (Trading Restricted)")
+            
+        text = " / ".join(times)
+        c = primary["color"]
+        
+        self.session_panel.set_data(names, text, c)
+        self.session_panel.setToolTip("\n".join(tooltips))
+
     def open_chart(self):
         if not self.chart_window:
             self.chart_window = ChartWindow()
+            self.chart_window.closed.connect(lambda: self.toggle_chart_data_signal.emit(False))
+        
+        self.toggle_chart_data_signal.emit(True)
         self.chart_window.show()
         self.chart_window.raise_()
         self.chart_window.activateWindow()
 
     def open_manual(self):
-        if not self.manual_dialog:
-            self.manual_dialog = ManualExecutionDialog(self)
-        self.manual_dialog.show()
-        self.manual_dialog.raise_()
-        self.manual_dialog.activateWindow()
+        self.side_panel.tabs.setCurrentIndex(0)
+        
+    def open_calculator(self):
+        self.side_panel.tabs.setCurrentIndex(1)
 
     def open_settings(self):
         dlg = AdvancedSettingsDialog(self)
@@ -1005,7 +1159,7 @@ class DashboardGUI(QMainWindow):
         item = self.tree_positions.itemAt(pos)
         if item:
             menu = QMenu(self)
-            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            menu.setStyleSheet("QMenu { background-color: #1E1F20; color: #E3E3E3; } QMenu::item:selected { background-color: #A8C7FA; color: #000000; }")
             copy_action = menu.addAction("Copy Row")
             close_action = menu.addAction("Close Position")
             action = menu.exec(self.tree_positions.mapToGlobal(pos))
@@ -1020,7 +1174,7 @@ class DashboardGUI(QMainWindow):
         item = self.tree_logs.itemAt(pos)
         if item:
             menu = QMenu(self)
-            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            menu.setStyleSheet("QMenu { background-color: #1E1F20; color: #E3E3E3; } QMenu::item:selected { background-color: #A8C7FA; color: #000000; }")
             copy_action = menu.addAction("Copy Log")
             action = menu.exec(self.tree_logs.mapToGlobal(pos))
             if action == copy_action:
@@ -1032,7 +1186,7 @@ class DashboardGUI(QMainWindow):
         item = self.tree_history.itemAt(pos)
         if item:
             menu = QMenu(self)
-            menu.setStyleSheet("QMenu { background-color: #3B4252; color: #ECEFF4; } QMenu::item:selected { background-color: #88C0D0; color: #2E3440; }")
+            menu.setStyleSheet("QMenu { background-color: #1E1F20; color: #E3E3E3; } QMenu::item:selected { background-color: #A8C7FA; color: #000000; }")
             copy_action = menu.addAction("Copy Row")
             action = menu.exec(self.tree_history.mapToGlobal(pos))
             if action == copy_action:
@@ -1057,10 +1211,26 @@ class DashboardGUI(QMainWindow):
             ModernToast.show_message(self, f"Price Copied: {tick.bid}", style="info")
 
     def close_ticket(self, ticket):
+        # Try closing position
         positions = mt5.positions_get(ticket=ticket)
         if positions: 
             self._send_close_request(positions[0])
             ModernToast.show_message(self, f"Close Request Sent: #{ticket}", style="info")
+            return
+            
+        # Try cancelling order
+        orders = mt5.orders_get(ticket=ticket)
+        if orders:
+            self._send_cancel_request(orders[0])
+            ModernToast.show_message(self, f"Cancel Request Sent: #{ticket}", style="info")
+
+    def _send_cancel_request(self, order):
+        req = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": order.ticket,
+            "symbol": order.symbol
+        }
+        mt5.order_send(req)
 
     def _send_close_request(self, pos):
         tick = mt5.symbol_info_tick(pos.symbol)
@@ -1090,6 +1260,13 @@ class DashboardGUI(QMainWindow):
         
         positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
         if not positions: return
+        
+        if action == "Close ALL Positions":
+            for pos in positions:
+                self._send_close_request(pos)
+            ModernToast.show_message(self, "ALL POSITIONS CLOSED", style="error")
+            return
+
         for pos in positions:
             is_scalp = pos.magic == CONFIG["magic_number"]
             is_swing = pos.magic == CONFIG["magic_number"] + 1
@@ -1169,17 +1346,6 @@ class DashboardGUI(QMainWindow):
         dlg = PositionModifyDialog(ticket, symbol, sl, tp, self)
         dlg.exec()
 
-    def panic_close(self):
-        # This would ideally send a signal to the controller or worker to close all
-        # For now, we can just log it or implement a direct MT5 call if thread-safe
-        # Since MT5 is thread-safe for simple calls, we can try, but better to flag state.
-        # Let's just log for now as the worker handles logic usually.
-        positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
-        if positions:
-            for pos in positions:
-                self._send_close_request(pos)
-            ModernToast.show_message(self, "PANIC CLOSE INITIATED", style="error")
-
     def closeEvent(self, event):
         self._is_closing = True
         self.blink_timer.stop()
@@ -1188,15 +1354,17 @@ class DashboardGUI(QMainWindow):
         except Exception:
             pass
 
-        data = {"geometry": self.saveGeometry().toBase64().data().decode()}
+        data = {
+            "geometry": self.saveGeometry().toBase64().data().decode(),
+            "state": self.saveState().toBase64().data().decode(),
+            "chart_open": bool(self.chart_window and self.chart_window.isVisible())
+        }
         with open("ui_state.json", "w") as f: json.dump(data, f)
         self.stop_worker_signal.emit()
         self.worker_thread.quit()
         self.worker_thread.wait()
         if self.chart_window:
             self.chart_window.close()
-        if self.manual_dialog:
-            self.manual_dialog.close()
         super().closeEvent(event)
 
     def load_signals(self, page):
@@ -1249,9 +1417,9 @@ class DashboardGUI(QMainWindow):
             
             # Color coding
             if "long" in s.get("entryType", ""):
-                item.setForeground(2, QBrush(QColor("#A3BE8C")))
+                item.setForeground(2, QBrush(QColor("#81C995")))
             elif "short" in s.get("entryType", ""):
-                item.setForeground(2, QBrush(QColor("#BF616A")))
+                item.setForeground(2, QBrush(QColor("#F28B82")))
                 
             item.setData(0, Qt.UserRole, s) # Store full data
             self.tree_signals.addTopLevelItem(item)

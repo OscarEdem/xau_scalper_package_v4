@@ -32,10 +32,20 @@ def calculate_velocity():
     bids = ticks['bid']
     return (bids.max() - bids.min()) / (get_point() * 10.0)
 
-def calculate_local_atr(symbol, period=14):
-    """Calculate ATR(14) using M1 candles from MT5."""
+def calculate_local_atr(symbol, timeframe_str=None, period=14):
+    """Calculate ATR(14) using configured timeframe candles from MT5."""
+    if timeframe_str is None:
+        timeframe_str = CONFIG.get("atr_timeframe", "M5")
+        
+    tf_str = timeframe_str
+    tf_map = {
+        "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+    }
+    tf = tf_map.get(tf_str, mt5.TIMEFRAME_M5)
+    
     # Fetch period+1 candles to calculate True Range for 'period' candles
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, period + 1)
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, period + 1)
     if rates is None or len(rates) < period + 1:
         return 0.0
     
@@ -211,6 +221,29 @@ def execute_trade(signal):
                     "details": msg
                 })
             return
+            
+        # --- Netting Account Protection ---
+        # If account is Netting (0) or Exchange (1), opposite trades will close existing ones.
+        # We must protect Manual trades (magic=0) from being closed by bot trades.
+        if acct_info.margin_mode != mt5.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING and not CONFIG.get("allow_manual_closure_on_netting", False):
+            positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
+            if positions:
+                is_long = "long" in entry_type
+                for pos in positions:
+                    is_opposite = (is_long and pos.type == mt5.ORDER_TYPE_SELL) or \
+                                  (not is_long and pos.type == mt5.ORDER_TYPE_BUY)
+                    
+                    if is_opposite and pos.magic == 0:
+                        msg = f"Aborted {entry_type} to protect Manual Trade #{pos.ticket} (Netting Account)"
+                        print(f"[EXEC] {msg}")
+                        with state["lock"]:
+                            state["gui_logs"].append({
+                                "time": datetime.now().strftime("%H:%M:%S"),
+                                "ticket": "-",
+                                "type": "Exec Abort",
+                                "details": "Protecting Manual Trade (Netting)"
+                            })
+                        return
     
     # Simple Filters
     ask, bid = get_ask_bid()
@@ -456,11 +489,54 @@ def monitor_closed_trades(open_positions):
                     del state["active_trades"][ticket]
                 save_active_trades()
 
+def close_all_positions(mode="scalp"):
+    """
+    Closes all open positions for the specified mode (scalp or swing).
+    """
+    positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
+    if not positions: return
+    
+    magic_target = CONFIG["magic_number"] if mode == "scalp" else CONFIG["magic_number"] + 1
+    
+    for pos in positions:
+        if pos.magic == magic_target:
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if not tick: continue
+            
+            type_close = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            price_close = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+            
+            req = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": pos.symbol,
+                "position": pos.ticket,
+                "volume": pos.volume,
+                "type": type_close,
+                "price": price_close,
+                "magic": pos.magic,
+                "comment": f"Session End ({mode})"
+            }
+            
+            res = mt5.order_send(req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                with state["lock"]:
+                    state["gui_logs"].append({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "ticket": str(pos.ticket),
+                        "type": "Auto Close",
+                        "details": f"Session End ({mode})"
+                    })
+
 def manage_positions():
-    # 0. Update ATR from Chart (M1)
-    local_atr = calculate_local_atr(CONFIG["trade_symbol"])
-    if local_atr > 0:
-        state["server_atr"] = local_atr
+    # 0. Update ATRs
+    # Dashboard Gauge ATR (Global setting)
+    gauge_atr = calculate_local_atr(CONFIG["trade_symbol"], CONFIG.get("atr_timeframe", "M5"))
+    if gauge_atr > 0:
+        state["server_atr"] = gauge_atr
+        
+    # Strategy-specific ATRs for Trailing
+    atr_scalp = calculate_local_atr(CONFIG["trade_symbol"], CONFIG.get("atr_timeframe_scalp", "M5"))
+    atr_swing = calculate_local_atr(CONFIG["trade_symbol"], CONFIG.get("atr_timeframe_swing", "H1"))
 
     # Fetch all positions for the symbol (including Manual with magic=0)
     all_positions = mt5.positions_get(symbol=CONFIG["trade_symbol"])
@@ -558,6 +634,7 @@ def manage_positions():
         current_sl = pos.sl
         best_sl = current_sl
         sl_reason = "Manual"
+        using_atr = False
         
         # Params
         # Use Scalp settings for Scalp trades, Swing settings for Swing AND Manual trades
@@ -580,11 +657,15 @@ def manage_positions():
             dist_pips = tr_dist_cfg
             
             # Dynamic ATR Logic
-            if CONFIG.get("use_atr_trailing", False) and state["server_atr"] > 0:
+            if CONFIG.get("use_atr_trailing", False):
+                # Select appropriate ATR based on trade type
+                active_atr = atr_scalp if is_scalp else atr_swing
+                
+                if active_atr > 0:
                 # Convert ATR (Price) to Pips (1 pip = 10 points)
-                atr_pips = state["server_atr"] / (point * 10)
-                mult = CONFIG.get("atr_dist_mult_scalp", 1.5) if is_scalp else CONFIG.get("atr_dist_mult_swing", 2.5)
-                dist_pips = atr_pips * mult
+                    atr_pips = active_atr / (point * 10)
+                    dist_pips = atr_pips
+                    using_atr = True
 
             dist_pts = dist_pips * 10 * point
             candidate_sl = (current_price - dist_pts) if is_buy else (current_price + dist_pts)
@@ -593,10 +674,12 @@ def manage_positions():
                 if candidate_sl > best_sl: 
                     best_sl = candidate_sl
                     sl_reason = "Trailing"
+                    if using_atr: sl_reason += f" (ATR: {dist_pips:.1f})"
             else:
                 if best_sl == 0 or candidate_sl < best_sl: 
                     best_sl = candidate_sl
                     sl_reason = "Trailing"
+                    if using_atr: sl_reason += f" (ATR: {dist_pips:.1f})"
             
             # Diagnostic Log (Throttle: Only log if profit is high and no update happening, or periodically)
             # For diagnosis, we log if we are DEEP in profit but SL isn't moving

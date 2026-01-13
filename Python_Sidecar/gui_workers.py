@@ -16,11 +16,13 @@ class MT5DataWorker(QObject):
     def __init__(self):
         super().__init__()
         self.timer = QTimer(self)
-        self.timer.setInterval(200)  # 5Hz update rate
+        self.timer.setInterval(300)  # Reduced to 2Hz to save resources
         self.timer.timeout.connect(self.fetch_data)
         self.loop_counter = 0
         self.history_cache = []
         self.total_pl_cache = 0.0
+        self.last_valid_atr = 0.0
+        self.chart_data_enabled = False
 
     @Slot()
     def start_working(self):
@@ -29,6 +31,10 @@ class MT5DataWorker(QObject):
     @Slot()
     def stop_working(self):
         self.timer.stop()
+
+    @Slot(bool)
+    def set_chart_data_enabled(self, enabled):
+        self.chart_data_enabled = enabled
 
     def fetch_data(self):
         if not state.get("running", False):
@@ -69,6 +75,13 @@ class MT5DataWorker(QObject):
         else:
             data["bid"] = 0.0
             data["ask"] = 0.0
+            
+        # Fetch Daily Open for Price Change calculation
+        d1_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 1)
+        if d1_rates is not None and len(d1_rates) > 0:
+            data["daily_open"] = float(d1_rates[0]['open'])
+        else:
+            data["daily_open"] = 0.0
         
         data["contract_size"] = symbol_info.trade_contract_size if symbol_info else 100.0
 
@@ -77,9 +90,11 @@ class MT5DataWorker(QObject):
         data["balance"] = acct.balance if acct else 0.0
         data["equity"] = acct.equity if acct else 0.0
         data["margin_used"] = acct.margin if acct else 0.0
+        data["margin_mode"] = acct.margin_mode if acct else -1
         
         # 4. Positions
         positions = mt5.positions_get(symbol=symbol)
+        orders = mt5.orders_get(symbol=symbol)
         pos_list = []
         counts = {"scalp": 0, "swing": 0, "manual": 0}
         total_open_pl = 0.0
@@ -111,6 +126,34 @@ class MT5DataWorker(QObject):
                         "symbol": p.symbol,
                         "price_open": p.price_open
                     })
+        
+        if orders:
+            for o in orders:
+                if o.magic == CONFIG["magic_number"]: counts["scalp"] += 1
+                elif o.magic == CONFIG["magic_number"] + 1: counts["swing"] += 1
+                elif o.magic == 0: counts["manual"] += 1
+                
+                t_map = {
+                    mt5.ORDER_TYPE_BUY_LIMIT: "BUY LIMIT",
+                    mt5.ORDER_TYPE_SELL_LIMIT: "SELL LIMIT",
+                    mt5.ORDER_TYPE_BUY_STOP: "BUY STOP",
+                    mt5.ORDER_TYPE_SELL_STOP: "SELL STOP",
+                    mt5.ORDER_TYPE_BUY_STOP_LIMIT: "BUY STOP LIMIT",
+                    mt5.ORDER_TYPE_SELL_STOP_LIMIT: "SELL STOP LIMIT"
+                }
+                
+                pos_list.append({
+                    "ticket": o.ticket,
+                    "type": t_map.get(o.type, "ORDER"),
+                    "volume": o.volume_current,
+                    "profit": 0.0,
+                    "magic": o.magic,
+                    "sl": o.sl,
+                    "tp": o.tp,
+                    "symbol": o.symbol,
+                    "price_open": o.price_open,
+                    "is_pending": True
+                })
         
         data["positions"] = pos_list
         data["counts"] = counts
@@ -172,7 +215,49 @@ class MT5DataWorker(QObject):
         data["status_text"] = state.get("status_text", "")
         data["connection_time"] = state.get("connection_time")
         data["last_signal_ts"] = state.get("last_signal_ts", 0)
-        data["server_atr"] = state.get("server_atr", 0.0)
+        
+        # Priority 1: Calculate ATR locally from live market data
+        local_atr = 0.0
+        if data["connected"]:
+            try:
+                tf_str = CONFIG.get("atr_timeframe", "M5")
+                tf_map = {
+                    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+                    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+                }
+                tf = tf_map.get(tf_str, mt5.TIMEFRAME_M5)
+                
+                # Fetch last 20 candles to calculate 14-period ATR
+                rates = mt5.copy_rates_from_pos(symbol, tf, 0, 20)
+                if rates is not None and len(rates) >= 15:
+                    tr_sum = 0.0
+                    count = 0
+                    # Calculate TR for the last 14 periods available
+                    for i in range(len(rates) - 14, len(rates)):
+                        h = float(rates[i]['high'])
+                        l = float(rates[i]['low'])
+                        pc = float(rates[i-1]['close'])
+                        tr = max(h - l, abs(h - pc), abs(l - pc))
+                        tr_sum += tr
+                        count += 1
+                    if count > 0:
+                        local_atr = tr_sum / count
+            except Exception:
+                pass
+
+        # Determine final ATR (Local > Server > Cache)
+        server_atr = state.get("server_atr", 0.0)
+        
+        if local_atr > 0:
+            data["server_atr"] = local_atr
+            self.last_valid_atr = local_atr
+        elif server_atr > 0:
+            data["server_atr"] = server_atr
+            self.last_valid_atr = server_atr
+        elif self.last_valid_atr > 0:
+            data["server_atr"] = self.last_valid_atr
+        else:
+            data["server_atr"] = 0.0
 
         latest = state.get("latest_signal")
         if latest:
@@ -183,8 +268,11 @@ class MT5DataWorker(QObject):
             data["last_signal_class"] = latest.get("classification", "Unknown")
 
         # 8. Chart Data
-        tf = CONFIG.get("chart_timeframe", "M1")
-        data["chart_data"] = get_chart_data(symbol, timeframe_str=tf, count=500)
+        if self.chart_data_enabled:
+            tf = CONFIG.get("chart_timeframe", "M1")
+            data["chart_data"] = get_chart_data(symbol, timeframe_str=tf, count=500)
+        else:
+            data["chart_data"] = []
 
         self.data_updated.emit(data)
 

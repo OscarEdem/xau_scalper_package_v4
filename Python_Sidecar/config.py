@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "swing_mode": True,
     "force_market": False,
     "manage_manual": False,
+    "allow_manual_closure_on_netting": False,
     
     # -- Filters --
     "max_spread_points": 162,
@@ -43,11 +44,36 @@ DEFAULT_CONFIG = {
     "use_trailing_scalp": True,
     "use_trailing_swing": True,
     "use_atr_trailing": True,
-    "atr_dist_mult_scalp": 1.5,
-    "atr_dist_mult_swing": 2.5,
-    "atr_high_vol_threshold": 1.0,
+    "atr_high_vol_threshold": 2.0,
+    "atr_timeframe": "M5",
+    "atr_timeframe_scalp": "M5",
+    "atr_timeframe_swing": "H1",
     "chart_rr_ratio": 1.5,
     "chart_timeframe": "M1",
+    
+    # -- Session Filters --
+    "session_scalp_syd": True,
+    "session_scalp_tok": True,
+    "session_scalp_lon": True,
+    "session_scalp_ny": True,
+    "session_swing_syd": True,
+    "session_swing_tok": True,
+    "session_swing_lon": True,
+    "session_swing_ny": True,
+    "session_scalp_overlap_tok_lon": True,
+    "session_scalp_overlap_lon_ny": True,
+    "session_swing_overlap_tok_lon": True,
+    "session_swing_overlap_lon_ny": True,
+    
+    # -- Auto Close on Session End --
+    "close_scalp_syd_end": False,
+    "close_scalp_tok_end": False,
+    "close_scalp_lon_end": False,
+    "close_scalp_ny_end": False,
+    "close_swing_syd_end": False,
+    "close_swing_tok_end": False,
+    "close_swing_lon_end": False,
+    "close_swing_ny_end": False,
 }
 
 CONFIG = DEFAULT_CONFIG.copy()
