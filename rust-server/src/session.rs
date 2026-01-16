@@ -87,6 +87,7 @@ impl ExecutionManager {
         pyramiding_threshold: f64,
         averaging_threshold: f64,
         rapid_reversal_seconds: i64,
+        push_notification_threshold: f64,
     ) -> bool {
         if signal.entry_type == SignalDirection::None {
             return false;
@@ -99,9 +100,12 @@ impl ExecutionManager {
             if current_conv > self.last_notified_conviction {
                 return true;
             }
-            // Reminder Logic: Re-broadcast every 15 minutes (900 seconds) if signal persists
+            // Reminder Logic: Re-broadcast every 15 minutes (900 seconds) if signal persists with high conviction
             if current_time - self.last_reminder_time > 900 {
-                return true;
+                // Only remind if conviction is still high enough to be noteworthy, preventing stale reminders.
+                if current_conv >= push_notification_threshold {
+                    return true;
+                }
             }
             return false;
         }
@@ -548,7 +552,8 @@ impl TradingSession {
                         close_notification.should_push = settings.swing.push_notifications_enabled;
                         if close_notification.should_push { Self::format_push_notification(&mut close_notification, &self.symbol); }
                         if let Some(db) = &self.db {
-                            let sig_clone = close_notification.clone();
+                            let mut sig_clone = close_notification.clone();
+                            sig_clone.signal_id = format!("{}_CLOSE_{}", sig_clone.signal_id, Utc::now().timestamp_millis());
                             let sym_clone = self.symbol.clone();
                             let db_clone = db.clone();
                             let metrics_clone = self.metrics.clone();
@@ -717,7 +722,8 @@ impl TradingSession {
             cooldown_seconds,
             pyramiding_threshold,
             averaging_threshold,
-            rapid_reversal_seconds
+            rapid_reversal_seconds,
+            settings.swing.push_notification_threshold
         );
         if should_notify_swing {
             self.swing_execution.update_state(&swing_signal, current_time);
@@ -728,9 +734,13 @@ impl TradingSession {
                 Self::format_push_notification(&mut swing_signal, &self.symbol);
             }
 
+            // Create a unique version for History & DB (preserves updates)
+            let mut history_signal = swing_signal.clone();
+            history_signal.signal_id = format!("{}_{}", history_signal.signal_id, Utc::now().timestamp_millis());
+
             // Save Swing Signal to DB
             if let Some(db) = &self.db {
-                let sig_clone = swing_signal.clone();
+                let sig_clone = history_signal.clone();
                 let sym_clone = self.symbol.clone();
                 let db_clone = db.clone();
                 let metrics_clone = self.metrics.clone();
@@ -741,7 +751,7 @@ impl TradingSession {
                 });
             }
 
-            notifications.push(swing_signal.clone());
+            notifications.push(history_signal);
             self.broadcast_signal(&swing_signal);
         } else if active_trade_closed {
             // --- NEW: Notify on Trade Closure (SL Hit / Invalidation) ---
@@ -753,9 +763,13 @@ impl TradingSession {
                 close_notification.should_push = true;
                 Self::format_push_notification(&mut close_notification, &self.symbol);
                 
+                // Create unique version for History & DB
+                let mut history_close = close_notification.clone();
+                history_close.signal_id = format!("{}_CLOSE_{}", history_close.signal_id, Utc::now().timestamp_millis());
+
                 // Save Close Signal to DB
                 if let Some(db) = &self.db {
-                    let sig_clone = close_notification.clone();
+                    let sig_clone = history_close.clone();
                     let sym_clone = self.symbol.clone();
                     let db_clone = db.clone();
                     let metrics_clone = self.metrics.clone();
@@ -768,7 +782,7 @@ impl TradingSession {
 
                 // Broadcast Trade Closure to WebSocket
                 self.broadcast_signal(&close_notification);
-                notifications.push(close_notification);
+                notifications.push(history_close);
                 
                 // Clear the execution state so we don't notify again
                 self.swing_execution.last_notified_signal_id = None;
@@ -783,7 +797,25 @@ impl TradingSession {
                 self.swing_execution.last_pushed_signal_id = Some(swing_signal.signal_id.clone());
                 swing_signal.should_push = true;
                 Self::format_push_notification(&mut swing_signal, &self.symbol);
-                notifications.push(swing_signal.clone());
+                
+                // Create unique version for History & DB
+                let mut history_signal = swing_signal.clone();
+                history_signal.signal_id = format!("{}_{}", history_signal.signal_id, Utc::now().timestamp_millis());
+
+                // Save to DB (Was missing for late blooms!)
+                if let Some(db) = &self.db {
+                    let sig_clone = history_signal.clone();
+                    let sym_clone = self.symbol.clone();
+                    let db_clone = db.clone();
+                    let metrics_clone = self.metrics.clone();
+                    tokio::spawn(async move { 
+                        if let Err(e) = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
+                            tracing::error!(symbol = %sym_clone, signal_id = %sig_clone.signal_id, error = %e, "Failed to save swing update signal to DB");
+                        }
+                    });
+                }
+
+                notifications.push(history_signal);
                 
                 // Broadcast update so UI reflects high conviction
                 self.broadcast_signal(&swing_signal);
@@ -799,7 +831,8 @@ impl TradingSession {
             // This ensures the DB records the signal even if we didn't send a Push Notification (e.g. Strict Mode blocked it).
             if !is_same_swing_id {
                 if let Some(db) = &self.db {
-                    let sig_clone = swing_signal.clone();
+                    let mut sig_clone = swing_signal.clone();
+                    sig_clone.signal_id = format!("{}_{}", sig_clone.signal_id, Utc::now().timestamp_millis());
                     let sym_clone = self.symbol.clone();
                     let db_clone = db.clone();
                     let metrics_clone = self.metrics.clone();
@@ -889,7 +922,8 @@ impl TradingSession {
             cooldown_seconds,
             pyramiding_threshold,
             averaging_threshold,
-            rapid_reversal_seconds
+            rapid_reversal_seconds,
+            settings.scalp.push_notification_threshold
         );
         // Check ID match before evaluate_execution potentially updates state (though it doesn't here, it's safer)
         let is_same_scalp_id = self.execution.last_notified_signal_id.as_ref() == Some(&scalp_signal.signal_id);

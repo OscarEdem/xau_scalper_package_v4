@@ -1,4 +1,0 @@
-MetaTrader5
-websocket-client
-PySide6
-numpy<2.0.0

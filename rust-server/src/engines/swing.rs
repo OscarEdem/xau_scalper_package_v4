@@ -65,6 +65,30 @@ impl SwingEngine {
             last_atr
         };
 
+        // --- NEW: Dynamic Regime Adjustment ---
+        let vol_ratio = if avg_atr > 0.0 { last_atr / avg_atr } else { 1.0 };
+        let mut adjusted_settings = settings.clone();
+        let mut regime_note = "Normal".to_string();
+
+        if vol_ratio > 1.5 {
+            // High Volatility: "Kill Switch" / Defensive Mode
+            // 1. Require higher conviction (filter weak trades)
+            adjusted_settings.conviction_threshold += 15.0; 
+            // 2. Widen stops (prevent noise stop-outs)
+            adjusted_settings.sl_atr_buffer *= 1.5;
+            // 3. Take profit earlier (mean reversion risk)
+            adjusted_settings.risk_reward_ratio_tp1 *= 0.8;
+            
+            regime_note = format!("High Vol (Ratio {:.2}) -> Defensive Mode", vol_ratio);
+        } else if vol_ratio < 0.75 {
+            // Low Volatility: Aggressive Mode
+            // 1. Tighter stops allowed
+            adjusted_settings.sl_atr_buffer *= 0.8;
+            
+            regime_note = format!("Low Vol (Ratio {:.2}) -> Aggressive Mode", vol_ratio);
+        }
+        let settings = &adjusted_settings; // Shadow original settings
+
         let adx_vals = adx(h1_highs, h1_lows, h1_closes, settings.adx_period);
 
         // --- Guard: Check for high-risk news or volatility before proceeding ---
@@ -133,8 +157,12 @@ impl SwingEngine {
 
         // --- 6. Confluence Scoring ---
         let (mut long_score, mut short_score, mut reason_long, mut reason_short) = Self::confluence_scoring_engine(
-            htf_bias_score, &liquidity, &displacement, &fvg_zones, &order_blocks, req.current_price, last_atr, final_prediction_bias, settings
+            htf_bias_score, &liquidity, &displacement, &fvg_zones, &order_blocks, req.current_price, final_prediction_bias, settings
         );
+
+        // 5️⃣ Fix: Capture Raw Scores for Debugging (Before Penalties)
+        let raw_long_score_val = long_score;
+        let raw_short_score_val = short_score;
 
         // --- NEW: Fractal Guard Integration ---
         if long_score > 0.0 {
@@ -158,10 +186,25 @@ impl SwingEngine {
         }
 
         // --- 7. Execution Logic ---
-        let conviction_threshold = settings.conviction_threshold; // Lowered to capture Context-only trades (HTF + AI)
-        let (entry_type, conviction_score, reason) = if long_score > short_score && long_score >= conviction_threshold {
+        // Contextual Thresholds: Reversals & SFPs need more proof than Continuations
+        let mut long_threshold = settings.conviction_threshold;
+        let mut short_threshold = settings.conviction_threshold;
+
+        if displacement.is_bullish && displacement.is_reversal {
+            long_threshold += 10.0;
+        } else if liquidity.is_sfp_bullish {
+            long_threshold += 5.0;
+        }
+
+        if displacement.is_bearish && displacement.is_reversal {
+            short_threshold += 10.0;
+        } else if liquidity.is_sfp_bearish {
+            short_threshold += 5.0;
+        }
+
+        let (entry_type, conviction_score, reason) = if long_score > short_score && long_score >= long_threshold {
             (SignalDirection::Long, long_score.min(100.0), reason_long)
-        } else if short_score > long_score && short_score >= conviction_threshold {
+        } else if short_score > long_score && short_score >= short_threshold {
             (SignalDirection::Short, short_score.min(100.0), reason_short)
         } else {
             let (leaning_reason, score) = if long_score >= short_score {
@@ -199,7 +242,7 @@ impl SwingEngine {
         // --- 8. Risk Model ---
         let (sl_price, tp1_price, tp2_price) = if entry_type != SignalDirection::None {
             Self::risk_model(
-                &entry_type, &reason, execution_price, last_atr, &structure, h1_highs[n-1], h1_lows[n-1], settings
+                &entry_type, &reason, execution_price, last_atr, &structure, h1_highs[n-1], h1_lows[n-1], settings, vol_ratio
             )
         } else {
             (0.0, 0.0, 0.0)
@@ -262,8 +305,13 @@ impl SwingEngine {
         debug_info.insert("long_score".to_string(), format!("{:.2}", long_score));
         debug_info.insert("short_score".to_string(), format!("{:.2}", short_score));
         debug_info.insert("entry_atr".to_string(), format!("{:.5}", last_atr));
-        debug_info.insert("raw_long_score".to_string(), format!("{:.2}", long_score));
-        debug_info.insert("raw_short_score".to_string(), format!("{:.2}", short_score));
+        debug_info.insert("raw_long_score".to_string(), format!("{:.2}", raw_long_score_val));
+        debug_info.insert("raw_short_score".to_string(), format!("{:.2}", raw_short_score_val));
+        debug_info.insert("final_long_score".to_string(), format!("{:.2}", long_score));
+        debug_info.insert("final_short_score".to_string(), format!("{:.2}", short_score));
+        debug_info.insert("threshold_long".to_string(), format!("{:.2}", long_threshold));
+        debug_info.insert("threshold_short".to_string(), format!("{:.2}", short_threshold));
+        debug_info.insert("regime_note".to_string(), regime_note);
 
         // --- Deterministic Signal ID ---
         // We generate a stable ID based on the structural level being traded.
@@ -493,7 +541,6 @@ impl SwingEngine {
         fvg_zones: &Vec<PriceLevel>,
         order_blocks: &Vec<PriceLevel>,
         current_price: f64,
-        last_atr: f64,
         final_prediction_bias: f64,
         settings: &SwingSettings,
     ) -> (f64, f64, String, String) {
@@ -502,28 +549,51 @@ impl SwingEngine {
         let mut reason_long = Vec::new();
         let mut reason_short = Vec::new();
 
+        // 6️⃣ Fix: Diminishing Returns Counters (Prevent Confidence Inflation)
+        let mut long_signal_count = 0;
+        let mut short_signal_count = 0;
+
+        // Progressive Decay Multiplier
+        let get_decay_mult = |count: usize| -> f64 {
+            match count {
+                1 => 1.0,
+                2 => 0.85,
+                3 => 0.70,
+                4 => 0.50,
+                _ => 0.30,
+            }
+        };
+
         // 1. HTF Bias (Weight: 30)
         if htf_bias_score > 0.0 {
-            long_score += htf_bias_score.abs() * settings.htf_bias_weight;
+            long_signal_count += 1;
+            long_score += htf_bias_score.abs() * settings.htf_bias_weight * get_decay_mult(long_signal_count);
             reason_long.push("Bullish HTF Bias");
         } else if htf_bias_score < 0.0 {
-            short_score += htf_bias_score.abs() * settings.htf_bias_weight;
+            short_signal_count += 1;
+            short_score += htf_bias_score.abs() * settings.htf_bias_weight * get_decay_mult(short_signal_count);
             reason_short.push("Bearish HTF Bias");
         }
 
         // 2. SFP Confidence (Weight: 40) - High impact event
         if liquidity.is_sfp_bullish {
-            long_score += liquidity.sfp_confidence * settings.sfp_weight_mult; // Increased weight
+            long_signal_count += 1;
+            let mult = get_decay_mult(long_signal_count);
+            long_score += (liquidity.sfp_confidence * settings.sfp_weight_mult) * mult; // Increased weight
             reason_long.push("Bullish Liquidity Grab (SFP)");
         }
         if liquidity.is_sfp_bearish {
-            short_score += liquidity.sfp_confidence * settings.sfp_weight_mult; // Increased weight
+            short_signal_count += 1;
+            let mult = get_decay_mult(short_signal_count);
+            short_score += (liquidity.sfp_confidence * settings.sfp_weight_mult) * mult; // Increased weight
             reason_short.push("Bearish Liquidity Grab (SFP)");
         }
 
         // 3. Displacement Strength (Weight: 30)
         if displacement.is_bullish {
-            long_score += displacement.strength * settings.displacement_weight_mult; // Increased weight
+            long_signal_count += 1;
+            let mult = get_decay_mult(long_signal_count);
+            long_score += (displacement.strength * settings.displacement_weight_mult) * mult; // Increased weight
             if displacement.is_reversal {
                 reason_long.push("Bullish Reversal (CHoCH)");
             } else {
@@ -531,7 +601,9 @@ impl SwingEngine {
             }
         }
         if displacement.is_bearish {
-            short_score += displacement.strength * settings.displacement_weight_mult; // Increased weight
+            short_signal_count += 1;
+            let mult = get_decay_mult(short_signal_count);
+            short_score += (displacement.strength * settings.displacement_weight_mult) * mult; // Increased weight
             if displacement.is_reversal {
                 reason_short.push("Bearish Reversal (CHoCH)");
             } else {
@@ -539,47 +611,85 @@ impl SwingEngine {
             }
         }
 
-        // 4. FVG Alignment (Weight: 20)
-        // Check for FVG Support/Resistance regardless of current displacement (allows retests)
-        let bullish_fvg_match = fvg_zones.iter().any(|z| {
+        // --- 4 & 5. FVG and Order Block Confluence ---
+        let bullish_ob = order_blocks.iter().find(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998);
+        let bullish_fvg = fvg_zones.iter().find(|z| {
             let is_valid_location = z.bottom < current_price && z.is_bullish.unwrap_or(false);
             if !is_valid_location { return false; }
             let is_testing = current_price <= z.top;
-            is_testing || displacement.is_bullish
+            is_testing // Focus on retests for entry signals
         });
-        if bullish_fvg_match {
-             long_score += settings.fvg_weight;
-             reason_long.push("Bullish FVG Support");
+
+        let bullish_confluence = if let (Some(ob), Some(fvg)) = (bullish_ob, bullish_fvg) {
+            ob.bottom <= fvg.top && ob.top >= fvg.bottom // Check for overlap
+        } else {
+            false
+        };
+
+        if bullish_confluence {
+            long_signal_count += 1;
+            let mult = get_decay_mult(long_signal_count);
+            long_score += 35.0 * mult; // Confluence weight
+            reason_long.push("Bullish OB+FVG Confluence");
+        } else {
+            // No confluence, score individually
+            if bullish_ob.is_some() {
+                long_signal_count += 1;
+                let mult = get_decay_mult(long_signal_count);
+                long_score += 25.0 * mult;
+                reason_long.push("Bullish Order Block Test");
+            }
+            if bullish_fvg.is_some() {
+                long_signal_count += 1;
+                let mult = get_decay_mult(long_signal_count);
+                long_score += settings.fvg_weight * mult;
+                reason_long.push("Bullish FVG Support");
+            }
         }
 
-        let bearish_fvg_match = fvg_zones.iter().any(|z| {
+        let bearish_ob = order_blocks.iter().find(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002);
+        let bearish_fvg = fvg_zones.iter().find(|z| {
             let is_valid_location = z.top > current_price && !z.is_bullish.unwrap_or(true);
             if !is_valid_location { return false; }
             let is_testing = current_price >= z.bottom;
-            is_testing || displacement.is_bearish
+            is_testing
         });
-        if bearish_fvg_match {
-             short_score += settings.fvg_weight;
-             reason_short.push("Bearish FVG Resistance");
-        }
 
-        // 5. Order Block Alignment (Weight: 25)
-        // Decoupled from displacement to allow Limit entries on retests
-        if order_blocks.iter().any(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998) {
-             long_score += 25.0;
-             reason_long.push("Bullish Order Block Test");
-        }
+        let bearish_confluence = if let (Some(ob), Some(fvg)) = (bearish_ob, bearish_fvg) {
+            ob.bottom <= fvg.top && ob.top >= fvg.bottom // Check for overlap
+        } else {
+            false
+        };
 
-        if order_blocks.iter().any(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002) {
-             short_score += 25.0;
-             reason_short.push("Bearish Order Block Test");
+        if bearish_confluence {
+            short_signal_count += 1;
+            let mult = get_decay_mult(short_signal_count);
+            short_score += 35.0 * mult; // Confluence weight
+            reason_short.push("Bearish OB+FVG Confluence");
+        } else {
+            if bearish_ob.is_some() {
+                short_signal_count += 1;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += 25.0 * mult;
+                reason_short.push("Bearish Order Block Test");
+            }
+            if bearish_fvg.is_some() {
+                short_signal_count += 1;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += settings.fvg_weight * mult;
+                reason_short.push("Bearish FVG Support");
+            }
         }
 
         if final_prediction_bias > 0.0 {
-            long_score += settings.ensemble_weight_mult * (final_prediction_bias / last_atr).clamp(0.0, 1.5); // Add a slightly higher weight for the ensemble
+            long_signal_count += 1;
+            let mult = get_decay_mult(long_signal_count);
+            long_score += settings.ensemble_weight_mult * mult; // Fixed binary contribution (No ATR scaling)
             reason_long.push("Ensemble Bullish Bias");
         } else if final_prediction_bias < 0.0 {
-            short_score += settings.ensemble_weight_mult * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
+            short_signal_count += 1;
+            let mult = get_decay_mult(short_signal_count);
+            short_score += settings.ensemble_weight_mult * mult; // Fixed binary contribution (No ATR scaling)
             reason_short.push("Ensemble Bearish Bias");
         }
 
@@ -596,26 +706,32 @@ impl SwingEngine {
         current_high: f64,
         current_low: f64,
         settings: &SwingSettings,
+        vol_ratio: f64,
     ) -> (f64, f64, f64) {
         // Clamp max SL distance to avoid excessive risk on volatile candles (e.g. 3 ATRs)
         let max_sl_dist = last_atr * 3.0;
+        let is_defensive = vol_ratio > 1.5;
 
         if *entry_type == SignalDirection::Long {
-            // For SFP, SL goes below the liquidity wick (current_low).
-            // For Structure/Trend, try internal structure first (tighter), then external.
-            let sl_anchor = if reason.contains("SFP") { 
-                current_low 
-            } else { 
-                if structure.internal_low.1 < entry_price && structure.internal_low.1 > 0.0 {
-                    structure.internal_low.1
-                } else if structure.external_low.1 < entry_price && structure.external_low.1 > 0.0 {
-                    structure.external_low.1 
-                } else { 
+            let mut sl = if is_defensive {
+                // Defensive Mode: ATR-first anchor.
+                // In high volatility, internal structure often fails. We anchor to entry with a wide buffer.
+                entry_price - (last_atr * 2.0)
+            } else {
+                // Standard Mode: Structure-first anchor.
+                let sl_anchor = if reason.contains("SFP") { 
                     current_low 
-                }
+                } else { 
+                    if structure.internal_low.1 < entry_price && structure.internal_low.1 > 0.0 {
+                        structure.internal_low.1
+                    } else if structure.external_low.1 < entry_price && structure.external_low.1 > 0.0 {
+                        structure.external_low.1 
+                    } else { 
+                        current_low 
+                    }
+                };
+                sl_anchor - (last_atr * settings.sl_atr_buffer)
             };
-
-            let mut sl = sl_anchor - (last_atr * settings.sl_atr_buffer); // Small buffer below the low
             
             // Sanity Check: Ensure SL is below entry
             if sl >= entry_price {
@@ -628,19 +744,24 @@ impl SwingEngine {
             let tp2 = entry_price + risk * settings.risk_reward_ratio_tp2; // Aim for 1:4 R:R
             (sl, tp1, tp2)
         } else { // "short"
-            let sl_anchor = if reason.contains("SFP") { 
-                current_high 
-            } else { 
-                if structure.internal_high.1 > entry_price && structure.internal_high.1 > 0.0 {
-                    structure.internal_high.1
-                } else if structure.external_high.1 > entry_price && structure.external_high.1 > 0.0 {
-                    structure.external_high.1
-                } else { 
+            let mut sl = if is_defensive {
+                // Defensive Mode: ATR-first anchor.
+                entry_price + (last_atr * 2.0)
+            } else {
+                // Standard Mode: Structure-first anchor.
+                let sl_anchor = if reason.contains("SFP") { 
                     current_high 
-                }
+                } else { 
+                    if structure.internal_high.1 > entry_price && structure.internal_high.1 > 0.0 {
+                        structure.internal_high.1
+                    } else if structure.external_high.1 > entry_price && structure.external_high.1 > 0.0 {
+                        structure.external_high.1
+                    } else { 
+                        current_high 
+                    }
+                };
+                sl_anchor + (last_atr * settings.sl_atr_buffer)
             };
-
-            let mut sl = sl_anchor + (last_atr * settings.sl_atr_buffer);
             
             // Sanity Check: Ensure SL is above entry
             if sl <= entry_price {

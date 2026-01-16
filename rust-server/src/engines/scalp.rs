@@ -4,6 +4,12 @@ use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, calcul
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq)]
+enum ExpectancyClass {
+    Linear,     // For trend-following (Momentum, Pullback)
+    Asymmetric, // For counter-trend (Fade, Stop-Hunt)
+}
+
+#[derive(Debug, PartialEq)]
 enum ScalpMode {
     Momentum,
     Pullback,
@@ -16,6 +22,7 @@ struct Decision {
     conviction: f64,
     reason: String,
     scalp_mode: ScalpMode,
+    expectancy_class: ExpectancyClass,
     recommended_order_type: String,
     entry_price: f64,
     vol_regime_val: f64,
@@ -30,6 +37,7 @@ impl Default for Decision {
             conviction: 0.0,
             reason: "No Signal".to_string(),
             scalp_mode: ScalpMode::Pullback,
+            expectancy_class: ExpectancyClass::Linear,
             recommended_order_type: "none".to_string(),
             entry_price: 0.0,
             vol_regime_val: 1.0,
@@ -95,7 +103,7 @@ impl ScalpEngine {
         // 1. Try Fade Strategy (Priority)
         // 2. If no Fade, try Standard Strategy (Momentum/Pullback)
         
-        let mut decision = if let Some(fade_decision) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals) {
+        let mut decision = if let Some(fade_decision) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals, last_swing_high, last_swing_low, &fvg_zones) {
             fade_decision
         } else {
             Self::evaluate_standard(req, predictor_cache, settings, m5_closes, m1_closes, last_atr, &atr_vals, last_swing_low, last_swing_high)
@@ -150,10 +158,25 @@ impl ScalpEngine {
             } else { false };
 
             if confirmed {
-                decision.entry_type = if london_hunt_signal == "bullish_hunt" { SignalDirection::Long } else { SignalDirection::Short };
-                decision.reason = format!("London Open Stop-Hunt: Swept Asia {}", if london_hunt_signal == "bullish_hunt" { "Low" } else { "High" });
-                decision.entry_price = req.current_price;
-                decision.recommended_order_type = format!("market_{}", decision.entry_type);
+                let hunt_dir = if london_hunt_signal == "bullish_hunt" { SignalDirection::Long } else { SignalDirection::Short };
+                
+                if decision.entry_type == SignalDirection::None {
+                    decision.entry_type = hunt_dir;
+                    decision.scalp_mode = ScalpMode::Fade;
+                    decision.expectancy_class = ExpectancyClass::Asymmetric;
+                    decision.conviction = 85.0;
+                    decision.reason = format!("London Open Stop-Hunt: Swept Asia {}", if london_hunt_signal == "bullish_hunt" { "Low" } else { "High" });
+                    decision.entry_price = req.current_price;
+                    decision.recommended_order_type = format!("market_{}", decision.entry_type);
+                } else if decision.entry_type == hunt_dir {
+                    decision.scalp_mode = ScalpMode::Fade;
+                    decision.expectancy_class = ExpectancyClass::Asymmetric;
+                    decision.conviction = decision.conviction.max(85.0);
+                    decision.reason = format!("{} + London Hunt", decision.reason);
+                } else {
+                    decision.entry_type = SignalDirection::None;
+                    decision.reason = "Conflict: Strategy vs London Hunt".to_string();
+                }
             }
         }
 
@@ -168,20 +191,42 @@ impl ScalpEngine {
             "ny" => 0.8,
             _ => 0.5,
         };
-        let conviction_mult = if decision.conviction > 80.0 { 1.2 } else { 1.0 };
-        let setup_mult = if london_hunt_signal != "none" { 1.5 } else { 1.0 };
-        let position_size = base_size * session_mult * conviction_mult * setup_mult;
-
+        let conviction_mult = if decision.expectancy_class == ExpectancyClass::Linear && decision.conviction > 80.0 {
+            1.2
+        } else {
+            1.0
+        };
+        let position_size = base_size * session_mult * conviction_mult;
+        
         // 5️⃣ Fix: Position sizing inversely proportional to SL distance
         let position_size = if sl != 0.0 && last_atr > 0.0 {
             let risk_atr = (decision.entry_price - sl).abs() / last_atr;
-            let risk_mult = if risk_atr > 0.0 { (1.0 / risk_atr).clamp(0.5, 1.5) } else { 1.0 };
+            
+            // Mode-Aware Risk Scaling
+            let risk_mult = match decision.scalp_mode {
+                ScalpMode::Momentum => {
+                    // Momentum: Inverse-SL OK (Aggressive scaling for tight stops)
+                    if risk_atr > 0.0 { (1.0 / risk_atr).clamp(0.5, 1.5) } else { 1.0 }
+                },
+                ScalpMode::Pullback => {
+                    // Pullback: Mild inverse (Dampened scaling)
+                    if risk_atr > 0.0 { (1.0 / risk_atr.sqrt()).clamp(0.75, 1.25) } else { 1.0 }
+                },
+                ScalpMode::Fade => {
+                    // Fade: Fixed size only (Never scale up on tight stops)
+                    1.0
+                }
+            };
+
             position_size * risk_mult
         } else { position_size };
 
         // Add common debug info
-        decision.debug_info.insert("atr".to_string(), format!("{:.5}", last_atr));
-        decision.debug_info.insert("entry_atr".to_string(), format!("{:.5}", last_atr));
+        decision.debug_info.insert("atr_m5".to_string(), format!("{:.5}", last_atr));
+        if sl != 0.0 && last_atr > 0.0 {
+            let risk_in_atr = (decision.entry_price - sl).abs() / last_atr;
+            decision.debug_info.insert("entry_sl_atr".to_string(), format!("{:.2}", risk_in_atr));
+        }
         decision.debug_info.insert("vol_regime".to_string(), format!("{:.2}", decision.vol_regime_val));
 
         // ---- Deterministic Signal ID ----
@@ -237,7 +282,16 @@ impl ScalpEngine {
 
     /// Evaluates the "Fade" strategy (Mean Reversion).
     /// Returns Some(Decision) if a fade setup is detected, None otherwise.
-    fn evaluate_fade(req: &EvalRequest, m5_closes: &[f64], last_atr: f64, settings: &ScalpSettings, adx_vals: &[f64]) -> Option<Decision> {
+    fn evaluate_fade(
+        req: &EvalRequest, 
+        m5_closes: &[f64], 
+        last_atr: f64, 
+        settings: &ScalpSettings, 
+        adx_vals: &[f64],
+        last_swing_high: Option<f64>,
+        last_swing_low: Option<f64>,
+        fvg_zones: &[PriceLevel]
+    ) -> Option<Decision> {
         if m5_closes.len() >= settings.fade_sma_period {
             // 3️⃣ Fix: Fade Guards (ADX & Trend Bias)
             if let Some(&last_adx) = adx_vals.last() {
@@ -271,26 +325,46 @@ impl ScalpEngine {
             let mut triggered = false;
             
             if req.current_price >= upper_fence && is_parabolic {
+                // 4️⃣ Fix: Liquidity Context Guard (Sweep or FVG)
+                // Use M5 high/low as M1 data might be sparse in request
+                let current_high = req.m5_highs.last().cloned().unwrap_or(req.current_price);
+                let swept_high = last_swing_high.map(|h| current_high > h).unwrap_or(false);
+                let in_bearish_fvg = fvg_zones.iter().any(|z| !z.is_bullish.unwrap_or(true) && req.current_price >= z.bottom && req.current_price <= z.top);
+
+                if !swept_high && !in_bearish_fvg {
+                    return None;
+                }
+
                 // Fix C: Safer Fade Trigger (Check for rejection candle)
                 let m1_close = *req.closes.last().unwrap_or(&0.0);
                 let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
                 if m1_close < prev_m1_close {
                     decision.entry_type = SignalDirection::Short;
-                    decision.reason = format!("Fade Short: Parabolic Rejection at Upper Fence");
+                    decision.reason = format!("Fade Short: Parabolic Rejection + Liquidity Context");
                     triggered = true;
                 }
             } else if req.current_price <= lower_fence && is_parabolic {
+                // 4️⃣ Fix: Liquidity Context Guard (Sweep or FVG)
+                let current_low = req.m5_lows.last().cloned().unwrap_or(req.current_price);
+                let swept_low = last_swing_low.map(|l| current_low < l).unwrap_or(false);
+                let in_bullish_fvg = fvg_zones.iter().any(|z| z.is_bullish.unwrap_or(false) && req.current_price >= z.bottom && req.current_price <= z.top);
+
+                if !swept_low && !in_bullish_fvg {
+                    return None;
+                }
+
                 let m1_close = *req.closes.last().unwrap_or(&0.0);
                 let prev_m1_close = if req.closes.len() > 1 { req.closes[req.closes.len() - 2] } else { m1_close };
                 if m1_close > prev_m1_close {
                     decision.entry_type = SignalDirection::Long;
-                    decision.reason = format!("Fade Long: Parabolic Rejection at Lower Fence");
+                    decision.reason = format!("Fade Long: Parabolic Rejection + Liquidity Context");
                     triggered = true;
                 }
             }
 
             if triggered {
                 decision.scalp_mode = ScalpMode::Fade;
+                decision.expectancy_class = ExpectancyClass::Asymmetric;
                 decision.conviction = 85.0; // High conviction, but not maxed out
                 decision.recommended_order_type = format!("limit_{}", decision.entry_type);
                 decision.entry_price = req.current_price;
@@ -377,6 +451,21 @@ impl ScalpEngine {
             let mut short_reasons = Vec::new();
             let mut short_score = 0.0;
 
+            // 6️⃣ Fix: Diminishing Returns Counters (Prevent Confidence Inflation)
+            let mut long_signal_count = 0;
+            let mut short_signal_count = 0;
+
+            // Progressive Decay Multiplier
+            let get_decay_mult = |count: usize| -> f64 {
+                match count {
+                    1 => 1.0,
+                    2 => 0.85,
+                    3 => 0.70,
+                    4 => 0.50,
+                    _ => 0.30,
+                }
+            };
+
             let mut htf_weight = settings.htf_bias_weight;
             let mut ensemble_weight = settings.ensemble_weight;
 
@@ -386,10 +475,12 @@ impl ScalpEngine {
             }
 
             if bias > 0 {
-                long_score += htf_weight;
+                long_signal_count += 1;
+                long_score += htf_weight * get_decay_mult(long_signal_count);
                 long_reasons.push("HTF Bullish Bias");
             } else if bias < 0 {
-                short_score += htf_weight;
+                short_signal_count += 1;
+                short_score += htf_weight * get_decay_mult(short_signal_count);
                 short_reasons.push("HTF Bearish Bias");
             }
 
@@ -399,55 +490,77 @@ impl ScalpEngine {
             decision.debug_info.insert("ensemble_bias".to_string(), format!("{:.4}", final_prediction_bias));
 
             if final_prediction_bias > 0.0 {
-                long_score += ensemble_weight * (final_prediction_bias / last_atr).clamp(0.0, 1.5);
+                long_signal_count += 1;
+                let mult = get_decay_mult(long_signal_count);
+                long_score += (ensemble_weight * (final_prediction_bias / last_atr).clamp(0.0, 1.5)) * mult;
                 long_reasons.push("Ensemble Bullish Bias");
             } else if final_prediction_bias < 0.0 {
-                short_score += ensemble_weight * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5);
+                short_signal_count += 1;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += (ensemble_weight * (final_prediction_bias.abs() / last_atr).clamp(0.0, 1.5)) * mult;
                 short_reasons.push("Ensemble Bearish Bias");
             }
 
             if is_bull_flow {
-                long_score += kalman_score * settings.kalman_weight;
+                long_signal_count += 1;
+                let mult = get_decay_mult(long_signal_count);
+                long_score += (kalman_score * settings.kalman_weight) * mult;
                 long_reasons.push("Bullish M5 Flow");
 
                 // Fix B: Pullback Buy Logic
                 if is_bear_m1_surge {
-                    long_score += m1_score * settings.m1_surge_weight * 1.5;
+                    long_signal_count += 1;
+                    let mult_m1 = get_decay_mult(long_signal_count);
+                    long_score += (m1_score * settings.m1_surge_weight * 1.5) * mult_m1;
                     long_reasons.push("Discount Entry (Bearish M1 Surge in Bull Trend)");
                 } else if is_bull_m1 {
-                    long_score += m1_score * settings.m1_surge_weight;
+                    long_signal_count += 1;
+                    let mult_m1 = get_decay_mult(long_signal_count);
+                    long_score += (m1_score * settings.m1_surge_weight) * mult_m1;
                     long_reasons.push("M1 Momentum Alignment");
                 }
             }
             if is_bear_flow {
-                short_score += kalman_score * settings.kalman_weight;
+                short_signal_count += 1;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += (kalman_score * settings.kalman_weight) * mult;
                 short_reasons.push("Bearish M5 Flow");
 
                 // Fix B: Pullback Sell Logic
                 if is_bull_m1_surge {
-                    short_score += m1_score * settings.m1_surge_weight * 1.5;
+                    short_signal_count += 1;
+                    let mult_m1 = get_decay_mult(short_signal_count);
+                    short_score += (m1_score * settings.m1_surge_weight * 1.5) * mult_m1;
                     short_reasons.push("Premium Entry (Bullish M1 Surge in Bear Trend)");
                 } else if is_bear_m1 {
-                    short_score += m1_score * settings.m1_surge_weight;
+                    short_signal_count += 1;
+                    let mult_m1 = get_decay_mult(short_signal_count);
+                    short_score += (m1_score * settings.m1_surge_weight) * mult_m1;
                     short_reasons.push("M1 Momentum Alignment");
                 }
             }
 
             if is_bull_flow && is_bull_m1 {
-                long_score += settings.flow_surge_confluence_boost; 
+                let mult = get_decay_mult(long_signal_count);
+                long_score += settings.flow_surge_confluence_boost * mult; 
                 long_reasons.push("Flow+Surge Confluence");
             }
             if is_bear_flow && is_bear_m1 {
-                short_score += settings.flow_surge_confluence_boost;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += settings.flow_surge_confluence_boost * mult;
                 short_reasons.push("Flow+Surge Confluence");
             }
 
             if inducement.as_str() == "bullish_inducement" {
-                long_score += settings.inducement_weight * inducement_score;
+                long_signal_count += 1;
+                let mult = get_decay_mult(long_signal_count);
+                long_score += (settings.inducement_weight * inducement_score) * mult;
                 long_reasons.push("Bullish Inducement");
                 short_score *= settings.inducement_opposing_reduction;
             } else if inducement.as_str() == "bearish_inducement" {
-                short_score += settings.inducement_weight * inducement_score;
+                short_signal_count += 1;
+                let mult = get_decay_mult(short_signal_count);
+                short_score += (settings.inducement_weight * inducement_score) * mult;
                 short_reasons.push("Bearish Inducement");
                 long_score *= settings.inducement_opposing_reduction;
             }
