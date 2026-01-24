@@ -84,6 +84,10 @@ pub struct EvalRequest<'a> {
     #[schema(value_type = Vec<f64>)]
     pub m30_closes: Cow<'a, [f64]>,
     #[schema(value_type = Option<Vec<f64>>)]
+    pub m30_highs: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
+    pub m30_lows: Option<Cow<'a, [f64]>>,
+    #[schema(value_type = Option<Vec<f64>>)]
     pub h1_closes: Option<Cow<'a, [f64]>>,
     #[schema(value_type = Option<Vec<f64>>)]
     pub h1_highs: Option<Cow<'a, [f64]>>,
@@ -165,6 +169,8 @@ pub struct EvalRequest<'a> {
     // New fields for engine mode
     pub mode: Cow<'a, str>, // "scalp" or "swing"
     pub current_price: f64,
+    pub account_equity: Option<f64>,
+    pub account_currency: Option<Cow<'a, str>>,
     /// The predictor model to use (e.g., "gbm", "heston", "lstm").
     pub predictor_model: Option<String>,
 }

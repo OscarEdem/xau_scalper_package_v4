@@ -199,6 +199,8 @@ pub struct MarketDataBuffer {
     pub m15_highs: VecDeque<f64>,
     pub m15_lows: VecDeque<f64>,
     pub m30_closes: VecDeque<f64>,
+    pub m30_highs: VecDeque<f64>,
+    pub m30_lows: VecDeque<f64>,
     pub h1_closes: VecDeque<f64>,
     pub h1_highs: VecDeque<f64>,
     pub h1_opens: VecDeque<f64>,
@@ -233,6 +235,8 @@ impl MarketDataBuffer {
             m15_highs: VecDeque::with_capacity(initial_buffer_size),
             m15_lows: VecDeque::with_capacity(initial_buffer_size),
             m30_closes: VecDeque::with_capacity(initial_buffer_size),
+            m30_highs: VecDeque::with_capacity(initial_buffer_size),
+            m30_lows: VecDeque::with_capacity(initial_buffer_size),
             h1_closes: VecDeque::with_capacity(initial_buffer_size),
             h1_highs: VecDeque::with_capacity(initial_buffer_size),
             h1_opens: VecDeque::with_capacity(initial_buffer_size),
@@ -291,6 +295,8 @@ impl MarketDataBuffer {
         if let Some(ts) = req.last_m30_timestamp {
             if (ts > 0 && ts > self.last_m30_timestamp) || req.m30_closes.len() > settings.sync_threshold {
                 TradingSession::update_buffer(&mut self.m30_closes, &req.m30_closes, settings.max_buffer_size);
+                if let Some(v) = &req.m30_highs { TradingSession::update_buffer(&mut self.m30_highs, v, settings.max_buffer_size); }
+                if let Some(v) = &req.m30_lows { TradingSession::update_buffer(&mut self.m30_lows, v, settings.max_buffer_size); }
                 self.last_m30_timestamp = ts;
             }
         }
@@ -428,6 +434,15 @@ impl TradingSession {
     /// Returns a list of signals that should be notified.
     pub fn on_data(&mut self, req: EvalRequest<'static>, predictor_cache: &PredictorCache, settings_arc: &Arc<RwLock<TradingSettings>>) -> Vec<EvalResponse> {
         let settings = settings_arc.read().expect("TradingSettings RwLock poisoned");
+        
+        // Detect resumption after a long pause (e.g., Weekend or Disconnect)
+        if self.last_evaluation_timestamp > 0 {
+            let gap = req.last_m1_timestamp - self.last_evaluation_timestamp;
+            if gap > 300 {
+                info!(symbol = %self.symbol, gap_seconds = gap, "Market data flow resumed after idle period. Session reactivated.");
+            }
+        }
+
         info!(symbol = %self.symbol, "Processing new data for session with hot-reloaded settings.");
 
         // Update session configuration from global settings
@@ -879,8 +894,7 @@ impl TradingSession {
             scalp_req.upcoming_events = req.upcoming_events.clone();
             scalp_req.predictor_model = Some(predictor_model); 
 
-            // Note: The ScalpEngine::evaluate function must also be updated to accept `&settings.risk`
-            ScalpEngine::evaluate(&scalp_req, predictor_cache, &settings.scalp) // Placeholder, see note
+            ScalpEngine::evaluate(&scalp_req, predictor_cache, &settings.scalp, &settings.risk)
         };
         info!(symbol = %self.symbol, signal_id = %scalp_signal.signal_id, entry_type = %scalp_signal.entry_type, reason = %scalp_signal.reason, "Scalp engine evaluated.");
 
@@ -1267,6 +1281,8 @@ impl TradingSession {
         let m5_timestamps = if !self.market_data.m5_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.m5_timestamps.make_contiguous() as &[i64])) } else { None };
         let m15_timestamps = if !self.market_data.m15_timestamps.is_empty() { Some(Cow::Borrowed(self.market_data.m15_timestamps.make_contiguous() as &[i64])) } else { None };
         let m30_closes = self.market_data.m30_closes.make_contiguous();
+        let m30_highs = if !self.market_data.m30_highs.is_empty() { Some(Cow::Borrowed(self.market_data.m30_highs.make_contiguous() as &[f64])) } else { None };
+        let m30_lows = if !self.market_data.m30_lows.is_empty() { Some(Cow::Borrowed(self.market_data.m30_lows.make_contiguous() as &[f64])) } else { None };
 
         let m15_closes = if !self.market_data.m15_closes.is_empty() { Some(Cow::Borrowed(self.market_data.m15_closes.make_contiguous() as &[f64])) } else { None };
         let m15_highs = if !self.market_data.m15_highs.is_empty() { Some(Cow::Borrowed(self.market_data.m15_highs.make_contiguous() as &[f64])) } else { None };
@@ -1305,6 +1321,8 @@ impl TradingSession {
             m15_lows,
             m15_timestamps,
             m30_closes: Cow::Borrowed(m30_closes),
+            m30_highs,
+            m30_lows,
             h1_closes,
             h1_highs,
             h1_opens,
@@ -1348,9 +1366,12 @@ impl TradingSession {
     }
 
     /// Sets the signals to None, used by the cleanup task.
-    pub fn invalidate_signals(&mut self) {
+    /// Returns true if signals were actually cleared (preventing log spam).
+    pub fn invalidate_signals(&mut self) -> bool {
+        let had_signals = self.latest_scalp_signal.is_some() || self.latest_swing_signal.is_some();
         self.latest_scalp_signal = None;
         self.latest_swing_signal = None;
+        had_signals
     }
 }
 

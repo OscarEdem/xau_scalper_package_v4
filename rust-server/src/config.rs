@@ -302,6 +302,10 @@ pub struct SwingSettings {
     pub fractal_guard_enabled: bool,
     #[serde(default = "default_m15_swing_lookback")]
     pub m15_swing_lookback: usize,
+    #[serde(default = "default_m5_swing_lookback")]
+    pub m5_swing_lookback: usize,
+    #[serde(default = "default_m30_swing_lookback")]
+    pub m30_swing_lookback: usize,
     #[serde(default = "default_fractal_penalty")]
     pub fractal_penalty_score: f64,
     #[serde(default = "default_push_notifications_enabled")]
@@ -361,6 +365,8 @@ impl Default for SwingSettings {
             fvg_lookback: 10,
             fractal_guard_enabled: true,
             m15_swing_lookback: 6,
+            m5_swing_lookback: 60,
+            m30_swing_lookback: 30,
             fractal_penalty_score: 25.0,
             push_notifications_enabled: true,
             push_notification_threshold: 60.0,
@@ -374,6 +380,8 @@ impl Default for SwingSettings {
 
 fn default_fractal_guard_enabled() -> bool { true }
 fn default_m15_swing_lookback() -> usize { 6 }
+fn default_m5_swing_lookback() -> usize { 60 }
+fn default_m30_swing_lookback() -> usize { 30 }
 fn default_fractal_penalty() -> f64 { 25.0 }
 fn default_push_notifications_enabled() -> bool { true }
 fn default_push_notification_threshold() -> f64 { 60.0 }

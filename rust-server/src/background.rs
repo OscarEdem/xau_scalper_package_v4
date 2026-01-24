@@ -33,8 +33,9 @@ pub fn spawn_stale_signal_cleanup_task(state: Arc<ApplicationStateWithTicks>, mu
             for symbol in stale_symbols {
                 if let Some(session_arc) = sessions.get(&symbol) {
                     let mut session = session_arc.lock().await;
-                    session.invalidate_signals();
-                    info!(event = "stale_invalidation", symbol = %symbol, "Invalidated stale signals for symbol: {}", symbol);
+                    if session.invalidate_signals() {
+                        info!(event = "stale_invalidation", symbol = %symbol, "Invalidated stale signals for symbol: {}", symbol);
+                    }
                 }
             }
         }
