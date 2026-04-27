@@ -374,7 +374,7 @@ void ProcessData(bool manual_force)
                             "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
                             "\"currentPrice\":%.5f,\"accountEquity\":%.2f,\"accountCurrency\":\"%s\",\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
                             "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
-                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],\"m5Timestamps\":[%s],""
+                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],\"m5Timestamps\":[%s],"
                             "\"m15Closes\":[%s],\"m15Highs\":[%s],\"m15Lows\":[%s],\"m15Timestamps\":[%s],"
                             "\"m30Closes\":[%s],\"m30Highs\":[%s],\"m30Lows\":[%s],"
                             "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],\"h1Timestamps\":[%s],"
