@@ -235,7 +235,7 @@ void ProcessData(bool manual_force)
 
 // Build the JSON payload
    string m1_opens_str = "", m1_closes_str = "", m1_highs_str = "", m1_lows_str = "", m1_volumes_str = "";
-   string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "", h1_opens_str = "";
+   string m5_closes_str = "", m5_highs_str = "", m5_lows_str = "", m5_timestamps_str = "", h1_opens_str = "";
    string m15_closes_str = "", m15_highs_str = "", m15_lows_str = "", m15_timestamps_str = "";
    string m30_closes_str = "", m30_highs_str = "", m30_lows_str = "", h1_closes_str = "", h1_highs_str = "", h1_lows_str = "", h1_timestamps_str = "";
    string h4_closes_str = "", h4_highs_str = "", h4_lows_str = "", h4_timestamps_str = "";
@@ -264,13 +264,15 @@ void ProcessData(bool manual_force)
       for(int i = 0; i < ArraySize(m5_rates); i++)
         {
          m5_closes_str += DoubleToString(m5_rates[i].close, _Digits);
-         m5_highs_str += DoubleToString(m5_rates[i].high, _Digits);
-         m5_lows_str += DoubleToString(m5_rates[i].low, _Digits);
+         m5_highs_str  += DoubleToString(m5_rates[i].high, _Digits);
+         m5_lows_str   += DoubleToString(m5_rates[i].low, _Digits);
+         m5_timestamps_str += IntegerToString(m5_rates[i].time); // FIX: Send real M5 timestamps
          if(i < ArraySize(m5_rates) - 1)
            {
             m5_closes_str += ",";
-            m5_highs_str += ",";
-            m5_lows_str += ",";
+            m5_highs_str  += ",";
+            m5_lows_str   += ",";
+            m5_timestamps_str += ",";
            }
         }
      }
@@ -372,7 +374,7 @@ void ProcessData(bool manual_force)
                             "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
                             "\"currentPrice\":%.5f,\"accountEquity\":%.2f,\"accountCurrency\":\"%s\",\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
                             "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
-                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],"
+                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],\"m5Timestamps\":[%s],""
                             "\"m15Closes\":[%s],\"m15Highs\":[%s],\"m15Lows\":[%s],\"m15Timestamps\":[%s],"
                             "\"m30Closes\":[%s],\"m30Highs\":[%s],\"m30Lows\":[%s],"
                             "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],\"h1Timestamps\":[%s],"
@@ -391,7 +393,7 @@ void ProcessData(bool manual_force)
                             _Symbol,
                             ask, equity, account_currency, spread_pts, _Digits, last_m1_timestamp,
                             m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
-                            m5_closes_str, m5_highs_str, m5_lows_str,
+                            m5_closes_str, m5_highs_str, m5_lows_str, m5_timestamps_str,
                             m15_closes_str, m15_highs_str, m15_lows_str, m15_timestamps_str, m30_closes_str, m30_highs_str, m30_lows_str,
                             h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str, h1_timestamps_str,
                             h4_closes_str, h4_highs_str, h4_lows_str, h4_timestamps_str,

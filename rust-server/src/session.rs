@@ -401,7 +401,7 @@ impl TradingSession {
             active_trade_latch_time: 0,
             last_swing_eval_time: 0,
             pending_re_entry: None,
-            execution: ExecutionManager::new(true, false), // Scalp: Allow pyramiding, Normal mode
+            execution: ExecutionManager::new(false, false), // Scalp: Disable pyramiding/averaging to prevent adding to losers
             swing_execution: ExecutionManager::new(true, true), // Swing: Pyramiding YES, Strict Reversal YES
             broadcast_tx,
             db,
@@ -610,24 +610,55 @@ impl TradingSession {
         
         info!(symbol = %self.symbol, signal_id = %swing_signal.signal_id, entry_type = %swing_signal.entry_type, reason = %swing_signal.reason, "Swing engine evaluated.");
 
-        // --- ID STABILIZATION & HYSTERESIS ---
+        // --- NEW: Calculate Real-Time PnL of the Active Idea ---
+        // This detects "Success Blindness" -> failing trades that haven't hit SL yet.
+        let mut current_pnl_pct = 0.0;
+        let mut active_direction = SignalDirection::None;
+        
+        if let Some(existing) = &self.latest_swing_signal {
+            if existing.entry_price > 0.0 && existing.entry_type != SignalDirection::None {
+                active_direction = existing.entry_type.clone();
+                current_pnl_pct = match existing.entry_type {
+                    SignalDirection::Long => (req.current_price - existing.entry_price) / existing.entry_price,
+                    SignalDirection::Short => (existing.entry_price - req.current_price) / existing.entry_price,
+                    _ => 0.0,
+                };
+            }
+        }
 
-        // 1. Check if we have an active trade ID tracked in the SESSION (not just the last signal)
+        // --- ID STABILIZATION, FLIP OVERRIDE, & KILL SWITCH ---
+
         if let Some(active_id) = &self.active_swing_trade_id {
             
-            // Scenario A: Engine confirms the active trade
-            if swing_signal.signal_id == *active_id {
+            // 1. REVERSE & FLIP CHECK
+            // Does the NEW signal contradict the ACTIVE trade?
+            let is_reversal = swing_signal.entry_type != SignalDirection::None && swing_signal.entry_type != active_direction;
+            
+            // If it's a reversal, is it strong enough to override? (Conviction > Threshold)
+            // We trust the SwingEngine's score here. If it generated a signal, it passed the base threshold.
+            if is_reversal {
+                tracing::info!(symbol = %self.symbol, old=%active_direction, new=%swing_signal.entry_type, "FLIP DETECTED: Bias Shifted. Overriding active trade.");
+                
+                // FORCE UPDATE: The new signal wins. Update the active ID immediately.
+                self.active_swing_trade_id = Some(swing_signal.signal_id.clone());
+                self.active_trade_latch_time = req.last_m1_timestamp;
+            }
+            // 2. SAME ID CONFIRMATION
+            else if swing_signal.signal_id == *active_id {
                  self.active_trade_latch_time = req.last_m1_timestamp; // Refresh latch
             } 
-            // Scenario B: Engine returns "None" (Conviction Drop) OR a new ID (Structural Shift)
+            // 3. ZOMBIE HANDLING (Engine sees "None", but we are in a trade)
             else {
-                // Check if we are within the "Grace Period" (e.g., 1 hour)
-                // This prevents a momentary drop in conviction from killing the trade ID
                 let grace_period = 3600; 
                 let within_grace = (req.last_m1_timestamp - self.active_trade_latch_time) < grace_period;
 
-                if within_grace && swing_signal.entry_type == SignalDirection::None {
-                    // FORCE THE OLD ID onto the "None" signal
+                // KILL SWITCH: If trade is failing (> 0.25% loss) AND engine is silent, KILL IT.
+                // Do not resurrect a failing trade.
+                // Note: 0.0025 (0.25%) is a tighter "soft stop" than your hard SL usually.
+                let is_failing = current_pnl_pct < -0.0025; 
+
+                if within_grace && !is_failing && swing_signal.entry_type == SignalDirection::None {
+                    // RESURRECTION: Trade is healthy/flat, just noise. Hold the line.
                     swing_signal.signal_id = active_id.clone();
                     
                     // Restore state from latest_swing_signal to maintain "Holding" status
@@ -640,14 +671,22 @@ impl TradingSession {
                              swing_signal.tp2_price = existing.tp2_price;
                              swing_signal.tp3_price = existing.tp3_price;
                              swing_signal.debug_info = existing.debug_info.clone();
-                             swing_signal.reason = format!("Holding (Low Conviction): {}", swing_signal.reason);
+                             swing_signal.reason = format!("Holding (Grace Period): {}", swing_signal.reason);
                         }
                     }
-                } else if !within_grace && swing_signal.entry_type == SignalDirection::None {
-                    // Grace period over. Trade is dead.
+                } else if !within_grace || is_failing {
+                    // Grace period over OR Trade is failing.
+                    if is_failing {
+                         tracing::info!(symbol = %self.symbol, pnl=current_pnl_pct, "KILL SWITCH: Active trade invalidated by adverse excursion.");
+                    }
+                    // Trade is dead. Release the ID.
                     self.active_swing_trade_id = None;
+                    
+                    // Note: swing_signal is already "None" (or a different ID) here, so we let it pass through.
+                    // This allows the system to go "Flat".
                 } else if swing_signal.entry_type != SignalDirection::None {
-                    // Engine found a totally NEW valid signal (different ID). Overwrite active trade.
+                    // Engine found a totally NEW valid signal (different ID, same direction, or weak reversal).
+                    // Update active trade.
                     self.active_swing_trade_id = Some(swing_signal.signal_id.clone());
                     self.active_trade_latch_time = req.last_m1_timestamp;
                 }
@@ -673,45 +712,38 @@ impl TradingSession {
                                 .last().cloned().unwrap_or(0.0);
 
         // --- Trade Management & Persistence Logic ---
-        // 1. Check if we have an existing active trade
         let mut active_trade_closed = false;
 
+        // NEW: FLIP MANAGEMENT
+        // If we just flipped (found a new signal opposite to the old one), 
+        // we assume the old one is closed implicitly by the new one opening.
+        // However, we should check if we need to explicitly notify a "Close" for the old one first.
+        
         if let Some(existing) = &self.latest_swing_signal {
             if existing.entry_type != SignalDirection::None {
 
-                // Case A: Engine confirms the SAME trade (ID matches)
-                if swing_signal.signal_id == existing.signal_id {
-                    // Run standard management (Latch & SL-hit detection) on the NEW signal.
-                    // NOTE: We DO NOT move SLs here; SL adjustments are managed externally by the user.
+                // If ID Changed AND Direction Changed -> It's a FLIP.
+                if swing_signal.signal_id != existing.signal_id && 
+                   swing_signal.entry_type != SignalDirection::None && 
+                   swing_signal.entry_type != existing.entry_type {
+                       
+                    tracing::info!("Managing Flip: Implicitly closing old {} trade.", existing.entry_type);
+                    // We don't need to manually close here because the ExecutionManager 
+                    // handles reversals, but we ensure 'active_trade_closed' is false 
+                    // so we don't double-notify.
+                } 
+                // Standard Management
+                else if swing_signal.signal_id == existing.signal_id {
                     self.manage_active_swing_trade(&mut swing_signal, req.current_price, req.last_m1_timestamp, h1_atr);
                 } 
-                // Case B: Engine says "None" or "New ID", but we are holding a trade.
-                // We must manually check the EXISTING trade for SL/TP hits.
                 else {
-                    // Create a mutable copy of the existing trade to check against price
+                    // Check the OLD trade for SL hits before discarding it
                     let mut managed_existing = existing.clone();
                     self.manage_active_swing_trade(&mut managed_existing, req.current_price, req.last_m1_timestamp, h1_atr);
 
                     if managed_existing.entry_type == SignalDirection::None {
-                        // SL was hit during management!
-                        // We adopt this "Close" signal as the current swing_signal to notify the user.
                         swing_signal = managed_existing;
                         active_trade_closed = true;
-                    } else {
-                        // Trade is still healthy, but Engine is silent or found something else.
-                        // If the Engine found a NEW valid trade (different ID), we generally prioritize the NEW one (Pyramiding?).
-                        // But if Engine found "none", we MUST persist the existing trade.
-                        if swing_signal.entry_type == SignalDirection::None {
-                            swing_signal = managed_existing; // Keep holding
-                            // Don't treat this as a "new" signal for notification, just persistence.
-                        } else {
-                            // Engine found a NEW trade. 
-                            // For this system (Single Trade per Session), we usually ignore new if old is active,
-                            // UNLESS Pyramiding is handled elsewhere. 
-                            // For safety/simplicity here: We let the NEW signal override the OLD one in memory 
-                            // (effectively closing the old one implicitly, or just losing track of it).
-                            // Ideally, we should notify "Close" of old before "Open" of new, but let's stick to the new signal.
-                        }
                     }
                 }
             }
@@ -905,16 +937,10 @@ impl TradingSession {
                 && scalp_trend != self.swing_trend {
                 info!(
                     symbol = %self.symbol,
-                    "Scalp signal ({:?}) conflicts with swing trend ({:?}). Adding caution warning.",
+                    "Scalp signal ({:?}) conflicts with swing trend ({:?}). BLOCKED.",
                     scalp_trend, self.swing_trend
                 );
-                // Warn user but allow signal
-                let trend_desc = match self.swing_trend {
-                    TrendDirection::Up => "Upward",
-                    TrendDirection::Down => "Downward",
-                    _ => "Sideways",
-                };
-                scalp_signal.reason = format!("(Counter-Trend: {}): {}", trend_desc, scalp_signal.reason);
+                return notifications;
             }
         }
 
@@ -923,7 +949,7 @@ impl TradingSession {
         // Execution parameters (TODO: Move to TradingSettings for runtime config)
         let cooldown_seconds = 300;
         let pyramiding_threshold = 0.0015; // 0.15%
-        let averaging_threshold = 0.0005; // 0.05%
+        let averaging_threshold = 0.0025; // 0.25% - Increased to prevent rapid averaging into losers
         let rapid_reversal_seconds = 300; // Increased to 5m to prevent ping-pong
 
         // Require significantly higher conviction to override rapid reversal check

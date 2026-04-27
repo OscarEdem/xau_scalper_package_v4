@@ -19,6 +19,10 @@ struct MarketStructure {
     is_bos_bearish: bool,
     is_choch_bullish: bool, // Change of Character
     is_choch_bearish: bool,
+    /// True when price has broken a structural level AND retested it from the other side.
+    /// Prevents entries on the breakout candle itself (the most common swing loss cause).
+    bos_bullish_retested: bool,
+    bos_bearish_retested: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -501,8 +505,32 @@ impl SwingEngine {
         let current_close = *closes.last().unwrap();
 
         // BOS: Breaking structure in the direction of the trend
-        if is_uptrend && current_close > structure.external_high.1 { structure.is_bos_bullish = true; }
-        if is_downtrend && current_close < structure.external_low.1 { structure.is_bos_bearish = true; }
+        if is_uptrend && current_close > structure.external_high.1 {
+            structure.is_bos_bullish = true;
+            // BOS Retest Check: Is price now pulling back toward the broken level?
+            // We require price to close within 0.5 ATR of the broken high to confirm retest.
+            let atr_approx = if closes.len() > 14 {
+                let slice = &closes[closes.len()-14..];
+                let range: f64 = slice.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / 13.0;
+                range.max(0.0001)
+            } else { 1.0 };
+            let retest_zone = structure.external_high.1 + atr_approx * 0.5;
+            if current_close <= retest_zone {
+                structure.bos_bullish_retested = true;
+            }
+        }
+        if is_downtrend && current_close < structure.external_low.1 {
+            structure.is_bos_bearish = true;
+            let atr_approx = if closes.len() > 14 {
+                let slice = &closes[closes.len()-14..];
+                let range: f64 = slice.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / 13.0;
+                range.max(0.0001)
+            } else { 1.0 };
+            let retest_zone = structure.external_low.1 - atr_approx * 0.5;
+            if current_close >= retest_zone {
+                structure.bos_bearish_retested = true;
+            }
+        }
 
         // CHoCH: Breaking structure against the trend
         if is_uptrend && current_close < structure.internal_low.1 { structure.is_choch_bearish = true; }
@@ -577,7 +605,7 @@ impl SwingEngine {
         let body_size = (current_close - current_open).abs();
         let rsi_val = rsi(req.h1_closes.as_ref()?.as_ref(), settings.displacement_rsi_period).last().cloned().unwrap_or(50.0);
 
-        if structure.is_bos_bullish || structure.is_choch_bullish {
+        if (structure.is_bos_bullish && structure.bos_bullish_retested) || structure.is_choch_bullish {
             return Some(SetupDriver::BosRetest(DisplacementQuality {
                 direction: SignalDirection::Long,
                 strength_atr: body_size / last_atr,
@@ -586,7 +614,7 @@ impl SwingEngine {
             }));
         }
 
-        if structure.is_bos_bearish || structure.is_choch_bearish {
+        if (structure.is_bos_bearish && structure.bos_bearish_retested) || structure.is_choch_bearish {
             return Some(SetupDriver::BosRetest(DisplacementQuality {
                 direction: SignalDirection::Short,
                 strength_atr: body_size / last_atr,

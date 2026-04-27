@@ -177,6 +177,10 @@ pub struct ScalpSettings {
     #[serde(default = "default_push_notification_threshold")]
     pub push_notification_threshold: f64,
     // (swing evaluation knobs moved to `SwingSettings`)
+    #[serde(default = "default_pullback_entry_displacement_atr")]
+    pub pullback_entry_displacement_atr: f64,
+    #[serde(default = "default_momentum_require_ml_confluence")]
+    pub momentum_require_ml_confluence: bool,
 }
 
 impl Default for ScalpSettings {
@@ -185,9 +189,9 @@ impl Default for ScalpSettings {
             min_data_len: 60,
             atr_period: 14,
             kalman_period: 20,
-            base_kalman_threshold: 0.12,
-            base_m1_surge_threshold: 0.9,
-            min_conviction: 50.0,
+            base_kalman_threshold: 0.08, // Lowered to catch trends earlier
+            base_m1_surge_threshold: 0.20, // Sniper: Catch smaller initial impulses (0.2 ATR)
+            min_conviction: 60.0,
             max_limit_dist_atr_mult: 0.6,
             htf_bias_weight: 0.35,
             ensemble_weight: 0.25,
@@ -214,11 +218,11 @@ impl Default for ScalpSettings {
             fade_tp1_atr_mult: 1.0,
             fade_max_adx: 30.0,
             momentum_risk_atr_mult: 0.24,
-            momentum_tp1_atr_mult: 0.7,
-            momentum_tp2_atr_mult: 1.3,
+            momentum_tp1_atr_mult: 1.5, // Widened from 0.7
+            momentum_tp2_atr_mult: 3.0, // Widened from 1.3
+            pullback_tp1_atr_mult: 1.0, // Widened from 0.5
+            pullback_tp2_atr_mult: 2.0, // Widened from 1.0
             pullback_sl_atr_mult: 0.09,
-            pullback_tp1_atr_mult: 0.5,
-            pullback_tp2_atr_mult: 1.0,
             min_sl_atr_mult: 0.15,
             max_sl_atr_mult: 1.5,
             kalman_weight: 0.6,
@@ -227,21 +231,25 @@ impl Default for ScalpSettings {
             allow_asia_trading: false,
             allow_london_open_momentum: false,
             allow_ny_late_momentum: false,
-            m1_roc_period: 3,
+            m1_roc_period: 3, // FIXED: Require 3-bar sustained M1 move (was 1 — single-bar noise)
             m1_atr_conversion_div: 5.0,
             vol_regime_clamp_min: 0.5,
             vol_regime_clamp_max: 2.0,
             flow_threshold_mult: 0.5,
             inducement_opposing_reduction: 0.5,
             momentum_min_risk_atr: 0.21,
-            filter_scalp_by_swing: false,
+            filter_scalp_by_swing: true, // ENABLED: Only scalp in the direction of H1 swing bias
             push_notifications_enabled: true,
             push_notification_threshold: 60.0,
+            pullback_entry_displacement_atr: 0.30, // RAISED: Require deeper pullbacks to fair value (was 0.20)
+            momentum_require_ml_confluence: true,
             // note: swing evaluation knobs belong to `SwingSettings`
         }
     }
 }
 
+fn default_pullback_entry_displacement_atr() -> f64 { 0.20 }
+fn default_momentum_require_ml_confluence() -> bool { true }
 fn default_eval_on_h1_only() -> bool { false }
 fn default_eval_atr_multiplier() -> f64 { 1.5 }
 fn default_eval_struct_margin_atr() -> f64 { 0.5 }
@@ -328,7 +336,7 @@ impl Default for SwingSettings {
         Self {
             min_data_len: 60,
             atr_period: 14,
-            conviction_threshold: 50.0,
+            conviction_threshold: 62.0, // RAISED: Require at least 2-3 confluence factors (was 50.0)
             htf_bias_weight: 30.0,
             sfp_weight_mult: 0.5,
             displacement_weight_mult: 0.4,

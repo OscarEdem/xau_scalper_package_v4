@@ -5,6 +5,7 @@
 ### A High-Performance Algorithmic Trading System for XAU/USD
 
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
 ![MQL5](https://img.shields.io/badge/MQL5-0053A3?style=for-the-badge&logo=mql5&logoColor=white)
 ![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
 
@@ -12,191 +13,250 @@
 
 ---
 
-**XAU Scalper Bridge** is a sophisticated, multi-component algorithmic trading system designed for scalping and swing trading the XAU/USD (Gold) market. It leverages a high-performance Rust backend for complex signal analysis, incorporating AI models (LSTM, GBM, Heston) and institutional trading concepts (Smart Money Concepts).
+**XAU Scalper Bridge** is a three-component algorithmic trading system for scalping and swing trading XAU/USD (Gold). A Rust backend generates AI-powered trade signals. A Python sidecar consumes those signals via WebSocket and executes trades through the MetaTrader 5 API. An MQL5 EA feeds live market data to the server.
 
-The core philosophy is to trade **quality over quantity** by waiting for a confluence of technical factors across multiple timeframes before executing a trade.
+> **Philosophy:** Trade quality over quantity — wait for a confluence of technical factors across multiple timeframes before executing.
+
+---
 
 ## 🏛️ System Architecture
 
-The system is composed of two primary components that work in tandem:
-
-1.  **Rust Server (The Brain):** A powerful `axum` web server that receives market data from the EA. It performs complex, multi-timeframe analysis using a pre-defined strategy to calculate a trade signal and a "conviction score". It also acts as a central repository for all trade history.
-    *   **Engines:** Scalp Engine (Kalman Filter, Momentum) and Swing Engine (Market Structure, Liquidity).
-    *   **AI Integration:** Uses ONNX runtime for LSTM models and Google Gemini for fundamental macro analysis.
-    *   **Notification Hub:** Sends push notifications via Expo and broadcasts live data via WebSockets.
-
-2.  **MQL5 Expert Advisor (The Bridge):** An EA that runs on the MetaTrader 5 chart. Its primary job is to collect M1, M5, and H1 market data and send it to the Rust server.
-
 ```
-+---------------------------+      (1) Market Data (M1/M5)      +---------------------+
-|                           |----------------------------------->|                     |
-|   MetaTrader 5 Terminal   |              (JSON)                |     Rust Server     |
-|      (MQL5 EA)            |<-----------------------------------|      (The Brain)      |
-|                           |  (2) Trade Signal & Conviction     |                     |
-+---------------------------+              (JSON)                +---------------------+
-           |
-           | (3) Open/Close/Log Trades
-           v
-+---------------------------+
-|                           |
-|      Trading Broker       |
-|                           |
-+---------------------------+
+┌──────────────────────────────────────────────────────────────────────┐
+│  MT5 Terminal                                                        │
+│                                                                      │
+│  XAU_DATA_BRIDGE.mq5   ─── POST /data (every M1 bar) ─────────────►│
+│  (Market Data Sender)  ─── POST /ticks (every 500ms) ─────────────►│
+└──────────────────────────────────────────────────────────────────────┘
+                                                    │
+                                                    ▼
+                              ┌──────────────────────────────────────┐
+                              │  Rust Server  (The Brain)            │
+                              │  hosted on Render / Docker           │
+                              │                                      │
+                              │  ├─ ScalpEngine (M1 / M5)           │
+                              │  │   ├─ LondonHunt                  │
+                              │  │   ├─ Momentum (Kalman)           │
+                              │  │   ├─ Pullback (2-bar confirm)    │
+                              │  │   └─ Fade (Bollinger + ADX)      │
+                              │  └─ SwingEngine (H1 / H4 / D1)     │
+                              │      ├─ HTF Bias (Daily + H4)       │
+                              │      ├─ BOS / CHoCH retest latch    │
+                              │      ├─ OB + FVG Detection          │
+                              │      └─ Ensemble (GBM/LSTM/Heston)  │
+                              │                                      │
+                              │  Signal ──► WebSocket /ws ──────────┼──►
+                              └──────────────────────────────────────┘  │
+                                                                         │
+                              ┌──────────────────────────────────────┐  │
+                              │  Python Sidecar  (The Executor)      │◄─┘
+                              │  xau_controller.py + mt5_interface   │
+                              │                                      │
+                              │  ├─ WebSocket signal consumer        │
+                              │  ├─ Mode / Session / Conviction gate │
+                              │  ├─ mt5.order_send() execution       │
+                              │  ├─ ATR-capped trailing SL          │
+                              │  └─ Stagnation time-stop (5 min)    │
+                              └──────────────────────────────────────┘
+                                              │
+                                              ▼
+                                     MetaTrader 5 Broker
 ```
+
+---
 
 ## ✨ Key Features
 
--   **Multi-Timeframe Analysis:** Uses M5 data for trend direction and M1 data for precise entries, filtering out market noise.
--   **Confluence-Based Strategy:** Executes trades only when **five** distinct technical conditions align, generating a "Conviction Score" for each potential signal.
--   **Dynamic Risk Management:** Automatically adjusts lot size based on the conviction score, risking more on "A+" setups and less (or nothing) on weaker signals.
--   **Advanced Trailing Stop:** Implements an ATR-based "Chandelier Exit" to let winning trades run and protect profits adaptively based on market volatility.
--   **Generative AI Analysis:** Integrates Google Gemini to parse economic news events and generate human-readable daily/weekly fundamental bias reports.
--   **Centralized Trade Analytics API:** All trades are logged to the server, which exposes an interactive API (`/history`) with performance statistics (P/L, Win Rate, Profit Factor) and date filtering.
--   **Interactive API Documentation:** Automatically generated Swagger UI provides a beautiful and easy-to-use interface for exploring the server's API.
--   **High-Performance Backend:** Built in Rust for speed, safety, and reliability, ensuring signals are processed with minimal latency.
--   **Comprehensive MQL5 Dashboard:** A clean, modern on-chart interface displays the current signal, server status, market info, and key indicator values in real-time.
--   **Dockerized Deployment:** Fully containerized with a multi-stage `Dockerfile` for easy, consistent deployment on any cloud server or local machine.
--   **Parallelized Backtester:** Includes a powerful, multi-threaded backtester written in Rust to rapidly optimize strategy parameters over historical data.
+- **Three-component pipeline:** Data bridge (MQL5) → Signal engine (Rust) → Executor (Python)
+- **Multi-timeframe analysis:** M1/M5 for scalp entries, H1/H4/D1 for swing bias
+- **SMC signal logic:** BOS retest latch, FVG/OB bounces, SFP detection
+- **Dynamic conviction scoring:** LondonHunt and Fade scores scale with setup quality
+- **AI ensemble:** LSTM + GBM + Heston models provide directional bias confirmation
+- **Server-side position sizing:** Lot size = equity% / (SL distance × point value)
+- **Session-aware gating:** Momentum blocked in Asia and late-NY; Sydney scalps disabled
+- **Stagnation time-stop:** Scalp trades auto-close after 5 min if flat
+- **ATR-capped trailing:** Trailing stop can only tighten, never widen
+- **Push notifications:** Expo push alerts for high-conviction signals
+- **WebSocket live feed:** Real-time tick broadcast to sidecar and dashboards
+- **Dockerized deployment:** Multi-stage `Dockerfile` for Render or any cloud
+- **Interactive API docs:** Swagger UI at `/docs`
 
 ---
 
-## 🚀 Installation and Usage
+## 🚀 Quick Start
 
 ### Prerequisites
--   Rust Language Toolchain
--   Docker Desktop
--   MetaTrader 5 Terminal
 
-### 1. The Rust Server
+- Rust toolchain (`rustup`)
+- Python 3.10+ with `pip`
+- MetaTrader 5 Terminal (Windows)
+- Docker Desktop (optional)
 
-The server is the core analytical engine.
+---
 
-#### Build and Run Locally:
+### 1. Rust Server
+
 ```bash
-# Navigate to the project root directory
-cd /path/to/xau_scalper_package_v4-main
-
-# Build the server in release mode
+# Build and run locally
+cd xau_scalper_package_v4-main
 cargo build --release --package xau-scalper-server
-
-# Run the server
 ./target/release/xau-scalper-server
-```
 
-#### Build and Run with Docker:
-```bash
-# Build the Docker image
+# OR via Docker
 docker build -t xau-scalper-v4 .
-
-# Run the server inside a container
 docker run --rm -p 3000:3000 xau-scalper-v4
 ```
-The server will be accessible at `http://127.0.0.1:3000`.
 
-### 2. The MQL5 Expert Advisor
+The server starts at `http://0.0.0.0:3000`.
 
-The EA connects MetaTrader 5 to your Rust server.
+**Key environment variable overrides:**
 
-1.  **Copy the EA File:** Copy `mt5-ea/XAU_ScalperBridge_Fixed.mq5` into your MT5 data folder under `MQL5/Experts/`.
-2.  **Compile:** Open MetaEditor in MT5, find the EA in the Navigator, and press `F7` to compile it.
-3.  **Configure MT5:**
-    -   Go to `Tools -> Options -> Expert Advisors`.
-    -   Check `Allow WebRequest for listed URL`.
-    -   Add `http://127.0.0.1:3000`.
-4.  **Attach to Chart:**
-    -   Open an **M1** chart for **XAUUSD**.
-    -   Drag the `XAU_ScalperBridge_Fixed` EA onto the chart.
-    -   In the **"Inputs"** tab, ensure the parameters are set correctly. **Crucially, set `NumCloses` to `250` or higher** to provide enough data to the server.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `APP__SERVER__PORT` | Listening port | `3000` |
+| `APP__TRADING__SCALP__M1_ROC_PERIOD` | M1 surge lookback bars | `3` |
+| `APP__TRADING__SWING__CONVICTION_THRESHOLD` | Min swing score to emit signal | `62.0` |
+| `APP__TRADING__RISK__RISK_PER_TRADE_PCT` | Equity % risked per trade | `0.01` |
+| `DATABASE_URL` | PostgreSQL connection string | _(optional)_ |
 
-### 3. Running the System
-
-With both the server running and the EA attached to the chart, the system is live. The EA will send data on each new M1 bar, and the on-chart dashboard will update with the server's response.
+> All fields in `config.rs` can be overridden at runtime with `APP__TRADING__SCALP__<FIELD>` or `APP__TRADING__SWING__<FIELD>` env vars.
 
 ---
 
-## 🔬 API and Analytics
+### 2. MQL5 Data Bridge
 
-The server provides a powerful interface for monitoring and analysis.
+`XAU_DATA_BRIDGE.mq5` sends OHLCV market data to the Rust server. **It does NOT execute trades.**
 
-### Interactive API Docs (Swagger UI)
+1. Copy `mt5-ea/XAU_DATA_BRIDGE.mq5` → MT5 `MQL5/Experts/`
+2. Compile in MetaEditor (`F7`)
+3. `Tools → Options → Expert Advisors → Allow WebRequest` — add your server URL
+4. Attach to an **M1 XAUUSD** chart
 
-Navigate to `http://127.0.0.1:3000/docs` in your browser to see a full, interactive documentation of all available API endpoints.
+**EA Parameters:**
 
-### API Endpoints
-
-| Method | Endpoint               | Description                                                                 |
-| :----- | :------------ | :------------------------------------------------------------------------------------------------------ |
-| `POST` | `/data`       | The core endpoint used by the EA to process market data.                                                |
-| `POST` | `/ticks`      | Ingests live tick data for WebSocket broadcasting.                                                      |
-| `GET`  | `/signals`    | Returns a log of all signals generated in the last 12 hours.                                            |
-| `GET`  | `/signals/latest` | Returns the latest signals for all active symbols.                                                  |
-| `GET`  | `/signals/{symbol}` | Returns the latest signals for a specific symbol.                                                 |
-| `GET`  | `/analysis/fundamental` | Generates a macro economic outlook report using Gemini AI. Params: `symbol`, `period`. |
-| `GET`  | `/definitions/reasons` | Returns a dictionary of signal reasons and their explanations.                                 |
-| `GET`  | `/models/loaded` | Returns a list of currently loaded predictor models.                                                 |
-| `GET`  | `/metrics`    | Returns server performance and usage metrics.                                                           |
-| `GET`  | `/metrics/prometheus` | Returns metrics in Prometheus format.                                                           |
-| `GET`  | `/health`     | A simple health check endpoint that returns "OK".                                                       |
-
-### Analyzing Performance
-
-To view the recent signal history, access the signals endpoint in your browser:
-
-`http://127.0.0.1:3000/signals`
+| Parameter | Description | Recommended |
+|-----------|-------------|-------------|
+| `ServerUrl` | Rust server base URL | `https://gold-ml-base-server.onrender.com` |
+| `NumCloses` | Historical bars sent per timeframe | `300` (min 250) |
+| `MaxSpreadPoints` | Skip send if spread exceeds this | `162` |
+| `EnableTickBridge` | Send live ticks to `/ticks` | `true` |
+| `TickBridgeInterval` | Min ms between tick posts | `500` |
 
 ---
 
-## ⚙️ EA Parameters
+### 3. Python Sidecar (Trade Executor)
 
-The MQL5 EA has several input parameters for customization:
+The sidecar receives signals over WebSocket and places/manages trades via the MT5 Python API.
 
-| Parameter              | Description                                                                    | Default Value |
-| ---------------------- | ------------------------------------------------------------------------------ | ------------- |
-| `ServerUrl`            | The URL of the Rust server's `/data` endpoint.                                 | `http://127.0.0.1:3000/data` |
-| `RiskPercent`          | The percentage of account balance to risk on a full-conviction trade. | `0.5`         |
-| `NumCloses`            | **IMPORTANT:** Number of historical bars to send to the server. Must be > 202. | `80` (Change to `250`) |
-| `MaxSpreadPoints`      | The maximum allowed spread in points to place a trade.                         | `160`         |
-| `MagicNumber`          | A unique ID to distinguish this EA's trades from others.                       | `1337`        |
-| `RsiPeriod`            | The period for the RSI indicator.                                              | `16`          |
-| `EmaFastPeriod`        | The period for the fast EMA.                                                   | `5`           |
-| `EmaSlowPeriod`        | The period for the slow EMA.                                                   | `50`          |
-| `AtrPeriod`            | The period for the ATR indicator.                                              | `14`          |
-| `SlAtrMultiplier`      | The multiplier for calculating the initial Stop Loss based on ATR.             | `1.0`         |
-| `TpAtrMultiplier`      | The multiplier for calculating the initial Take Profit based on ATR.           | `1.5`         |
-| `UseTrailingStop`      | Enables or disables the ATR-based trailing stop.                               | `true`        |
-| `TrailingStopATRMlt`   | The ATR multiplier for the trailing stop.                                      | `1.0`         |
-| `EnableServerLogging`  | Enables or disables sending trade logs to the server.                          | `true`        |
+> 📄 Full documentation: **[Python_Sidecar/README.md](../Python_Sidecar/README.md)**
+
+```bash
+cd Python_Sidecar
+pip install -r requirements.txt
+python xau_controller.py
+# OR double-click run_bot.bat
+```
+
+**Critical config values (set in GUI Settings or `config.py`):**
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `max_entries` | `1` | No stacking — one position per signal |
+| `min_conviction` | `60.0` | Filter low-confluence signals |
+| `trailing_start_pips_scalp` | `12.0` | Activate early to protect median wins |
+| `trailing_dist_pips_scalp` | `15.0` | ATR trail capped here (tighten only) |
+| `stagnation_sec` | `300` | Hard-close scalps after 5 min |
+| `use_stagnation` | `true` | Must be enabled |
 
 ---
 
-## ⚡ Backtesting and Optimization
+## ⚙️ Strategy Configuration
 
-The project includes a high-speed, parallelized backtester to find the optimal strategy parameters.
+All server-side parameters are in `rust-server/src/config.rs` and override-able via `config.toml` or `APP__` env vars.
 
-1.  **Prepare Data:** Ensure you have `m1_data_comma.csv` and `m5_data_comma.csv` in the `/app` directory inside the container. The `Dockerfile` handles the conversion from the raw MT5 export format.
+### Scalp Engine (v4.2 defaults)
 
-2.  **Run the Backtester:** Use Docker to run the backtester binary. This command will test thousands of parameter combinations in parallel.
+| Parameter | Value | Change from v4.1 |
+|-----------|-------|-----------------|
+| `m1_roc_period` | `3` | Was `1` — now requires 3-bar sustained surge |
+| `min_conviction` | `60.0` | Was `50.0` |
+| `pullback_entry_displacement_atr` | `0.30` | Was `0.20` — deeper pullbacks only |
+| `filter_scalp_by_swing` | `true` | Was `false` — scalps must align with H1 |
+| `allow_asia_trading` | `false` | Asia is a loss zone |
+| `allow_london_open_momentum` | `false` | London open produces fake-outs |
+| `momentum_require_ml_confluence` | `true` | ML must confirm momentum direction |
 
-    ```bash
-    docker run --rm xau-scalper-v7 backtest --m1-file /app/m1_data_comma.csv --m5-file /app/m5_data_comma.csv
-    ```
+### Swing Engine (v4.2 defaults)
 
-3.  **Analyze Results:** The backtester will output the best parameter sets based on different metrics (Sharpe Ratio, Profit Factor / Max Drawdown), which you can then use in the live EA.
+| Parameter | Value | Change from v4.1 |
+|-----------|-------|-----------------|
+| `conviction_threshold` | `62.0` | Was `50.0` — requires ≥2 confluence bonuses |
+| `ensemble_h1_weight` | `0.7` | H1 ML bias weight |
+| `ensemble_d1_weight` | `0.3` | D1 ML bias weight |
+| `sl_atr_buffer` | `0.25` | SL buffer below structural level |
 
-    **Example Backtest Result:**
-    ```
-    --- Best Result (Optimized for Profit Factor / Max Drawdown) ---
-    Parameters: EMA(5/50), RSI(16), SL: 1.0*ATR, TP: 1.5*ATR
-    Sharpe Ratio: 0.167 | Profit Factor: 3.99
-    Final Balance: 123093006844.01
-    Net Profit: 123092996844.01
-    Max Drawdown: 2.68%
-    Total Trades: 3546
-    Win Rate: 66.84%
-    ```
+---
+
+## 🔬 API Reference
+
+Interactive docs: `http://127.0.0.1:3000/docs`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/data` | Ingest OHLCV from MT5 bridge |
+| `POST` | `/ticks` | Ingest live tick data |
+| `GET` | `/ws` | WebSocket — live signal stream |
+| `GET` | `/signals` | Last 12h signal log |
+| `GET` | `/signals/latest` | Latest signal per symbol |
+| `GET` | `/signals/{symbol}` | Latest signal for one symbol |
+| `GET` | `/analysis/fundamental` | Gemini AI macro outlook |
+| `GET` | `/models/loaded` | Loaded ONNX predictor models |
+| `GET` | `/metrics` | Server performance metrics |
+| `GET` | `/metrics/prometheus` | Prometheus-format metrics |
+| `GET` | `/health` | Health check → `"OK"` |
+
+---
+
+## ⚡ Backtesting
+
+```bash
+docker run --rm xau-scalper-v4 backtest \
+  --m1-file /app/m1_data_comma.csv \
+  --m5-file /app/m5_data_comma.csv
+```
+
+> ⚠️ **Always run backtests with a fixed lot size** (e.g. `0.01`) and enable spread + slippage simulation. The example below used unbounded compounding — the dollar figure is meaningless. Judge results by **Win Rate**, **Profit Factor**, and **Max Drawdown** only.
+
+```
+--- Example Backtest Result (fixed-lot reference) ---
+Parameters: EMA(5/50), RSI(16), SL: 1.0×ATR, TP: 1.5×ATR
+Sharpe Ratio:  0.167   |  Profit Factor: 3.99
+Win Rate:      66.84%  |  Total Trades:  3,546
+Max Drawdown:  2.68%
+```
+
+---
+
+## 🛠️ v4.2 Changelog — Loss Analysis Fixes
+
+| Component | Change |
+|-----------|--------|
+| `scalp.rs` | `m1_roc_period` 1→3: require 3-bar sustained M1 surge |
+| `scalp.rs` | Pullback: 2 consecutive closes required (no falling-knife) |
+| `scalp.rs` | `pullback_entry_displacement_atr` 0.20→0.30 |
+| `scalp.rs` | LondonHunt conviction dynamic (sweep depth/ATR), was hardcoded 90 |
+| `scalp.rs` | Fade conviction dynamic (inversely with ADX), was hardcoded 85 |
+| `swing.rs` | BOS retest latch: signal fires on retest, not breakout candle |
+| `config.rs` | `conviction_threshold` 50→62, `min_conviction` 50→60 |
+| `config.rs` | `filter_scalp_by_swing` enabled; `pullback_entry_displacement_atr` raised |
+| `XAU_DATA_BRIDGE.mq5` | M5 timestamps now sent — fixes London Hunt Asia range accuracy |
+| `config.py` | `max_entries` 5→1, `min_conviction` 45→60 |
+| `mt5_interface.py` | ATR trailing capped at `trailing_dist_pips_*` — tightens only |
+| `mt5_interface.py` | SL updates sequential (MT5 Python API is not thread-safe) |
+| `xau_controller.py` | `processed_ids` → bounded `deque(maxlen=500)` |
 
 ---
 
 ## 📜 License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the MIT License. See `LICENSE` for details.

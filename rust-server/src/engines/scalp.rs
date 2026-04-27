@@ -2,6 +2,7 @@ use crate::{EvalRequest, EvalResponse, PriceLevel, SignalDirection};
 use ::uuid::Uuid;
 use crate::{adx, get_trend_bias, find_imbalance_zones, find_swing_points, calculate_dynamic_thickness, engines::{news_guard, predictor_cache::PredictorCache, ensemble_predictor}, config::{ScalpSettings, RiskSettings}};
 use std::collections::HashMap;
+use tracing::info;
 
 #[derive(Debug, PartialEq, Clone)]
 enum ExpectancyClass {
@@ -115,14 +116,14 @@ impl ScalpEngine {
         // Priority A: Time-Based Specialist Setups (London Hunt)
         let mut decision = if let Some(d) = Self::evaluate_london_hunt(req, settings) {
             d
-        // Priority B: Mean Reversion (Fade) - Only valid at extremes
-        } else if let Some(d) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals, last_swing_high, last_swing_low, &fvg_zones) {
+        // Priority B: Trend Momentum (Breakouts/Fast Flow) - Prioritize Trend Following
+        } else if let Some(d) = Self::evaluate_momentum(req, settings, predictor_cache, last_atr, vol_regime, &adx_vals) {
             d
-        // Priority C: Trend Momentum (Breakouts/Fast Flow)
-        } else if let Some(d) = Self::evaluate_momentum(req, settings, predictor_cache, last_atr, vol_regime) {
-            d
-        // Priority D: Trend Pullback (Discount Entries)
+        // Priority C: Trend Pullback (Discount Entries)
         } else if let Some(d) = Self::evaluate_pullback(req, settings, predictor_cache, last_atr, vol_regime) {
+            d
+        // Priority D: Mean Reversion (Fade) - Lowest priority
+        } else if let Some(d) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals, last_swing_high, last_swing_low, &fvg_zones) {
             d
         } else {
             Decision::default()
@@ -293,21 +294,34 @@ impl ScalpEngine {
     }
 
     // --- STRATEGY 1: LONDON HUNT (Specialist) ---
-    fn evaluate_london_hunt(req: &EvalRequest, _settings: &ScalpSettings) -> Option<Decision> {
+    fn evaluate_london_hunt(req: &EvalRequest, settings: &ScalpSettings) -> Option<Decision> {
         let session = Self::session_utc(req.last_m1_timestamp);
-        if session != "london_open" { return None; }
+        // Allow London Open, London/NY Overlap, and NY Session
+        if session != "london_open" && session != "london_ny" && session != "ny" { return None; }
 
         let (asia_high, asia_low) = Self::get_asia_range(&req.m5_highs, &req.m5_lows, req.m5_timestamps.as_deref(), req.last_m1_timestamp)?;
         let current_price = req.current_price;
         let last_close = *req.closes.last().unwrap_or(&current_price);
+        
+        // Sniper Logic: Check if M1 recently traded beyond the level (using closes as proxy if highs missing)
+        let m1_n = req.closes.len();
+        let prev_m1_close = if m1_n > 1 { req.closes[m1_n - 2] } else { current_price };
+
+        // Dynamic conviction: scale with sweep depth relative to ATR
+        let atr_vals = crate::atr(&req.m5_highs, &req.m5_lows, &req.m5_closes, settings.atr_period);
+        let last_atr = atr_vals.last().cloned().unwrap_or(1.0).max(0.0001);
 
         // Logic: Price swept Asia High/Low and closed back inside
-        if current_price < asia_high && last_close < asia_high && req.m5_highs.last()? > &asia_high {
+        if current_price < asia_high && last_close < asia_high && (req.m5_highs.last().map(|&h| h > asia_high).unwrap_or(false) || prev_m1_close > asia_high) {
              // Bearish Hunt (Swept High)
+             let sweep_high = req.m5_highs.last().cloned().unwrap_or(asia_high);
+             let sweep_depth_atr = (sweep_high - asia_high) / last_atr;
+             // Base 70 + up to 20 bonus for deep sweeps; cap at 92
+             let conviction = (70.0 + (sweep_depth_atr * 20.0).min(20.0)).min(92.0);
              return Some(Decision {
                  entry_type: SignalDirection::Short,
-                 conviction: 90.0, // Specialist setups have high base conviction
-                 reason: "London Hunt: Asia High Sweep".to_string(),
+                 conviction,
+                 reason: format!("London Hunt: Asia High Sweep (depth {:.2} ATR)", sweep_depth_atr),
                  scalp_mode: ScalpMode::LondonHunt,
                  expectancy_class: ExpectancyClass::Asymmetric,
                  entry_price: current_price,
@@ -316,12 +330,15 @@ impl ScalpEngine {
              });
         }
         
-        if current_price > asia_low && last_close > asia_low && req.m5_lows.last()? < &asia_low {
+        if current_price > asia_low && last_close > asia_low && (req.m5_lows.last().map(|&l| l < asia_low).unwrap_or(false) || prev_m1_close < asia_low) {
              // Bullish Hunt (Swept Low)
+             let sweep_low = req.m5_lows.last().cloned().unwrap_or(asia_low);
+             let sweep_depth_atr = (asia_low - sweep_low) / last_atr;
+             let conviction = (70.0 + (sweep_depth_atr * 20.0).min(20.0)).min(92.0);
              return Some(Decision {
                  entry_type: SignalDirection::Long,
-                 conviction: 90.0,
-                 reason: "London Hunt: Asia Low Sweep".to_string(),
+                 conviction,
+                 reason: format!("London Hunt: Asia Low Sweep (depth {:.2} ATR)", sweep_depth_atr),
                  scalp_mode: ScalpMode::LondonHunt,
                  expectancy_class: ExpectancyClass::Asymmetric,
                  entry_price: current_price,
@@ -417,7 +434,10 @@ impl ScalpEngine {
             if triggered {
                 decision.scalp_mode = ScalpMode::Fade;
                 decision.expectancy_class = ExpectancyClass::Asymmetric;
-                decision.conviction = 85.0; // High conviction, but not maxed out
+                // Dynamic conviction: lower ADX = cleaner range = higher conviction for fade
+                // Ranges from 65 (ADX near 30) to 85 (ADX near 0)
+                let last_adx = adx_vals.last().cloned().unwrap_or(15.0);
+                decision.conviction = (85.0 - (last_adx / settings.fade_max_adx) * 20.0).clamp(65.0, 85.0);
                 decision.recommended_order_type = format!("limit_{}", decision.entry_type);
                 decision.entry_price = req.current_price;
                 decision.vol_regime_val = 2.0; // Parabolic implies high volatility
@@ -434,10 +454,16 @@ impl ScalpEngine {
         settings: &ScalpSettings,
         predictor_cache: &PredictorCache,
         last_atr: f64,
-        vol_regime: f64
+        vol_regime: f64,
+        adx_vals: &[f64]
     ) -> Option<Decision> {
         let m5_closes = &req.m5_closes;
         
+        // 0. ADX Filter: Avoid Momentum entries in low ADX (Chop)
+        if let Some(&last_adx) = adx_vals.last() {
+            if last_adx < 20.0 { return None; }
+        }
+
         // 1. Flow Check (Kalman)
         let kf_q = req.kf_process_noise.unwrap_or(0.01);
         let kf_r = req.kf_measurement_noise.unwrap_or(0.1);
@@ -445,10 +471,18 @@ impl ScalpEngine {
         let norm_slope = k_slope / last_atr;
         let threshold = settings.base_kalman_threshold * vol_regime; // Scale threshold by volatility
         
-        // 2. Surge Check (M1 ROC)
-        let m1_roc = crate::roc(&req.closes, settings.m1_roc_period);
-        let m1_surge = m1_roc.last().cloned().unwrap_or(0.0) / (last_atr / 5.0); // Normalize roughly
+        // 2. Surge Check (M1 Price Delta vs ATR)
+        // Fix: Use Price Change in ATR units instead of ROC % which is too small for XAUUSD
+        let m1_n = req.closes.len();
+        let roc_p = settings.m1_roc_period;
+        let current_close = *req.closes.last().unwrap_or(&req.current_price);
+        let prev_close_n = if m1_n > roc_p { req.closes[m1_n - 1 - roc_p] } else { req.closes.first().cloned().unwrap_or(current_close) };
         
+        let m1_surge = (current_close - prev_close_n) / last_atr; // e.g. 0.3 means moved 0.3 ATR in N minutes
+        
+        // LOGGING: Verify m1_surge calculation in console
+        info!(symbol = %req.symbol, m1_surge = m1_surge, threshold = settings.base_m1_surge_threshold, "Momentum Surge Check");
+
         // Requirement: Both M5 Flow AND M1 Surge must agree and be strong
         let is_bullish = norm_slope > threshold && m1_surge > settings.base_m1_surge_threshold;
         let is_bearish = norm_slope < -threshold && m1_surge < -settings.base_m1_surge_threshold;
@@ -456,12 +490,18 @@ impl ScalpEngine {
         if !is_bullish && !is_bearish { return None; }
 
         // 3. Ensemble Confirmation (Required for Momentum)
-        let ml_bias = ensemble_predictor::calculate_bias(predictor_cache, "m5", m5_closes, req.current_price, 1.0);
-        if (is_bullish && ml_bias < 0.0) || (is_bearish && ml_bias > 0.0) {
-            return None; // ML disagrees, filter fakeout
+        if settings.momentum_require_ml_confluence {
+            let ml_bias = ensemble_predictor::calculate_bias(predictor_cache, "m5", m5_closes, req.current_price, 1.0);
+            if (is_bullish && ml_bias < 0.0) || (is_bearish && ml_bias > 0.0) {
+                return None; // ML disagrees, filter fakeout
+            }
         }
 
         let direction = if is_bullish { SignalDirection::Long } else { SignalDirection::Short };
+        
+        let mut debug_info = HashMap::new();
+        debug_info.insert("m1_surge".to_string(), format!("{:.3}", m1_surge));
+        debug_info.insert("kalman_slope".to_string(), format!("{:.3}", norm_slope));
         
         Some(Decision {
             entry_type: direction,
@@ -472,6 +512,7 @@ impl ScalpEngine {
             entry_price: req.current_price,
             vol_regime_val: vol_regime,
             recommended_order_type: format!("market_{}", if is_bullish { "long" } else { "short" }),
+            debug_info,
             ..Default::default()
         })
     }
@@ -503,9 +544,26 @@ impl ScalpEngine {
         
         let dist_to_fair_value = (req.current_price - k_est) / last_atr;
 
+        // 3. Confirmation: Require M1 candle to show resumption (Close > Prev Close)
+        // This prevents catching a falling knife.
+        let m1_n = req.closes.len();
+        let current_close = *req.closes.last().unwrap_or(&req.current_price);
+        let prev_close = if m1_n > 1 { req.closes[m1_n - 2] } else { current_close };
+
         // Logic: Trend is UP, but Price is slightly cheap (Pullback)
-        let is_bullish_pullback = norm_slope > 0.0 && dist_to_fair_value < -0.5; // Price is 0.5 ATR below Kalman
-        let is_bearish_pullback = norm_slope < 0.0 && dist_to_fair_value > 0.5; // Price is 0.5 ATR above Kalman
+        // FIX: Require 2 consecutive closes in the resumption direction to avoid falling-knife entries.
+        let threshold_dist = settings.pullback_entry_displacement_atr;
+        let prev_close_2 = if m1_n > 2 { req.closes[m1_n - 3] } else { prev_close };
+
+        let is_bullish_pullback = norm_slope > 0.0
+            && dist_to_fair_value < -threshold_dist
+            && current_close > prev_close      // Bar N closes up
+            && prev_close > prev_close_2;      // Bar N-1 also closed up (2-bar confirmation)
+
+        let is_bearish_pullback = norm_slope < 0.0
+            && dist_to_fair_value > threshold_dist
+            && current_close < prev_close      // Bar N closes down
+            && prev_close < prev_close_2;      // Bar N-1 also closed down (2-bar confirmation)
 
         if !is_bullish_pullback && !is_bearish_pullback { return None; }
 
