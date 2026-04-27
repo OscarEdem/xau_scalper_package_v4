@@ -56,12 +56,15 @@ COPY rust-server/src/engines/lstm/models /app/models
 #     (head -n 1 /app/m5_data.csv | tr '\t' ',' && tail -n +2 /app/m5_data.csv | tr '\t' ',') > /app/m5_data_comma.csv
 
 # Set production environment variables
-ENV APP_SERVER__HOST=0.0.0.0 \
-    APP_SERVER__PORT=3000 \
-    APP_TRADING__MAX_BUFFER_SIZE=500 \
-    APP_PATHS__PUSH_TOKENS_FILE=/app/push_tokens.json \
-    APP_PATHS__MODELS_DIR=/app/models/ \
-    RUST_LOG=info
+# NOTE: The config crate uses double-underscore (__) as the hierarchy separator.
+# APP__SERVER__PORT maps to settings.server.port etc.
+ENV APP__SERVER__HOST=0.0.0.0 \
+    APP__SERVER__PORT=3000 \
+    APP__TRADING__MAX_BUFFER_SIZE=500 \
+    APP__PATHS__PUSH_TOKENS_FILE=/app/push_tokens.json \
+    APP__PATHS__MODELS_DIR=/app/models/ \
+    APP__PATHS__SESSIONS_DIR=/app/sessions_data \
+    RUST_LOG=info,xau_scalper_server=debug
 
 # Set the default container command to run the server
 CMD ["xau_scalper_server"]
