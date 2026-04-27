@@ -46,9 +46,9 @@ jobs:
         working-directory: rust-server
         run: cargo build --release
 
-      - name: Test
+      - name: Test (unit tests only — e2e tests require Postgres, run locally)
         working-directory: rust-server
-        run: cargo test --verbose
+        run: cargo test --lib --verbose
 
   # ─────────────────────────────────────────────────────────────────
   # JOB 2: Build & Push Docker image to GitHub Container Registry

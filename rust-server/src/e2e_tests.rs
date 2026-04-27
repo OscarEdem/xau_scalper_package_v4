@@ -74,6 +74,7 @@ async fn setup_test_state() -> Arc<ApplicationStateWithTicks> {
 }
 
 #[tokio::test]
+#[ignore = "Requires a running Postgres instance. Run locally with: cargo test -- --include-ignored"]
 async fn test_health_check_endpoint() {
     let state = setup_test_state().await;
     let app = create_app(state);
