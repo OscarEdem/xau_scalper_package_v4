@@ -6,10 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+# Opt into Node.js 24 now to silence deprecation warnings
 env:
   REGISTRY: ghcr.io
   # Must match the existing GHCR package name exactly
   IMAGE_NAME: oscaredem/xau_scalper_package_v4
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ─────────────────────────────────────────────────────────────────
@@ -38,7 +40,6 @@ jobs:
             ~/.cargo/git/db/
             rust-server/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          # Fall back to any previous cache for the same OS if the lock file changed
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -53,6 +54,17 @@ jobs:
   # ─────────────────────────────────────────────────────────────────
   # JOB 2: Build & Push Docker image to GitHub Container Registry
   # Only runs on pushes to main (not on PRs) after tests pass.
+  #
+  # ⚠️  ONE-TIME SETUP REQUIRED (fixes 403 Forbidden):
+  #   The package lives under your USER account, not the repository.
+  #   GITHUB_TOKEN only gets push rights after you explicitly grant it:
+  #
+  #   1. Go to:
+  #      https://github.com/users/oscaredem/packages/container/xau_scalper_package_v4/settings
+  #   2. Scroll to "Manage Actions access"
+  #   3. Click "Add Repository" → oscaredem/xau_scalper_package_v4 → Role: Write
+  #
+  #   Without that step this job will always fail with 403 Forbidden.
   # ─────────────────────────────────────────────────────────────────
   build-and-push-docker:
     name: Build & Push Docker Image
@@ -68,7 +80,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Enable multi-platform builds (linux/amd64 + linux/arm64 for Render/Fly compatibility)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -77,6 +88,10 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
+          # GITHUB_TOKEN works once the package grants this repo Write access.
+          # If it still 403s after the package settings step above, create a PAT
+          # with write:packages scope and add it as secret GHCR_TOKEN, then
+          # switch this line to: password: ${{ secrets.GHCR_TOKEN }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Generates tags:
@@ -107,17 +122,10 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ─────────────────────────────────────────────────────────────────
-  # JOB 3: Tell Render to redeploy using the new :latest image
+  # JOB 3: Tell Render to redeploy using the new :main image
   #
-  # Render-side setup (one-time, manual):
-  #   1. Render Dashboard → New Web Service → "Existing Image"
-  #   2. Image URL: ghcr.io/oscaredem/xau_scalper_package_v4:latest
-  #   3. Registry Credentials → Add:
-  #        Username: oscaredem
-  #        Password: <GitHub PAT with read:packages scope>
-  #        (Store PAT as GHCR_PAT in Render environment or GitHub secret)
-  #   4. Settings → Deploy Hook → copy URL
-  #   5. GitHub repo → Settings → Secrets → RENDER_DEPLOY_HOOK_URL → paste URL
+  # Requires secret RENDER_DEPLOY_HOOK_URL set in repo settings.
+  # Get it from: Render Dashboard → Service → Settings → Deploy Hook
   # ─────────────────────────────────────────────────────────────────
   deploy-render:
     name: Deploy to Render
