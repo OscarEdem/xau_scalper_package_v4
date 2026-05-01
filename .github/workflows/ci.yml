@@ -16,7 +16,7 @@ env:
   REGISTRY: ghcr.io
   # Image name must be lowercase. Using the hardcoded lowercase version is fine,
   # but ensure it matches the repository name exactly.
-  IMAGE_NAME: oscaredem/xau_scalper_package_v4
+  IMAGE_NAME: oscaredem/xau_scalper_package_v4_test
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
