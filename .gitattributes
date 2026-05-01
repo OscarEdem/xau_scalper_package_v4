@@ -4,3 +4,6 @@ rust-server/Cargo.lock linguist-vendored
 
 # Ensure .mk files are correctly identified as Makefiles.
 *.mk linguist-language=Makefile
+
+# Force LF line endings for SQL files to ensure consistent sqlx checksums
+*.sql text eol=lf

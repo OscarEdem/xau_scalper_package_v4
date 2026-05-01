@@ -2,7 +2,7 @@
 FROM rust:1-slim-bookworm AS builder
 
 # Install build dependencies required by crates like `openssl-sys`
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential dos2unix
 
 # Use /app as the working directory
 WORKDIR /app
@@ -17,6 +17,8 @@ RUN cargo build --release
 # Copy the actual source code and build the final binaries
 # Ensure migrations are present for the sqlx::migrate! macro
 COPY rust-server/migrations ./migrations
+# Normalize line endings to LF before the macro runs to ensure checksum matches production
+RUN find migrations -type f -exec dos2unix {} +
 COPY rust-server/src ./src
 RUN touch src/main.rs && cargo build --release --bin xau-scalper-server
 
