@@ -23,6 +23,9 @@ RUN touch src/main.rs && cargo build --release --bin xau-scalper-server
 # Stage 2: Create the final, minimal production image
 FROM debian:bookworm-slim
 
+# Add label to link this image to the source repository
+LABEL org.opencontainers.image.source=https://github.com/OscarEdem/xau_scalper_package_v4
+
 # Install runtime dependencies: SSL certificates for HTTPS requests, and utilities for data conversion.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl dos2unix gawk libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/*
 

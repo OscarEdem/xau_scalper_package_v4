@@ -9,7 +9,8 @@ on:
 # Opt into Node.js 24 now to silence deprecation warnings
 env:
   REGISTRY: ghcr.io
-  # Must match the existing GHCR package name exactly
+  # Image name must be lowercase. Using the hardcoded lowercase version is fine,
+  # but ensure it matches the repository name exactly.
   IMAGE_NAME: oscaredem/xau_scalper_package_v4
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
