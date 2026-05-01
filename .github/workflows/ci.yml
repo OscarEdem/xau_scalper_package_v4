@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
+# Global permissions for the GITHUB_TOKEN
+permissions:
+  contents: read
+  packages: write
+
 # Opt into Node.js 24 now to silence deprecation warnings
 env:
   REGISTRY: ghcr.io
@@ -72,10 +77,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    permissions:
-      contents: read
-      packages: write   # Required to push to GitHub Container Registry
 
     steps:
       - name: Checkout repository
