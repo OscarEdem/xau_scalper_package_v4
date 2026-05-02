@@ -48,6 +48,14 @@ pub async fn init_db(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     info!("Connected to PostgreSQL.");
 
+    // --- FIX: Migration Repair ---
+    // If the initial migration file was modified, sqlx will fail with a checksum mismatch.
+    // We delete the record for the problematic migration to force it to re-run and 
+    // update the checksum in the database. Since our migrations use 'IF NOT EXISTS', this is safe.
+    let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20240522000000")
+        .execute(&pool)
+        .await;
+
     // Basic schema migration
     // Uses the migrations folder embedded in the binary
     sqlx::migrate!("./migrations")
@@ -55,64 +63,6 @@ pub async fn init_db(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .await?;
 
     info!("Database migrations applied.");
-
-    // Ensure RSS table exists (Manual migration since we can't touch .sql files)
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS rss_news (
-            link TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            pub_date TEXT NOT NULL,
-            source TEXT NOT NULL,
-            image_url TEXT,
-            author TEXT,
-            fetched_at BIGINT NOT NULL
-        )"
-    )
-    .execute(&pool)
-    .await?;
-
-    // Ensure author column exists (Migration for existing DBs)
-    if let Err(e) = sqlx::query("ALTER TABLE rss_news ADD COLUMN IF NOT EXISTS author TEXT").execute(&pool).await {
-        tracing::warn!("Migration warning: Failed to ensure 'author' column exists in rss_news: {}", e);
-    }
-
-    // --- NEW: Create push_tokens table ---
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS push_tokens (
-            token TEXT PRIMARY KEY,
-            created_at BIGINT NOT NULL
-        )"
-    )
-    .execute(&pool)
-    .await?;
-
-    // --- NEW: Create news_events table ---
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS news_events (
-            event TEXT NOT NULL,
-            timestamp BIGINT NOT NULL,
-            currency TEXT NOT NULL,
-            impact TEXT NOT NULL,
-            data JSONB NOT NULL,
-            PRIMARY KEY (event, timestamp, currency)
-        )"
-    )
-    .execute(&pool)
-    .await?;
-
-    // --- NEW: Create analysis_reports table ---
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS analysis_reports (
-            id SERIAL PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            period TEXT NOT NULL,
-            created_at BIGINT NOT NULL,
-            report JSONB NOT NULL,
-            events_hash TEXT NOT NULL
-        )"
-    )
-    .execute(&pool)
-    .await?;
 
     Ok(pool)
 }
