@@ -23,6 +23,13 @@ pub struct HistoricalSignal {
     pub created_at: i64, // Unix timestamp
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ChatMessage {
+    pub role: String, // "user" or "model"
+    pub content: String,
+    pub timestamp: i64,
+}
+
 /// A more flexible state for the whole application, including the new SessionManager.
 #[derive(Clone)]
 pub struct ApplicationState {
@@ -39,6 +46,8 @@ pub struct ApplicationState {
     // NEW: Metrics
     /// Rate limiter for chat requests: Key = IP/User/Symbol, Value = (count, window_start_timestamp)
     pub chat_rate_limiter: Arc<DashMap<String, (u32, i64)>>,
+    /// Chat sessions for multi-turn context. Key: Symbol
+    pub chat_sessions: Arc<DashMap<String, VecDeque<ChatMessage>>>,
     pub server_start_time: chrono::DateTime<chrono::Utc>,
     pub total_signals_generated: Arc<AtomicUsize>,
     pub http_client: reqwest::Client,

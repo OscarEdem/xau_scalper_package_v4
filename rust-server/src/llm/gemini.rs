@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use xau_scalper_server::metrics::AppMetrics;
 
 // Use the v1beta endpoint for the latest models
-const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1/models";
+const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 pub async fn generate_analysis(
     client: &Client,
@@ -14,12 +14,12 @@ pub async fn generate_analysis(
     recent_data: &str,
     prompt: &str,
     metrics: &AppMetrics,
-) -> Result<String> {
+) -> Result<serde_json::Value> {
     // 1. Get API Key
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
-    // 2. Build Request Body
+    // 2. Build Request Body with JSON Schema for stability
     let body = json!({
         "contents": [{
             "parts": [{
@@ -28,11 +28,35 @@ pub async fn generate_analysis(
                     prompt, pair, recent_data
                 )
             }]
-        }]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The textual analysis or answer." },
+                    "confidence": { "type": "number", "description": "Confidence score from 0.0 to 1.0" },
+                    "targets": {
+                        "type": "array",
+                        "description": "Optional price/time coordinates for visual grounding on the chart.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "price": { "type": "number" },
+                                "time": { "type": "string", "description": "ISO timestamp or chart index" },
+                                "label": { "type": "string", "description": "Short label for the annotation" }
+                            },
+                            "required": ["price", "label"]
+                        }
+                    }
+                },
+                "required": ["text", "confidence"]
+            }
+        }
     });
 
     // Fallback models in order of preference
-    let models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash"];
+    let models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-3-flash"];
     let mut last_error = anyhow!("No models available");
 
     for model in models {
@@ -45,7 +69,7 @@ pub async fn generate_analysis(
             // 3. Send Request
             let res_result = client
                 .post(&url)
-                .header("x-goog-api-key", &api_key) // Security: Use API Key header
+                .header("x-goog-api-key", &api_key)
                 .json(&body)
                 .send()
                 .await;
@@ -54,7 +78,7 @@ pub async fn generate_analysis(
                 Ok(r) => r,
                 Err(e) => {
                     last_error = anyhow!("Request failed for {}: {}", model, e);
-                    if attempt >= max_retries { break; } // Try next model
+                    if attempt >= max_retries { break; }
                     tracing::warn!("Request failed for {}: {}. Retrying...", model, e);
                     sleep(backoff).await;
                     attempt += 1;
@@ -67,7 +91,6 @@ pub async fn generate_analysis(
                 // 4. Parse Response
                 let json: serde_json::Value = res.json().await?;
                 
-                // Robustly extract the text from the JSON structure
                 let result_text = json["candidates"]
                     .as_array()
                     .and_then(|c| c.get(0))
@@ -75,11 +98,14 @@ pub async fn generate_analysis(
                     .and_then(|c| c["parts"].as_array())
                     .and_then(|c| c.get(0))
                     .and_then(|c| c["text"].as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| anyhow!("Failed to parse text from Gemini response: {:?}", json))?;
+                    .ok_or_else(|| anyhow!("Failed to extract text from Gemini response: {:?}", json))?;
+
+                // Parse the inner JSON string returned by Gemini in JSON mode
+                let structured_res: serde_json::Value = serde_json::from_str(result_text)
+                    .map_err(|e| anyhow!("Failed to parse Gemini structured output: {}. Raw: {}", e, result_text))?;
 
                 metrics.gemini_success_model.with_label_values(&[model]).inc();
-                return Ok(result_text);
+                return Ok(structured_res);
             } else if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS || res.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             let status = res.status();
             if attempt >= max_retries {

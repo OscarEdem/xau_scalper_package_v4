@@ -119,6 +119,31 @@ pub async fn chat_analysis_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // --- NEW: Price Action Mini-Scribe ---
+    let mut candle_scribe = String::new();
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(&req.symbol) {
+        let session = session_entry.value().lock().await;
+        let m5 = &session.market_data;
+        let count = m5.m5_closes.len();
+        let start = if count > 20 { count - 20 } else { 0 };
+        for i in start..count {
+            candle_scribe.push_str(&format!("H:{:.2},L:{:.2},C:{:.2};", 
+                m5.m5_highs.get(i).unwrap_or(&0.0), 
+                m5.m5_lows.get(i).unwrap_or(&0.0), 
+                m5.m5_closes.get(i).unwrap_or(&0.0)));
+        }
+    }
+
+    // --- NEW: Multi-Turn Contextual Memory ---
+    let mut history_str = String::new();
+    {
+        if let Some(history) = state.inner.chat_sessions.get(&req.symbol) {
+            for msg in history.value() {
+                history_str.push_str(&format!("{}: {}\n", msg.role, msg.content));
+            }
+        }
+    }
+
     let cache_key = format!("{}_{}", req.symbol, req.period);
 
     // 1. Retrieve cached analysis
@@ -129,12 +154,39 @@ pub async fn chat_analysis_handler(
     };
 
     // 2. Construct Prompt
-    let system_instruction = "You are a financial analyst assistant. The user is asking a follow-up question based on the provided Fundamental Analysis Report (RECENT DATA). Answer the question using the context provided. Be concise and professional.";
-    let full_prompt = format!("{}\n\nUSER QUESTION: {}", system_instruction, req.query);
+    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA and RECENT CANDLES. \
+        Use the CHAT HISTORY for context. If you mention specific price levels, include them in the 'targets' array in the JSON response \
+        so they can be drawn on the chart. Be concise, professional, and insight-driven.";
+    
+    let full_prompt = format!(
+        "{}\n\nCHAT HISTORY:\n{}\nRECENT CANDLES (M5):\n{}\n\nUSER QUESTION: {}", 
+        system_instruction, history_str, candle_scribe, req.query
+    );
 
-    // 3. Call LLM (Reusing existing generate_analysis which handles API key and context formatting)
+    // 3. Call LLM (Now returns structured JSON)
     match generate_analysis(&state.inner.http_client, &req.symbol, &cached_report, &full_prompt, &state.inner.metrics).await {
-        Ok(response) => Ok(Json(serde_json::json!({ "response": response }))),
+        Ok(structured_res) => {
+            // Update history
+            let mut history = state.inner.chat_sessions.entry(req.symbol.clone()).or_insert_with(|| VecDeque::with_capacity(10));
+            history.push_back(crate::state::ChatMessage { 
+                role: "user".to_string(), 
+                content: req.query.clone(), 
+                timestamp: Utc::now().timestamp() 
+            });
+            
+            let model_text = structured_res["text"].as_str().unwrap_or("").to_string();
+            history.push_back(crate::state::ChatMessage { 
+                role: "model".to_string(), 
+                content: model_text, 
+                timestamp: Utc::now().timestamp() 
+            });
+            
+            if history.len() > 10 {
+                history.pop_front();
+            }
+
+            Ok(Json(structured_res))
+        },
         Err(e) => {
             tracing::error!("LLM Chat failed: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -367,30 +419,11 @@ pub async fn generate_fundamental_report(
     let context_json = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
 
     // --- LLM CALL ---
-    // We pass the context as the data payload, and the system prompt as the instruction.
     let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1, &state.inner.metrics)
         .await;
 
     let mut result: serde_json::Value = match llm_response {
-        Ok(json_str) => {
-            // Attempt to clean the response if it contains markdown code blocks or extra text
-            let cleaned_json = if let Some(start) = json_str.find('{') {
-                if let Some(end) = json_str.rfind('}') {
-                    &json_str[start..=end]
-                } else {
-                    &json_str
-                }
-            } else {
-                &json_str
-            };
-            serde_json::from_str(cleaned_json).unwrap_or_else(|e| {
-                serde_json::json!({
-                    "error": "Failed to parse LLM JSON",
-                    "details": e.to_string(),
-                    "raw": json_str
-                })
-            })
-        },
+        Ok(structured_res) => structured_res,
         Err(e) => serde_json::json!({
             "error": format!("Fundamental analysis failed: {}", e)
         }),
@@ -402,9 +435,9 @@ pub async fn generate_fundamental_report(
         obj.insert("global_risk_off".to_string(), serde_json::json!(context.global_risk_off));
         
         // Post-LLM Scoring: Combine LLM confidence with Swing Engine score
-        let llm_confidence = obj.get("confidence").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+        let llm_confidence = obj.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let final_conviction = if swing_conviction > 0.0 {
-            (llm_confidence + swing_conviction) / 2.0
+            (llm_confidence + (swing_conviction / 100.0)) / 2.0
         } else {
             llm_confidence
         };

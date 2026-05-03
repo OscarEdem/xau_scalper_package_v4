@@ -185,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fundamental_analysis_cache: Arc::new(DashMap::new()),
         ws_clients: Arc::new(AtomicUsize::new(0)),
         chat_rate_limiter: Arc::new(DashMap::new()),
+        chat_sessions: Arc::new(DashMap::new()),
         server_start_time: Utc::now(),
         total_signals_generated: Arc::new(AtomicUsize::new(0)),
         http_client: reqwest::Client::builder()
