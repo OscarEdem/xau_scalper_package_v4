@@ -1,5 +1,5 @@
 use std::error::Error;
-use super::{gbm, heston}; // lstm disabled due to linker issues
+use super::{gbm, heston, lstm};
 use std::path::Path;
 
 /// A common trait for all prediction models.
@@ -28,9 +28,10 @@ pub fn load_predictor(model_type: &str, timeframe: &str, models_dir: &str) -> Re
             Ok(Box::new(heston))
         }
         "lstm" => {
-            // LSTM models are disabled due to ort-sys linker issues on Windows.
-            // Using NoopPredictor as fallback.
-            Ok(Box::new(NoopPredictor::default()))
+            // LSTM models live as ONNX files named like `lstm_h1.onnx` in `/app/models`.
+            let path = base_path.join(format!("lstm_{}.onnx", timeframe));
+            let lstm_model = lstm::predict::LSTM::load(path.to_str().ok_or("Invalid path")?)?;
+            Ok(Box::new(lstm_model))
         }
         _ => Err(format!("Unknown predictor model type: {}", model_type).into()),
     }

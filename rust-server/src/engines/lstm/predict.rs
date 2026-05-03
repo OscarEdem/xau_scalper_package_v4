@@ -59,7 +59,7 @@ impl Predictor for LSTM {
             .collect();
 
         // Shape: [Batch Size = 1, Sequence Length = 50, Features = 1]
-        let input_array = Array::from_shape_vec((1, SEQ_LEN, 1), normalized)
+        let input_array = Array::from_shape_vec([1, SEQ_LEN, 1], normalized)
             .map_err(|e| format!("Failed to create input array: {}", e))?;
 
         // Pass 'input_array' directly (Ownership transfer)
