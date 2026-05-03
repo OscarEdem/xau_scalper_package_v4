@@ -24,7 +24,7 @@ pub async fn generate_analysis(
         "contents": [{
             "parts": [{
                 "text": format!(
-                    "{}\n\nPAIR: {}\nRECENT DATA:\n{}",
+                    "{}\n\nPAIR: {}\nRECENT DATA (Includes current_price for grounding):\n{}",
                     prompt, pair, recent_data
                 )
             }]
@@ -34,23 +34,36 @@ pub async fn generate_analysis(
             "response_schema": {
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "The textual analysis or answer." },
+                    "bias": { "type": "string", "enum": ["Bullish", "Bearish", "Neutral"], "description": "Market outlook bias." },
                     "confidence": { "type": "number", "description": "Confidence score from 0.0 to 1.0" },
+                    "macro_narrative": { "type": "string", "description": "Detailed institutional narrative." },
+                    "high_impact_drivers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "event": { "type": "string" },
+                                "how_it_shapes_direction": { "type": "string" },
+                                "date": { "type": "string" }
+                            },
+                            "required": ["event", "how_it_shapes_direction"]
+                        }
+                    },
+                    "risks": { "type": "array", "items": { "type": "string" } },
                     "targets": {
                         "type": "array",
-                        "description": "Optional price/time coordinates for visual grounding on the chart.",
+                        "description": "Optional price coordinates for visual grounding (e.g. liquidity zones, FVG gaps).",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "price": { "type": "number" },
-                                "time": { "type": "string", "description": "ISO timestamp or chart index" },
-                                "label": { "type": "string", "description": "Short label for the annotation" }
+                                "label": { "type": "string", "description": "Short label (max 10 chars)" }
                             },
                             "required": ["price", "label"]
                         }
                     }
                 },
-                "required": ["text", "confidence"]
+                "required": ["bias", "confidence", "macro_narrative", "high_impact_drivers", "risks"]
             }
         }
     });

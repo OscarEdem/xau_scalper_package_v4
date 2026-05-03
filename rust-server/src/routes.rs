@@ -174,7 +174,7 @@ pub async fn chat_analysis_handler(
                 timestamp: Utc::now().timestamp() 
             });
             
-            let model_text = structured_res["text"].as_str().unwrap_or("").to_string();
+            let model_text = structured_res["macro_narrative"].as_str().unwrap_or("").to_string();
             history.push_back(crate::state::ChatMessage { 
                 role: "model".to_string(), 
                 content: model_text, 
@@ -416,7 +416,15 @@ pub async fn generate_fundamental_report(
     let context = build_context(symbol, period, &relevant_events, technical_levels, swing_signals_ctx, htf_bias_ctx, fvg_zones_ctx);
 
     // --- BRIDGE LAYER (Serialization) ---
-    let context_json = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
+    let mut context_map = serde_json::to_value(&context).unwrap_or(serde_json::json!({}));
+    
+    // Inject current price for visual grounding calibration
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(symbol) {
+        let session = session_entry.value().lock().await;
+        context_map["current_price"] = serde_json::json!(session.market_data.m5_closes.back());
+    }
+    
+    let context_json = serde_json::to_string(&context_map).unwrap_or_else(|_| "{}".to_string());
 
     // --- LLM CALL ---
     let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1, &state.inner.metrics)
