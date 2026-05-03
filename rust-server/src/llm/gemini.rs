@@ -71,6 +71,7 @@ pub async fn generate_analysis(
     // Fallback models in order of preference
     // Fallback models prioritizing "Flash Lite" variants for higher RPD/RPM on Free Tier
     let models = [
+        "gemini-3.1-flash-lite", // Explicitly requested "Flash Lite" (500 RPD)
         "gemini-1.5-flash-8b",   // High RPD (500+)
         "gemini-2.0-flash-lite", // New Lite model
         "gemini-2.0-flash",      // Standard Flash
