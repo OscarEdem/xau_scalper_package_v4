@@ -71,11 +71,11 @@ pub async fn generate_analysis(
     // Fallback models in order of preference
     // Fallback models prioritizing "Flash Lite" variants for higher RPD/RPM on Free Tier
     let models = [
-        "gemini-3.1-flash-lite", // User requested
-        "gemini-1.5-flash-8b",   // Official High RPD Lite
-        "gemini-1.5-flash",      // High RPD Workhorse
-        "gemini-2.0-flash-lite", // New Lite
-        "gemini-2.0-flash",      // Standard
+        "gemini-3.1-flash-lite-preview", // 500 RPD High-Quota Primary
+        "gemini-3-flash-preview",        // Secondary Flash
+        "gemini-2.5-flash-lite",         // Pro-tier Lite
+        "gemini-2.5-flash",              // Pro-tier Standard
+        "gemini-2.0-flash",              // Legacy (Active until June 2026)
     ];
     let mut last_error = anyhow!("No models available");
 
