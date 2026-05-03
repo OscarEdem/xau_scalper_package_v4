@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 use utoipa::{IntoParams, ToSchema};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::info;
