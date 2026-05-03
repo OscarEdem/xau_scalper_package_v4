@@ -144,7 +144,8 @@ pub async fn chat_analysis_handler(
         }
     }
 
-    let cache_key = format!("{}_{}", req.symbol, req.period);
+    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
+    let cache_key = format!("{}_{}", normalized_symbol, req.period);
 
     // 1. Retrieve cached analysis
     let cached_report = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
@@ -297,6 +298,10 @@ pub async fn generate_fundamental_report(
     period: &str,
     force_refresh: bool,
 ) -> serde_json::Value {
+    // --- Symbol Normalization ---
+    let normalized_symbol = symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
+    let symbol = normalized_symbol.as_str();
+
     let all_events = state.inner.news_events.lock().await.clone();
 
     let now = Utc::now();
