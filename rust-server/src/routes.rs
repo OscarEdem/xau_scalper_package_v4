@@ -372,13 +372,18 @@ pub async fn generate_fundamental_report(
         }
     }
 
+    // --- Extract News Headlines (Top 10) ---
+    let headlines: Vec<String> = state.inner.external_rss_news.lock().await
+        .iter()
+        .take(10)
+        .map(|item| format!("[{}] {}", item.source, item.title))
+        .collect();
+
     // --- Caching Logic ---
-    // 1. Create a hash of the relevant events AND technical levels to see if they've changed.
-    // We build the context first to hash it, or hash inputs. Hashing inputs is cheaper.
     let mut hasher = DefaultHasher::new();
     relevant_events.hash(&mut hasher);
     technical_levels.hash(&mut hasher);
-    // Hash new context fields (using debug format for simplicity as they don't impl Hash)
+    headlines.hash(&mut hasher);
     format!("{:?}", swing_signals_ctx).hash(&mut hasher);
     htf_bias_ctx.hash(&mut hasher);
     format!("{:?}", fvg_zones_ctx).hash(&mut hasher);
@@ -413,7 +418,7 @@ pub async fn generate_fundamental_report(
     }
 
     // --- MACRO ENGINE (Deterministic) ---
-    let context = build_context(symbol, period, &relevant_events, technical_levels, swing_signals_ctx, htf_bias_ctx, fvg_zones_ctx);
+    let context = build_context(symbol, period, &relevant_events, technical_levels, swing_signals_ctx, htf_bias_ctx, fvg_zones_ctx, headlines);
 
     // --- BRIDGE LAYER (Serialization) ---
     let mut context_map = serde_json::to_value(&context).unwrap_or(serde_json::json!({}));

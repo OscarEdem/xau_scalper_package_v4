@@ -49,4 +49,5 @@ pub struct MacroContext {
     pub swing_signals: Vec<TechnicalSignal>,
     pub htf_bias: String,
     pub fvg_zones: Vec<String>,
+    pub news_headlines: Vec<String>,
 }

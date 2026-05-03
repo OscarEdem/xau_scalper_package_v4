@@ -13,6 +13,7 @@ pub fn build_context(
     swing_signals: Vec<TechnicalSignal>,
     htf_bias: String,
     fvg_zones: Vec<String>,
+    news_headlines: Vec<String>,
 ) -> MacroContext {
     // 1. Extract base/quote
     let base = if pair.len() >= 3 { &pair[0..3] } else { "" };
@@ -52,5 +53,6 @@ pub fn build_context(
         swing_signals,
         htf_bias,
         fvg_zones,
+        news_headlines,
     }
 }
