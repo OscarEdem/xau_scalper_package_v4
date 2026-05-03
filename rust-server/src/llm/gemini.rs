@@ -71,11 +71,11 @@ pub async fn generate_analysis(
     // Fallback models in order of preference
     // Fallback models prioritizing "Flash Lite" variants for higher RPD/RPM on Free Tier
     let models = [
-        "gemini-3.1-flash-lite", // Explicitly requested "Flash Lite" (500 RPD)
-        "gemini-1.5-flash-8b",   // High RPD (500+)
-        "gemini-2.0-flash-lite", // New Lite model
-        "gemini-2.0-flash",      // Standard Flash
-        "gemini-1.5-flash"       // Original Flash
+        "gemini-3.1-flash-lite", // User requested
+        "gemini-1.5-flash-8b",   // Official High RPD Lite
+        "gemini-1.5-flash",      // High RPD Workhorse
+        "gemini-2.0-flash-lite", // New Lite
+        "gemini-2.0-flash",      // Standard
     ];
     let mut last_error = anyhow!("No models available");
 
@@ -140,12 +140,13 @@ pub async fn generate_analysis(
             sleep(backoff).await;
             attempt += 1;
             backoff *= 2;
-            } else {
+        } else {
             let status = res.status();
             let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::warn!("Model '{}' skipped. Status: {}. Error: {}", model, status, error_text);
             last_error = anyhow!("Gemini API Error {} for {}: {}", status, model, error_text);
             break; // Try next model
-            }
+        }
         }
     }
     
