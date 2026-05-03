@@ -24,6 +24,16 @@ impl TradingService {
         }
     }
 
+    pub fn broadcast_ai_update(&self, analysis: serde_json::Value) {
+        let payload = serde_json::json!({
+            "type": "ai_update",
+            "data": analysis,
+            "timestamp": Utc::now().timestamp()
+        }).to_string();
+        
+        let _ = self.state.tick_tx.send(payload);
+    }
+
     pub async fn process_eval_request(&self, mut req: EvalRequest<'static>) -> Result<(), StatusCode> {
         self.state.inner.metrics.http_requests.inc();
         
@@ -92,6 +102,14 @@ impl TradingService {
             self.state.inner.metrics.signal_counter.inc_by(num_new_signals as f64);
         }
         for (signal, symbol) in signals_to_send {
+            // --- WS BROADCAST ---
+            let payload = serde_json::json!({
+                "type": "signal",
+                "symbol": symbol,
+                "data": signal
+            }).to_string();
+            let _ = self.state.tick_tx.send(payload);
+
             if signal.should_push {
                 self.send_push_notification(&signal, &symbol).await;
             }

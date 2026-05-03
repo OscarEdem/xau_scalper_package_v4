@@ -186,6 +186,10 @@ pub async fn chat_analysis_handler(
                 history.pop_front();
             }
 
+            // --- WS BROADCAST ---
+            let service = TradingService::new(state.clone());
+            service.broadcast_ai_update(structured_res.clone());
+
             Ok(Json(structured_res))
         },
         Err(e) => {
@@ -474,13 +478,19 @@ pub async fn generate_fundamental_report(
         tracing::error!("Failed to save analysis report to DB: {}", e);
     }
 
-    serde_json::json!({
+    let final_response = serde_json::json!({
         "symbol": symbol,
         "period": period,
         "analysis": result,
         "source_events_count": relevant_events.len(),
         "source": "api",
-    })
+    });
+
+    // --- WS BROADCAST ---
+    let service = TradingService::new(state.clone());
+    service.broadcast_ai_update(final_response.clone());
+
+    final_response
 }
 
 /// Starts a background task that runs analysis at specific times.
