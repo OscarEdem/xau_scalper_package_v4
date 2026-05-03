@@ -69,7 +69,13 @@ pub async fn generate_analysis(
     });
 
     // Fallback models in order of preference
-    let models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-3-flash"];
+    // Fallback models prioritizing "Flash Lite" variants for higher RPD/RPM on Free Tier
+    let models = [
+        "gemini-1.5-flash-8b",   // High RPD (500+)
+        "gemini-2.0-flash-lite", // New Lite model
+        "gemini-2.0-flash",      // Standard Flash
+        "gemini-1.5-flash"       // Original Flash
+    ];
     let mut last_error = anyhow!("No models available");
 
     for model in models {
