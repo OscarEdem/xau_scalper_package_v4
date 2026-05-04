@@ -271,6 +271,7 @@ impl ScalpEngine {
             signal_id,
             entry_type: decision.entry_type,
             entry_price: decision.entry_price,
+            atr: last_atr,
             sl_price: sl,
             tp1_price: tp1,
             tp2_price: tp2,

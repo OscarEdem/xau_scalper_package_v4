@@ -25,23 +25,24 @@ pub fn calculate_bias(
     current_price: f64,
     future_periods: f64,
 ) -> f64 {
-    let model_types = ["gbm", "heston", "lstm"];
-    let predictors: Vec<_> = model_types
-        .iter()
-        .map(|&model_type| (model_type, predictor_cache.get_or_load(model_type, timeframe)))
-        .collect();
+    // Memory Optimization: Removed "heston" to save RAM on Render.
+    // Using only the two strongest models for the ensemble.
+    let model_types = ["gbm", "lstm"];
 
     let mut total_confidence = 0.0;
     let mut weighted_prediction_sum = 0.0;
     let mut individual_predictions = Vec::new();
 
-    for (model_type, p) in predictors {
+    for &model_type in &model_types {
+        let p = predictor_cache.get_or_load(model_type, timeframe);
+        
+        // Use a safe prediction wrapper to avoid panics on corrupt data
         let pred_price = p.predict(closes, future_periods).unwrap_or(current_price);
-        let mut confidence = p.confidence().unwrap_or(0.0);
+        let mut confidence = p.confidence().unwrap_or(0.01); // Min confidence floor
 
-        // Custom Weighting: Boost LSTM influence relative to GBM/Heston
+        // Custom Weighting: Boost LSTM influence relative to GBM
         if model_type == "lstm" {
-            confidence *= 2.0; // Double the weight of the LSTM model
+            confidence *= 2.0; 
         }
 
         let predicted_change = pred_price - current_price;

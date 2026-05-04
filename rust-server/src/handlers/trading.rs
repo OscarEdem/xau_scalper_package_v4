@@ -23,7 +23,8 @@ pub async fn tick_ingest_handler(
     state.inner.metrics.http_requests.inc();
     let service = crate::services::trading::TradingService::new(state);
     if let Ok(tick_json) = serde_json::to_string(&tick_data) {
-        service.broadcast_tick(tick_json);
+        // Broadcast disabled: Sidecar handles local ticks
+        // service.broadcast_tick(tick_json);
         StatusCode::OK
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

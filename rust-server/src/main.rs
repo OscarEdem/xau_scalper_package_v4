@@ -168,9 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 1. Create a channel to broadcast live market data AND signals to WebSocket clients.
-    // Increased buffer size to 10,000 to prevent 'Lagged' errors during high volatility
-    // when mixing high-frequency ticks with critical signals.
-    let (tick_tx, _) = broadcast::channel::<String>(10000);
+    // Reduced buffer size to 1,000 to save memory on Render.
+    let (tick_tx, _) = broadcast::channel::<String>(1000);
 
     // Initialize the shared state
     let shared_state = ApplicationState {
@@ -259,6 +258,7 @@ async fn shutdown_signal(shutdown_tx: broadcast::Sender<()>) {
 
 pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
     Router::new()
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)) // 2MB Limit
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/", get(handlers::system::health_check_handler))
         .route("/ws", get(handlers::ws::websocket_handler))

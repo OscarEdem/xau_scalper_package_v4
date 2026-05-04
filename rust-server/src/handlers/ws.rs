@@ -80,9 +80,11 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
             recv = rx.recv() => {
                 match recv {
                     Ok(msg) => {
-                        if socket.send(Message::Text(msg)).await.is_err() {
-                            // Decrement happens in the recv block above if connection fails
-                            break;
+                        // Filter: Only send Signals or AI Updates. Skip Ticks.
+                        if msg.contains("\"type\":\"signal\"") || msg.contains("\"type\":\"ai_update\"") || msg.contains("\"signalId\"") {
+                            if socket.send(Message::Text(msg)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

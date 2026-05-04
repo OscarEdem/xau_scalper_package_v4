@@ -37,6 +37,7 @@ impl TradingService {
     pub async fn process_eval_request(&self, mut req: EvalRequest<'static>) -> Result<(), StatusCode> {
         self.state.inner.metrics.http_requests.inc();
         
+        /*
         // Optimization: Only serialize and send if there are actual subscribers
         if self.state.tick_tx.receiver_count() > 0 {
             let tick_payload = serde_json::json!({
@@ -50,6 +51,7 @@ impl TradingService {
 
             let _ = self.state.tick_tx.send(tick_payload);
         }
+        */
 
         // --- NEW: Inject cached news events into the request ---
         let news_guard = self.state.inner.news_events.lock().await;

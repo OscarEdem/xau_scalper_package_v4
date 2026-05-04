@@ -218,6 +218,7 @@ pub struct EvalResponse {
     pub signal_id: String, // e.g., a UUID or timestamp-based ID
     pub entry_type: SignalDirection, // "long", "short", "none"
     pub entry_price: f64,
+    pub atr: f64,
     pub sl_price: f64,
     pub tp1_price: f64, // Imbalance fill
     pub tp2_price: f64, // Liquidity target
@@ -260,6 +261,7 @@ impl Default for EvalResponse {
             signal_id: "".to_string(),
             entry_type: SignalDirection::None,
             entry_price: 0.0,
+            atr: 0.0,
             sl_price: 0.0,
             tp1_price: 0.0,
             tp2_price: 0.0,
