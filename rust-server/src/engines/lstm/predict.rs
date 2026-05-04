@@ -28,6 +28,8 @@ pub struct LSTM {
 impl LSTM {
     pub fn load(model_path: &str) -> Result<Self, Box<dyn Error>> {
         let session = Session::builder()?
+            .with_intra_threads(1)?
+            .with_inter_threads(1)?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(model_path)?;
 

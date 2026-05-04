@@ -196,22 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: db_pool,
     };
 
-    // --- NEW: Load persisted sessions from DB ---
-    match db::load_sessions(&shared_state.db, Some(&shared_state.metrics.db_retries_total)).await {
-        Ok(sessions) => {
-            for mut session in sessions {
-                session.broadcast_tx = Some(tick_tx.clone());
-                session.db = Some(shared_state.db.clone()); // Inject DB pool
-                session.metrics = Some(Arc::new(shared_state.metrics.clone())); // Inject Metrics
-                tracing::info!("Loaded session for {} from DB.", session.symbol);
-                shared_state.session_manager.sessions.insert(session.symbol.clone(), Arc::new(Mutex::new(session)));
-            }
-        },
-        Err(e) => {
-            tracing::error!("Failed to load sessions from DB: {}", e);
-        }
-    };
-
     // --- Phase 2: Real-time Data Gateway ---
 
     // Add the tick_tx channel to the application state so the handler can access it.

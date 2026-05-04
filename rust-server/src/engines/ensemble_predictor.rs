@@ -25,9 +25,7 @@ pub fn calculate_bias(
     current_price: f64,
     future_periods: f64,
 ) -> f64 {
-    // Memory Optimization: Removed "heston" to save RAM on Render.
-    // Using only the two strongest models for the ensemble.
-    let model_types = ["gbm", "lstm"];
+    let model_types = ["gbm", "heston", "lstm"];
 
     let mut total_confidence = 0.0;
     let mut weighted_prediction_sum = 0.0;
@@ -40,7 +38,7 @@ pub fn calculate_bias(
         let pred_price = p.predict(closes, future_periods).unwrap_or(current_price);
         let mut confidence = p.confidence().unwrap_or(0.01); // Min confidence floor
 
-        // Custom Weighting: Boost LSTM influence relative to GBM
+        // Custom Weighting: Boost LSTM influence relative to GBM/Heston
         if model_type == "lstm" {
             confidence *= 2.0; 
         }

@@ -172,8 +172,6 @@ impl SwingEngine {
             1.0, // Swing prediction for next H1 period
         );
 
-        let d1_bias = 0.0; // Disabled D1 models to save memory on Render
-        /*
         let d1_bias = ensemble_predictor::calculate_bias(
             predictor_cache,
             "d1",
@@ -181,7 +179,6 @@ impl SwingEngine {
             req.current_price,
             1.0, // Swing prediction for next D1 period
         );
-        */
 
         let final_prediction_bias = (h1_bias * settings.ensemble_h1_weight) + (d1_bias * settings.ensemble_d1_weight);
         debug!(h1_bias, d1_bias, final_bias = final_prediction_bias, "Swing ensemble prediction calculated");
