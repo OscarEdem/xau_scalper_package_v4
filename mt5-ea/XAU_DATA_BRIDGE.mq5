@@ -5,7 +5,7 @@
 
 
 // --- EA Inputs ---
-input string ServerUrl = "https://gold-ml-base-server.onrender.com"; // Base URL, endpoints will be appended
+input string ServerUrl = "https://xau-scalper-pro.duckdns.org"; // Base URL, endpoints will be appended
 input int    NumCloses = 300; // Increased to satisfy server's longest indicator (SMA 200) and provide buffer
 input double MaxSpreadPoints = 162;
 

@@ -136,7 +136,7 @@ The server starts at `http://0.0.0.0:3000`.
 
 | Parameter | Description | Recommended |
 |-----------|-------------|-------------|
-| `ServerUrl` | Rust server base URL | `https://gold-ml-base-server.onrender.com` |
+| `ServerUrl` | Rust server base URL | `https://xau-scalper-pro.duckdns.org` |
 | `NumCloses` | Historical bars sent per timeframe | `300` (min 250) |
 | `MaxSpreadPoints` | Skip send if spread exceeds this | `162` |
 | `EnableTickBridge` | Send live ticks to `/ticks` | `true` |

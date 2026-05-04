@@ -85,8 +85,7 @@ impl Predictor for LSTM {
         
         let raw_output = *output_slice.first().ok_or("Model returned empty prediction")? as f64;
 
-        let last_price = *recent_data.last().unwrap_or(&0.0);
-        let predicted_price = last_price * raw_output.exp();
+        let predicted_price = (raw_output * self.scaler.std) + self.scaler.mean;
 
         Ok(predicted_price)
     }
