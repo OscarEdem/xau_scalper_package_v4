@@ -15,37 +15,27 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # 1. Build & Test Rust Server
-  build-and-test:
-    name: Build & Test (Rust)
-    runs-on: ubuntu-latest
+  # 1. Build & Test + Docker Push
+  # Consolidating these into one flow to maximize cache efficiency
+  pipeline:
+    name: Build, Test & Push
+    runs-on: ubuntu-24.04 # Upgraded to 24.04 to match Docker glibc requirements
     steps:
       - uses: actions/checkout@v4
+
+      # --- RUST CACHING (for tests) ---
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cache Cargo
-        uses: actions/cache@v4
+      - uses: swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            rust-server/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build
-        working-directory: rust-server
-        run: cargo build --release
-      - name: Test
+          workspaces: rust-server -> target
+
+      - name: Run Tests
         working-directory: rust-server
         run: cargo test --lib --verbose
 
-  # 2. Build & Push to AWS ECR
-  build-and-push-ecr:
-    name: Build & Push to ECR
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-
+      # --- DOCKER BUILD & PUSH ---
       - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -53,43 +43,49 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+      - name: Set up Docker Buildx
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/setup-buildx-action@v3
 
-  # 3. Deploy to EC2 via SSH
+      - name: Build and push to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          # GHA Cache: This is the primary speed booster
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 2. Deploy to EC2
   deploy-ec2:
     name: Deploy to EC2
     runs-on: ubuntu-latest
-    needs: build-and-push-ecr
+    needs: pipeline
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - name: Deploy to EC2 via SSH
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Login to ECR on the EC2 instance
+            # Login to ECR
             aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
             
-            # Pull latest image
+            # Pull and Restart
             docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
-            
-            # Stop and remove old container if it exists
             docker stop xau-scalper || true
             docker rm xau-scalper || true
             
-            # Run new container (mapping 80 to app port 3000)
             docker run -d \
               --name xau-scalper \
               -p 3000:3000 \
