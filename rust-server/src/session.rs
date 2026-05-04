@@ -448,21 +448,30 @@ impl TradingSession {
         // Update session configuration from global settings
         self.filter_scalp_by_swing = settings.scalp.filter_scalp_by_swing;
 
-        // 1. Update data buffers
+        // 1. Update data buffers (Always do this to keep price fresh)
         self.market_data.update(&req, &settings);
         
+        let is_new_candle = req.last_m1_timestamp > self.last_evaluation_timestamp;
         self.last_evaluation_timestamp = req.last_m1_timestamp;
 
-        // Log buffer status to help debug "Insufficient Data"
+        // Log buffer status
         info!(
             symbol = %self.symbol,
+            is_new_candle,
             m1_len = self.market_data.m1_closes.len(),
-            m5_len = self.market_data.m5_closes.len(),
-            h1_len = self.market_data.h1_closes.len(),
             "Session buffers updated."
         );
 
         let mut notifications = Vec::new();
+
+        // 2. Run Engine Logic (Gated by New Candle or Force)
+        // We only run the heavy ML engines if a new candle has formed.
+        // This saves massive CPU on 0.1 CPU tiers like Render.
+        if !is_new_candle {
+            // Even if no new candle, we still manage active trades (SL/TP)
+            self.manage_existing_trades_lightweight(&req, &settings, &mut notifications);
+            return notifications;
+        }
 
         // 2. Run Swing Engine & Logic (gated for HTF stability)
         // Run full Swing evaluation only on H1 boundary, on ATR/interval triggers, or force.
@@ -551,44 +560,6 @@ impl TradingSession {
             notifications.extend(swing_notifications);
             // mark last eval time
             self.last_swing_eval_time = req.last_h1_timestamp.unwrap_or(req.last_m1_timestamp);
-        } else {
-            // Lightweight per-tick trade management: check existing active swing for SL hits only.
-            if let Some(existing) = &self.latest_swing_signal {
-                if existing.entry_type != SignalDirection::None {
-                    let h1_atr = crate::atr(&Cow::Borrowed(self.market_data.h1_highs.make_contiguous()), 
-                                            &Cow::Borrowed(self.market_data.h1_lows.make_contiguous()), 
-                                            &Cow::Borrowed(self.market_data.h1_closes.make_contiguous()), 14)
-                                            .last().cloned().unwrap_or(0.0);
-                    let mut managed = existing.clone();
-                    self.manage_active_swing_trade(&mut managed, req.current_price, req.last_m1_timestamp, h1_atr);
-                    if managed.entry_type == SignalDirection::None {
-                        // SL hit -> notify/close
-                        let mut close_notification = managed.clone();
-                        close_notification.should_push = settings.swing.push_notifications_enabled;
-                        if close_notification.should_push { Self::format_push_notification(&mut close_notification, &self.symbol); }
-                        if let Some(db) = &self.db {
-                            let mut sig_clone = close_notification.clone();
-                            sig_clone.signal_id = format!("{}_CLOSE_{}", sig_clone.signal_id, Utc::now().timestamp_millis());
-                            let sym_clone = self.symbol.clone();
-                            let db_clone = db.clone();
-                            let metrics_clone = self.metrics.clone();
-                            tokio::spawn(async move { 
-                                if let Err(e) = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
-                                    tracing::error!(symbol = %sym_clone, signal_id = %sig_clone.signal_id, error = %e, "Failed to save swing close signal to DB");
-                                }
-                            });
-                        }
-                        self.broadcast_signal(&close_notification);
-                        notifications.push(close_notification);
-                        // clear execution state
-                        self.swing_execution.last_notified_signal_id = None;
-                        self.swing_execution.last_notified_direction = SignalDirection::None;
-                    } else {
-                        // update latest_swing_signal to keep latch/debug info fresh
-                        self.latest_swing_signal = Some(managed);
-                    }
-                }
-            }
         }
 
         // 3. Run Scalp Engine & Logic
@@ -596,6 +567,54 @@ impl TradingSession {
         notifications.extend(scalp_notifications);
 
         notifications
+    }
+
+    fn manage_existing_trades_lightweight(&mut self, req: &EvalRequest, settings: &TradingSettings, notifications: &mut Vec<EvalResponse>) {
+        // --- 1. Manage Swing Trades ---
+        if let Some(existing) = &self.latest_swing_signal {
+            if existing.entry_type != SignalDirection::None {
+                let h1_atr = crate::atr(&Cow::Borrowed(self.market_data.h1_highs.make_contiguous()), 
+                                        &Cow::Borrowed(self.market_data.h1_lows.make_contiguous()), 
+                                        &Cow::Borrowed(self.market_data.h1_closes.make_contiguous()), 14)
+                                        .last().cloned().unwrap_or(0.0);
+                let mut managed = existing.clone();
+                self.manage_active_swing_trade(&mut managed, req.current_price, req.last_m1_timestamp, h1_atr);
+                
+                if managed.entry_type == SignalDirection::None {
+                    // SL hit -> notify/close
+                    let mut close_notification = managed.clone();
+                    close_notification.should_push = settings.swing.push_notifications_enabled;
+                    if close_notification.should_push { Self::format_push_notification(&mut close_notification, &self.symbol); }
+                    if let Some(db) = &self.db {
+                        let mut sig_clone = close_notification.clone();
+                        sig_clone.signal_id = format!("{}_CLOSE_{}", sig_clone.signal_id, Utc::now().timestamp_millis());
+                        let sym_clone = self.symbol.clone();
+                        let db_clone = db.clone();
+                        let metrics_clone = self.metrics.clone();
+                        tokio::spawn(async move { 
+                            if let Err(e) = crate::db::save_signal(&db_clone, &sig_clone, &sym_clone, metrics_clone.as_ref().map(|m| &m.db_retries_total)).await {
+                                tracing::error!(symbol = %sym_clone, signal_id = %sig_clone.signal_id, error = %e, "Failed to save swing close signal to DB");
+                            }
+                        });
+                    }
+                    self.broadcast_signal(&close_notification);
+                    notifications.push(close_notification);
+                    // clear execution state
+                    self.swing_execution.last_notified_signal_id = None;
+                    self.swing_execution.last_notified_direction = SignalDirection::None;
+                } else {
+                    // update latest_swing_signal to keep latch/debug info fresh
+                    self.latest_swing_signal = Some(managed);
+                }
+            }
+        }
+
+        // --- 2. Manage Scalp Trades (Heartbeat Only) ---
+        if let Some(existing) = &self.latest_scalp_signal {
+             if existing.entry_type != SignalDirection::None {
+                 // Future: Add lightweight trailing stop check here if needed
+             }
+        }
     }
 
     fn process_swing_logic(&mut self, req: &EvalRequest, predictor_cache: &PredictorCache, settings: &TradingSettings) -> Vec<EvalResponse> {
