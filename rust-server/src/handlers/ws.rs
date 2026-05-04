@@ -35,27 +35,32 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                 match result {
                     Ok(Message::Text(text)) => {
                         // Attempt to parse as market data
-                        if let Ok(req) = serde_json::from_str::<crate::EvalRequest>( &text) {
+                        if let Ok(req) = serde_json::from_str::<xau_scalper_server::EvalRequest>(&text) {
                             let symbol = req.symbol.to_string();
                             
-                            // Process via Trading Session
-                            let mut sessions = state.inner.sessions.write().unwrap();
-                            let session = sessions.entry(symbol.clone()).or_insert_with(|| {
-                                tracing::info!(symbol = %symbol, "Creating new trading session via WebSocket data ingestion.");
-                                crate::session::TradingSession::new(
-                                    symbol.clone(),
-                                    state.inner.settings.read().unwrap().scalp.filter_scalp_by_swing,
-                                    1000,
-                                    Some(state.tick_tx.clone()),
-                                    state.inner.db.clone(),
-                                    Some(state.inner.metrics.clone()),
-                                )
-                            });
+                            // Process via Trading Session (Managed by SessionManager)
+                            let session_arc = {
+                                if let Some(s) = state.inner.session_manager.sessions.get(&symbol) {
+                                    s.clone()
+                                } else {
+                                    let settings = state.inner.session_manager.settings.read().unwrap();
+                                    let new_session = Arc::new(tokio::sync::Mutex::new(xau_scalper_server::TradingSession::new(
+                                        symbol.clone(),
+                                        settings.scalp.filter_scalp_by_swing,
+                                        settings.max_buffer_size,
+                                        Some(state.tick_tx.clone()),
+                                        Some(state.inner.db.clone()),
+                                        Some(Arc::new(state.inner.metrics.clone())),
+                                    )));
+                                    state.inner.session_manager.sessions.insert(symbol.clone(), new_session.clone());
+                                    new_session
+                                }
+                            };
 
-                            let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.settings);
+                            let mut session = session_arc.lock().await;
+                            let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.session_manager.settings);
                             
                             // The session.on_data already broadcasts signals to WS if they are valid.
-                            // But we return them here for logging or additional processing if needed.
                             if !signals.is_empty() {
                                 tracing::info!(symbol = %symbol, count = signals.len(), "Generated signals from WebSocket data ingestion.");
                             }
