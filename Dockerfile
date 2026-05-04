@@ -15,7 +15,9 @@ COPY --from=rust-installer /root/.rustup /root/.rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install build dependencies required by crates like `openssl-sys`
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential dos2unix && \
+# ca-certificates is required so cargo can reach crates.io over HTTPS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates pkg-config libssl-dev build-essential dos2unix && \
     rm -rf /var/lib/apt/lists/*
 
 # Use /app as the working directory
