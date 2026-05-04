@@ -1,4 +1,4 @@
-name: CI / CD
+name: CI / CD to AWS
 
 on:
   push:
@@ -6,143 +6,94 @@ on:
   pull_request:
     branches: [ main ]
 
-# Global permissions for the GITHUB_TOKEN
 permissions:
   contents: read
-  packages: write
 
-# Opt into Node.js 24 now to silence deprecation warnings
 env:
-  REGISTRY: ghcr.io
-  # Must match the existing GHCR package name exactly
-  IMAGE_NAME: oscaredem/xau_scalper_package_v4
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: xau-scalper-v4
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────
-  # JOB 1: Build & Test the Rust server
-  # Runs on every push and pull request to main.
-  # ─────────────────────────────────────────────────────────────────
+  # 1. Build & Test Rust Server
   build-and-test:
     name: Build & Test (Rust)
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # dtolnay/rust-toolchain is the maintained successor to actions-rs/toolchain
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo dependencies
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            rust-server/target/
+            ~/.cargo/registry
+            rust-server/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build (release)
+      - name: Build
         working-directory: rust-server
         run: cargo build --release
-
-      - name: Test (unit tests only — e2e tests require Postgres, run locally)
+      - name: Test
         working-directory: rust-server
         run: cargo test --lib --verbose
 
-  # ─────────────────────────────────────────────────────────────────
-  # JOB 2: Build & Push Docker image to GitHub Container Registry
-  # Only runs on pushes to main (not on PRs) after tests pass.
-  #
-  # ⚠️  ONE-TIME SETUP REQUIRED (fixes 403 Forbidden):
-  #   The package lives under your USER account, not the repository.
-  #   GITHUB_TOKEN only gets push rights after you explicitly grant it:
-  #
-  #   1. Go to:
-  #      https://github.com/users/oscaredem/packages/container/xau_scalper_package_v4/settings
-  #   2. Scroll to "Manage Actions access"
-  #   3. Click "Add Repository" → oscaredem/xau_scalper_package_v4 → Role: Write
-  #
-  #   Without that step this job will always fail with 403 Forbidden.
-  # ─────────────────────────────────────────────────────────────────
-  build-and-push-docker:
-    name: Build & Push Docker Image
+  # 2. Build & Push to AWS ECR
+  build-and-push-ecr:
+    name: Build & Push to ECR
     runs-on: ubuntu-latest
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          # GITHUB_TOKEN works once the package grants this repo Write access.
-          # If it still 403s after the package settings step above, create a PAT
-          # with write:packages scope and add it as secret GHCR_TOKEN, then
-          # switch this line to: password: ${{ secrets.GHCR_TOKEN }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # Generates tags:
-      #   ghcr.io/oscaredem/xau_scalper_package_v4:latest
-      #   ghcr.io/oscaredem/xau_scalper_package_v4:main
-      #   ghcr.io/oscaredem/xau_scalper_package_v4:sha-<short>
-      - name: Extract Docker metadata (tags & labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=sha,prefix=sha-,format=short
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
-          # Layer caching via GitHub Actions cache (fast rebuilds)
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ─────────────────────────────────────────────────────────────────
-  # JOB 3: Tell Render to redeploy using the new :main image
-  #
-  # Requires secret RENDER_DEPLOY_HOOK_URL set in repo settings.
-  # Get it from: Render Dashboard → Service → Settings → Deploy Hook
-  # ─────────────────────────────────────────────────────────────────
-  deploy-render:
-    name: Deploy to Render
-    runs-on: ubuntu-latest
-    needs: build-and-push-docker
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Trigger Render deploy hook
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
-          echo "Render deploy hook responded: HTTP $response"
-          if [ "$response" != "200" ] && [ "$response" != "201" ] && [ "$response" != "202" ]; then
-            echo "::error::Render deploy hook failed with HTTP $response"
-            exit 1
-          fi
-          echo "✅ Render redeployment triggered successfully."
-          echo "Monitor at: https://dashboard.render.com"
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  # 3. Deploy to EC2 via SSH
+  deploy-ec2:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push-ecr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Login to ECR on the EC2 instance
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+            
+            # Pull latest image
+            docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+            
+            # Stop and remove old container if it exists
+            docker stop xau-scalper || true
+            docker rm xau-scalper || true
+            
+            # Run new container (mapping 80 to app port 3000)
+            docker run -d \
+              --name xau-scalper \
+              -p 80:3000 \
+              -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
+              -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+              --restart always \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest

@@ -415,16 +415,9 @@ pub async fn generate_fundamental_report(
     }
     // --- End Caching Logic ---
 
-    // If no events are found, return a default response instead of calling the AI.
-    if relevant_events.is_empty() {
-        return serde_json::json!({
-            "symbol": symbol,
-            "period": period,
-            "analysis": "No high-impact news events found for this period. Market likely driven by technicals.",
-            "source_events_count": 0,
-            "source": "api",
-        });
-    }
+    // Proceed to generate report regardless of event count.
+    // The AI will use headlines and technicals if news is sparse.
+    let source_events_count = relevant_events.len();
 
     // --- MACRO ENGINE (Deterministic) ---
     let context = build_context(symbol, period, &relevant_events, technical_levels, swing_signals_ctx, htf_bias_ctx, fvg_zones_ctx, headlines);
@@ -482,7 +475,7 @@ pub async fn generate_fundamental_report(
         "symbol": symbol,
         "period": period,
         "analysis": result,
-        "source_events_count": relevant_events.len(),
+        "source_events_count": source_events_count,
         "source": "api",
     });
 
