@@ -255,6 +255,22 @@ pub struct EvalResponse {
     pub push_body: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSignal {
+    pub symbol: String,
+    #[serde(flatten)]
+    pub signal: EvalResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalSignal {
+    #[serde(flatten)]
+    pub signal: ActiveSignal,
+    pub created_at: i64, // Unix timestamp
+}
+
 impl Default for EvalResponse {
     fn default() -> Self {
         Self {

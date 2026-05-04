@@ -2,7 +2,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Pool, Postgres, Row};
 use std::str::FromStr;
 use tracing::info;
-use crate::{EvalResponse, TradingSession, NewsEvent, NewsItem};
+use crate::{EvalResponse, TradingSession, NewsEvent, NewsItem, ActiveSignal, HistoricalSignal};
 use crate::config::TradingSettings;
 use std::collections::BTreeSet;
 use prometheus::Counter;
@@ -231,3 +231,27 @@ pub async fn load_rss_news(pool: &DbPool, retry_counter: Option<&Counter>) -> Re
     }
     Ok(items)
 }
+
+pub async fn load_recent_signals(pool: &DbPool, limit: i64, retry_counter: Option<&Counter>) -> Result<Vec<HistoricalSignal>, sqlx::Error> {
+    let rows = db_retry!(sqlx::query("SELECT symbol, timestamp, data FROM signals ORDER BY timestamp DESC LIMIT $1")
+        .bind(limit)
+        .fetch_all(pool), retry_counter)?;
+    
+    let mut signals = Vec::new();
+    for row in rows {
+        let symbol: String = row.get("symbol");
+        let timestamp: i64 = row.get("timestamp");
+        let data: serde_json::Value = row.get("data");
+        
+        if let Ok(eval_res) = serde_json::from_value::<EvalResponse>(data) {
+            signals.push(HistoricalSignal {
+                signal: ActiveSignal {
+                    symbol,
+                    signal: eval_res,
+                },
+                created_at: timestamp,
+            });
+        }
+    }
+    Ok(signals)
+}

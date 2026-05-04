@@ -15,7 +15,7 @@ use utoipa::{OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 use tokio::fs; // Use tokio's async fs module
 pub use xau_scalper_server::{
-    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory, NewsItem, CalendarEvent
+    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory, NewsItem, CalendarEvent, HistoricalSignal, ActiveSignal
 };
 use tokio::sync::Mutex;
 
@@ -144,6 +144,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // --- NEW: Load historical signals from DB ---
+    let initial_signals = match db::load_recent_signals(&db_pool, 200, None).await {
+        Ok(signals) => {
+            tracing::info!("Loaded {} historical signals from DB", signals.len());
+            signals
+        },
+        Err(e) => {
+            tracing::error!("Failed to load historical signals from DB: {}. Starting with empty history.", e);
+            Vec::new()
+        }
+    };
+
     // Initialize metrics with proper error handling
     let signal_counter = register_counter!("xau_scalper_signals_total", "Total number of signals generated")
         .map_err(|e| format!("Failed to register signal_counter: {}", e))?;
@@ -175,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_state = ApplicationState {
         session_manager: SessionManager::new(trading_settings, tick_tx.clone(), Some(db_pool.clone()), Some(Arc::new(metrics.clone()))),
         predictor_cache: xau_scalper_server::engines::predictor_cache::PredictorCache::new(config.paths.models_dir.clone()),
-        signal_history: Arc::new(Mutex::new(VecDeque::new())),
+        signal_history: Arc::new(Mutex::new(VecDeque::from(initial_signals))),
         // Use the tokens loaded from the file
         push_tokens: Arc::new(Mutex::new(initial_push_tokens)),
         news_events: Arc::new(Mutex::new(Vec::new())),

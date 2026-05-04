@@ -3,25 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, broadcast};
 use dashmap::DashMap;
-use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager, NewsItem, CalendarEvent};
+use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager, NewsItem, CalendarEvent, ActiveSignal, HistoricalSignal};
 use xau_scalper_server::config::Settings;
 use xau_scalper_server::metrics::AppMetrics;
 
-#[derive(serde::Serialize, utoipa::ToSchema, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveSignal {
-    pub symbol: String,
-    #[serde(flatten)]
-    pub signal: EvalResponse,
-}
-
-#[derive(serde::Serialize, utoipa::ToSchema, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct HistoricalSignal {
-    #[serde(flatten)]
-    pub signal: ActiveSignal,
-    pub created_at: i64, // Unix timestamp
-}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct ChatMessage {

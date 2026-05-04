@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 use chrono::Utc;
 use axum::http::StatusCode;
 use expo_push_notification_client::{Expo, ExpoClientOptions, ExpoPushMessage, ExpoPushTicket};
-use xau_scalper_server::{EvalRequest, EvalResponse};
-use crate::state::{ApplicationStateWithTicks, HistoricalSignal, ActiveSignal};
+use xau_scalper_server::{EvalRequest, EvalResponse, HistoricalSignal, ActiveSignal};
+use crate::state::ApplicationStateWithTicks;
 
 pub struct TradingService {
     state: Arc<ApplicationStateWithTicks>,

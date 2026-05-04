@@ -6,11 +6,11 @@ use axum::{
 use std::sync::Arc;
 use std::collections::HashMap;
 use chrono::Utc;
-use xau_scalper_server::EvalRequest;
+use xau_scalper_server::{EvalRequest, HistoricalSignal, ActiveSignal};
 use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
-    ApplicationStateWithTicks, HistoricalSignal, LatestSignalsForSymbol,
+    ApplicationStateWithTicks, LatestSignalsForSymbol,
     SignalDefinitionsResponse, SignalReasonInfo, TickData
 };
 
