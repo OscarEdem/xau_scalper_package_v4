@@ -92,7 +92,7 @@ jobs:
             # Run new container (mapping 80 to app port 3000)
             docker run -d \
               --name xau-scalper \
-              -p 80:3000 \
+              -p 3000:3000 \
               -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
               -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
               --restart always \

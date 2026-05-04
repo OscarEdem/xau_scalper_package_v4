@@ -195,6 +195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         db: db_pool,
     };
+    
+    // --- NEW: Pre-load ML models for AWS (speeds up first trade) ---
+    let pc = shared_state.predictor_cache.clone();
+    tokio::spawn(async move {
+        tracing::info!("Pre-loading ML models (GBM, Heston, LSTM) for M5 timeframe...");
+        let model_types = ["gbm", "heston", "lstm"];
+        for m in model_types {
+            // This triggers the load_predictor logic in predictor_cache
+            pc.get_or_load(m, "m5");
+        }
+        tracing::info!("✅ All ML models pre-loaded and ready for institutional trading.");
+    });
 
     // --- Phase 2: Real-time Data Gateway ---
 

@@ -465,11 +465,17 @@ impl TradingSession {
         let mut notifications = Vec::new();
 
         // 2. Run Engine Logic (Gated by New Candle or Force)
-        // We only run the heavy ML engines if a new candle has formed.
-        // This saves massive CPU on 0.1 CPU tiers like Render.
+        // ON AWS: We always run the Scalp logic for real-time responsiveness, 
+        // but we keep the Swing logic gated for HTF stability.
+        
         if !is_new_candle {
-            // Even if no new candle, we still manage active trades (SL/TP)
+            // Manage active trades (SL/TP) on every tick
             self.manage_existing_trades_lightweight(&req, &settings, &mut notifications);
+            
+            // Run Scalp Engine in real-time (No longer gated!)
+            let scalp_notifications = self.process_scalp_logic(&req, predictor_cache, &settings);
+            notifications.extend(scalp_notifications);
+            
             return notifications;
         }
 
