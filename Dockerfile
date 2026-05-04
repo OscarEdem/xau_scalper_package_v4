@@ -1,8 +1,22 @@
 # Stage 1: Build the application in a full Rust environment
-FROM rust:1-slim-bookworm AS builder
+# Using Ubuntu 24.04 (Noble) as builder because its glibc 2.39 satisfies the
+# prebuilt ONNX Runtime binaries downloaded by `ort` (ort-sys >=2.0-rc.10)
+# which require glibc 2.38+ symbols (__isoc23_strtoll etc.).
+FROM ubuntu:24.04 AS rust-installer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+FROM ubuntu:24.04 AS builder
+COPY --from=rust-installer /root/.cargo /root/.cargo
+COPY --from=rust-installer /root/.rustup /root/.rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install build dependencies required by crates like `openssl-sys`
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential dos2unix
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential dos2unix && \
+    rm -rf /var/lib/apt/lists/*
 
 # Use /app as the working directory
 WORKDIR /app
@@ -23,13 +37,16 @@ COPY rust-server/src ./src
 RUN touch src/main.rs && cargo build --release --bin xau-scalper-server
 
 # Stage 2: Create the final, minimal production image
-FROM debian:bookworm-slim
+# Must use Ubuntu 24.04 (glibc 2.39) to match the builder so that the
+# prebuilt ONNX Runtime shared objects loaded at runtime are compatible.
+FROM ubuntu:24.04
 
 # Add label to link this image to the source repository
 LABEL org.opencontainers.image.source=https://github.com/OscarEdem/xau_scalper_package_v4
 
 # Install runtime dependencies: SSL certificates for HTTPS requests, and utilities for data conversion.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl dos2unix gawk libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl dos2unix gawk libssl3 libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau_scalper_server
