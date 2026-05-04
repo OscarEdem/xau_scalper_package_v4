@@ -124,7 +124,8 @@ void OnTick()
 // --- UI Update for flashing indicator ---
    UpdateDataSendIndicator();
 
-// --- Real-time Tick Bridge Logic ---
+// --- Real-time Tick Bridge Logic DISABLED (Now handled by Python Sidecar) ---
+/*
    static ulong last_tick_req = 0;
    if(EnableTickBridge && (GetTickCount64() - last_tick_req > (ulong)TickBridgeInterval))
      {
@@ -157,6 +158,8 @@ void OnTick()
            }
         }
      }
+*/
+   g_DashLastTickStatus = "Sidecar";
 // --- Original OnTick Logic (runs on new bar) ---
    static datetime last_bar=0;
    MqlRates rates[];
@@ -216,12 +219,36 @@ void ProcessData(bool manual_force)
    bool update_h4 = (iTime(_Symbol, PERIOD_H4, 0) != g_prev_time_h4) || force_sync;
    bool update_d1 = (iTime(_Symbol, PERIOD_D1, 0) != g_prev_time_d1) || force_sync;
 
-   if(update_m5 && CopyRates(_Symbol, PERIOD_M5, 0, NumCloses, m5_rates) < NumCloses) return;
-   if(update_m15 && CopyRates(_Symbol, PERIOD_M15, 0, NumCloses, m15_rates) < NumCloses) return;
-   if(update_m30 && CopyRates(_Symbol, PERIOD_M30, 0, NumCloses, m30_rates) < NumCloses) return;
-   if(update_h1 && CopyRates(_Symbol, PERIOD_H1, 0, NumCloses, h1_rates) < NumCloses) return;
-   if(update_h4 && CopyRates(_Symbol, PERIOD_H4, 0, NumCloses, h4_rates) < NumCloses) return;
-   if(update_d1 && CopyRates(_Symbol, PERIOD_D1, 0, NumCloses, d1_rates) < NumCloses) return;
+   if(update_m5 && CopyRates(_Symbol, PERIOD_M5, 0, NumCloses, m5_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for M5 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
+   if(update_m15 && CopyRates(_Symbol, PERIOD_M15, 0, NumCloses, m15_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for M15 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
+   if(update_m30 && CopyRates(_Symbol, PERIOD_M30, 0, NumCloses, m30_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for M30 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
+   if(update_h1 && CopyRates(_Symbol, PERIOD_H1, 0, NumCloses, h1_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for H1 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
+   if(update_h4 && CopyRates(_Symbol, PERIOD_H4, 0, NumCloses, h4_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for H4 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
+   if(update_d1 && CopyRates(_Symbol, PERIOD_D1, 0, NumCloses, d1_rates) < NumCloses) 
+     {
+      UpdateDashboard("Waiting for D1 data...", TimeCurrent(), 0, g_DashLastTickStatus, g_DashLastTickTime);
+      return;
+     }
 
    // Update trackers
    if(update_m5 && ArraySize(m5_rates) > 0) g_prev_time_m5 = m5_rates[ArraySize(m5_rates)-1].time;
@@ -370,43 +397,75 @@ void ProcessData(bool manual_force)
    long last_h4_timestamp = (ArraySize(h4_rates) > 0) ? (long)h4_rates[ArraySize(h4_rates)-1].time : 0;
    long last_d1_timestamp = (ArraySize(d1_rates) > 0) ? (long)d1_rates[ArraySize(d1_rates)-1].time : 0;
 
-   string json_payload = StringFormat(
-                            "{\"symbol\":\"%s\",\"timeframe\":\"M1\","
-                            "\"currentPrice\":%.5f,\"accountEquity\":%.2f,\"accountCurrency\":\"%s\",\"spreadPoints\":%.1f,\"priceDecimals\":%d,\"lastM1Timestamp\":%lld,"
-                            "\"opens\":[%s],\"closes\":[%s],\"highs\":[%s],\"lows\":[%s],\"volumes\":[%s],"
-                            "\"m5Closes\":[%s],\"m5Highs\":[%s],\"m5Lows\":[%s],\"m5Timestamps\":[%s],"
-                            "\"m15Closes\":[%s],\"m15Highs\":[%s],\"m15Lows\":[%s],\"m15Timestamps\":[%s],"
-                            "\"m30Closes\":[%s],\"m30Highs\":[%s],\"m30Lows\":[%s],"
-                            "\"h1Closes\":[%s],\"h1Highs\":[%s],\"h1Lows\":[%s],\"h1Opens\":[%s],\"h1Timestamps\":[%s],"
-                            "\"h4Closes\":[%s],\"h4Highs\":[%s],\"h4Lows\":[%s],\"h4Timestamps\":[%s],"
-                            "\"d1Opens\":[%s],\"d1Closes\":[%s],\"d1Timestamps\":[%s],"
-                            "\"lastM5Timestamp\":%lld,\"lastM15Timestamp\":%lld,\"lastM30Timestamp\":%lld,\"lastH1Timestamp\":%lld,\"lastH4Timestamp\":%lld,\"lastD1Timestamp\":%lld,"
-                            "\"rsiPeriod\":%d,\"emaFast\":%d,\"emaSlow\":%d,\"atrPeriod\":%d,\"smaPeriod\":%d,"
-                            "\"spreadLimitPoints\":%.1f,"
-                            "\"stochKPeriod\":%d,\"stochDPeriod\":%d,\"stochSlowing\":%d,"
-                            "\"slAtrMultiplier\":%.2f,\"tpAtrMultiplier\":%.2f,"
-                            "\"kfProcessNoise\":%.4f,\"kfMeasurementNoise\":%.4f,"
-                            "\"adxPeriod\":%d,\"adxThreshold\":%.1f,"
-                            "\"chandelierPeriod\":%d,\"chandelierAtrMult\":%.1f,"
-                            "\"maxHoldBars\":%d,"
-                            "\"mode\":\"scalp\"}",
-                            _Symbol,
-                            ask, equity, account_currency, spread_pts, _Digits, last_m1_timestamp,
-                            m1_opens_str, m1_closes_str, m1_highs_str, m1_lows_str, m1_volumes_str,
-                            m5_closes_str, m5_highs_str, m5_lows_str, m5_timestamps_str,
-                            m15_closes_str, m15_highs_str, m15_lows_str, m15_timestamps_str, m30_closes_str, m30_highs_str, m30_lows_str,
-                            h1_closes_str, h1_highs_str, h1_lows_str, h1_opens_str, h1_timestamps_str,
-                            h4_closes_str, h4_highs_str, h4_lows_str, h4_timestamps_str,
-                            d1_opens_str, d1_closes_str, d1_timestamps_str,
-                            last_m5_timestamp, last_m15_timestamp, last_m30_timestamp, last_h1_timestamp, last_h4_timestamp, last_d1_timestamp,
-                            RsiPeriod, EmaFastPeriod, EmaSlowPeriod, AtrPeriod, SmaPeriod, MaxSpreadPoints,
-                            StochKPeriod, StochDPeriod, StochSlowing,
-                            SlAtrMultiplier, TpAtrMultiplier,
-                            KfProcessNoise, KfMeasurementNoise,
-                            AdxPeriod, AdxThreshold, ChandelierPeriod, ChandelierAtrMult, MaxHoldBars
-                         );
+   string json_payload = "";
+   StringAdd(json_payload, "{");
+   StringAdd(json_payload, "\"symbol\":\"" + _Symbol + "\",");
+   StringAdd(json_payload, "\"timeframe\":\"M1\",");
+   StringAdd(json_payload, "\"currentPrice\":" + DoubleToString(ask, _Digits) + ",");
+   StringAdd(json_payload, "\"accountEquity\":" + DoubleToString(equity, 2) + ",");
+   StringAdd(json_payload, "\"accountCurrency\":\"" + account_currency + "\",");
+   StringAdd(json_payload, "\"spreadPoints\":" + DoubleToString(spread_pts, 1) + ",");
+   StringAdd(json_payload, "\"priceDecimals\":" + IntegerToString(_Digits) + ",");
+   StringAdd(json_payload, "\"lastM1Timestamp\":" + IntegerToString(last_m1_timestamp) + ",");
+   StringAdd(json_payload, "\"opens\":[" + m1_opens_str + "],");
+   StringAdd(json_payload, "\"closes\":[" + m1_closes_str + "],");
+   StringAdd(json_payload, "\"highs\":[" + m1_highs_str + "],");
+   StringAdd(json_payload, "\"lows\":[" + m1_lows_str + "],");
+   StringAdd(json_payload, "\"volumes\":[" + m1_volumes_str + "],");
+   StringAdd(json_payload, "\"m5Closes\":[" + m5_closes_str + "],");
+   StringAdd(json_payload, "\"m5Highs\":[" + m5_highs_str + "],");
+   StringAdd(json_payload, "\"m5Lows\":[" + m5_lows_str + "],");
+   StringAdd(json_payload, "\"m5Timestamps\":[" + m5_timestamps_str + "],");
+   StringAdd(json_payload, "\"m15Closes\":[" + m15_closes_str + "],");
+   StringAdd(json_payload, "\"m15Highs\":[" + m15_highs_str + "],");
+   StringAdd(json_payload, "\"m15Lows\":[" + m15_lows_str + "],");
+   StringAdd(json_payload, "\"m15Timestamps\":[" + m15_timestamps_str + "],");
+   StringAdd(json_payload, "\"m30Closes\":[" + m30_closes_str + "],");
+   StringAdd(json_payload, "\"m30Highs\":[" + m30_highs_str + "],");
+   StringAdd(json_payload, "\"m30Lows\":[" + m30_lows_str + "],");
+   StringAdd(json_payload, "\"h1Closes\":[" + h1_closes_str + "],");
+   StringAdd(json_payload, "\"h1Highs\":[" + h1_highs_str + "],");
+   StringAdd(json_payload, "\"h1Lows\":[" + h1_lows_str + "],");
+   StringAdd(json_payload, "\"h1Opens\":[" + h1_opens_str + "],");
+   StringAdd(json_payload, "\"h1Timestamps\":[" + h1_timestamps_str + "],");
+   StringAdd(json_payload, "\"h4Closes\":[" + h4_closes_str + "],");
+   StringAdd(json_payload, "\"h4Highs\":[" + h4_highs_str + "],");
+   StringAdd(json_payload, "\"h4Lows\":[" + h4_lows_str + "],");
+   StringAdd(json_payload, "\"h4Timestamps\":[" + h4_timestamps_str + "],");
+   StringAdd(json_payload, "\"d1Opens\":[" + d1_opens_str + "],");
+   StringAdd(json_payload, "\"d1Closes\":[" + d1_closes_str + "],");
+   StringAdd(json_payload, "\"d1Timestamps\":[" + d1_timestamps_str + "],");
+   StringAdd(json_payload, "\"lastM5Timestamp\":" + IntegerToString(last_m5_timestamp) + ",");
+   StringAdd(json_payload, "\"lastM15Timestamp\":" + IntegerToString(last_m15_timestamp) + ",");
+   StringAdd(json_payload, "\"lastM30Timestamp\":" + IntegerToString(last_m30_timestamp) + ",");
+   StringAdd(json_payload, "\"lastH1Timestamp\":" + IntegerToString(last_h1_timestamp) + ",");
+   StringAdd(json_payload, "\"lastH4Timestamp\":" + IntegerToString(last_h4_timestamp) + ",");
+   StringAdd(json_payload, "\"lastD1Timestamp\":" + IntegerToString(last_d1_timestamp) + ",");
+   StringAdd(json_payload, "\"rsiPeriod\":" + IntegerToString(RsiPeriod) + ",");
+   StringAdd(json_payload, "\"emaFast\":" + IntegerToString(EmaFastPeriod) + ",");
+   StringAdd(json_payload, "\"emaSlow\":" + IntegerToString(EmaSlowPeriod) + ",");
+   StringAdd(json_payload, "\"atrPeriod\":" + IntegerToString(AtrPeriod) + ",");
+   StringAdd(json_payload, "\"smaPeriod\":" + IntegerToString(SmaPeriod) + ",");
+   StringAdd(json_payload, "\"spreadLimitPoints\":" + DoubleToString(MaxSpreadPoints, 1) + ",");
+   StringAdd(json_payload, "\"stochKPeriod\":" + IntegerToString(StochKPeriod) + ",");
+   StringAdd(json_payload, "\"stochDPeriod\":" + IntegerToString(StochDPeriod) + ",");
+   StringAdd(json_payload, "\"stochSlowing\":" + IntegerToString(StochSlowing) + ",");
+   StringAdd(json_payload, "\"slAtrMultiplier\":" + DoubleToString(SlAtrMultiplier, 2) + ",");
+   StringAdd(json_payload, "\"tpAtrMultiplier\":" + DoubleToString(TpAtrMultiplier, 2) + ",");
+   StringAdd(json_payload, "\"kfProcessNoise\":" + DoubleToString(KfProcessNoise, 4) + ",");
+   StringAdd(json_payload, "\"kfMeasurementNoise\":" + DoubleToString(KfMeasurementNoise, 4) + ",");
+   StringAdd(json_payload, "\"adxPeriod\":" + IntegerToString(AdxPeriod) + ",");
+   StringAdd(json_payload, "\"adxThreshold\":" + DoubleToString(AdxThreshold, 1) + ",");
+   StringAdd(json_payload, "\"chandelierPeriod\":" + IntegerToString(ChandelierPeriod) + ",");
+   StringAdd(json_payload, "\"chandelierAtrMult\":" + DoubleToString(ChandelierAtrMult, 1) + ",");
+   StringAdd(json_payload, "\"maxHoldBars\":" + IntegerToString(MaxHoldBars) + ",");
+   StringAdd(json_payload, "\"mode\":\"scalp\"");
+   StringAdd(json_payload, "}");
 
-// --- 1. POST data to the Rust server ---
+   Print("Payload length: ", StringLen(json_payload), " (Transmission handled by Sidecar)");
+
+// --- 1. POST data logic DISABLED (Now handled by Python Sidecar via WebSocket) ---
+/*
    ResetLastError();
    string result_headers;
    StringToCharArray(json_payload, post_data);
@@ -415,21 +474,27 @@ void ProcessData(bool manual_force)
    
    if(res == -1)
      {
-      Print("WebRequest failed. Error code: ", GetLastError());
-      UpdateDashboard("POST /data Failed", m1_rates[ArraySize(m1_rates)-1].time, res, g_DashLastTickStatus, g_DashLastTickTime);
+      int last_err = GetLastError();
+      Print("WebRequest failed. Error code: ", last_err);
+      UpdateDashboard("POST /data Failed", m1_rates[ArraySize(m1_rates)-1].time, last_err, g_DashLastTickStatus, g_DashLastTickTime);
      }
    else
       if(res != 200)
         {
-         Print("Server /data returned non-200 status: ", res);
-         Print("Server response: ", CharArrayToString(result));
-         UpdateDashboard("Server Error", m1_rates[ArraySize(m1_rates)-1].time, res, g_DashLastTickStatus, g_DashLastTickTime);
+          string s_res = CharArrayToString(result);
+          Print("Server /data returned non-200 status: ", res);
+          Print("Server response: ", s_res);
+          Print("Headers: ", result_headers);
+          UpdateDashboard("Server Error", m1_rates[ArraySize(m1_rates)-1].time, res, g_DashLastTickStatus, g_DashLastTickTime);
         }
       else
         {
-         Print("Data POST successful.");
-         UpdateDashboard("OK", m1_rates[ArraySize(m1_rates)-1].time, res, g_DashLastTickStatus, g_DashLastTickTime);
+          Print("Data POST successful.");
+          UpdateDashboard("OK", m1_rates[ArraySize(m1_rates)-1].time, res, g_DashLastTickStatus, g_DashLastTickTime);
         }
+*/
+   g_last_data_sent_time = GetTickCount64();
+   UpdateDashboard("SIDECAR ACTIVE", m1_rates[ArraySize(m1_rates)-1].time, 200, "Sidecar", g_DashLastTickTime);
   }
 
 //+------------------------------------------------------------------+

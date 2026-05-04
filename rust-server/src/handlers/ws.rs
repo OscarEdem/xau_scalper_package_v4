@@ -22,24 +22,61 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
     let prev = state.inner.ws_clients.fetch_add(1, Ordering::SeqCst);
     let new_total = prev + 1;
     state.inner.metrics.active_ws_clients.set(new_total as f64);
-    tracing::info!("New WebSocket client connected. Starting live tick stream... total_clients={}", new_total);
+    tracing::info!("New WebSocket client connected. total_clients={}", new_total);
 
     let mut rx = state.tick_tx.subscribe();
-
-    // Keepalive ping interval to avoid idle connection closures by proxies
     let mut keepalive = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
             biased;
-            // Prefer processing ticks when they arrive
+            // 1. Handle incoming data from Python (Data Ingestion)
+            Some(result) = socket.recv() => {
+                match result {
+                    Ok(Message::Text(text)) => {
+                        // Attempt to parse as market data
+                        if let Ok(req) = serde_json::from_str::<crate::EvalRequest>( &text) {
+                            let symbol = req.symbol.to_string();
+                            
+                            // Process via Trading Session
+                            let mut sessions = state.inner.sessions.write().unwrap();
+                            let session = sessions.entry(symbol.clone()).or_insert_with(|| {
+                                tracing::info!(symbol = %symbol, "Creating new trading session via WebSocket data ingestion.");
+                                crate::session::TradingSession::new(
+                                    symbol.clone(),
+                                    state.inner.settings.read().unwrap().scalp.filter_scalp_by_swing,
+                                    1000,
+                                    Some(state.tick_tx.clone()),
+                                    state.inner.db.clone(),
+                                    Some(state.inner.metrics.clone()),
+                                )
+                            });
+
+                            let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.settings);
+                            
+                            // The session.on_data already broadcasts signals to WS if they are valid.
+                            // But we return them here for logging or additional processing if needed.
+                            if !signals.is_empty() {
+                                tracing::info!(symbol = %symbol, count = signals.len(), "Generated signals from WebSocket data ingestion.");
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                        state.inner.metrics.active_ws_clients.set(remaining as f64);
+                        tracing::info!("WebSocket client disconnected. remaining_clients={}", remaining);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            // 2. Outbound Tick/Signal Stream (Push to Clients)
             recv = rx.recv() => {
                 match recv {
                     Ok(msg) => {
                         if socket.send(Message::Text(msg)).await.is_err() {
-                            let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                            tracing::info!("WebSocket client disconnected while sending tick. remaining_clients={}", remaining);
-                            state.inner.metrics.active_ws_clients.set(remaining as f64);
+                            // Decrement happens in the recv block above if connection fails
                             break;
                         }
                     }
@@ -47,19 +84,16 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                         tracing::warn!("WebSocket subscriber lagged; skipped {} messages", skipped);
                         continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
+
+            // 3. Keepalive
             _ = keepalive.tick() => {
                 if socket.send(Message::Ping(Vec::new())).await.is_err() {
-                    let remaining = state.inner.ws_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                    tracing::info!("WebSocket client disconnected during keepalive ping. remaining_clients={}", remaining);
-                    state.inner.metrics.active_ws_clients.set(remaining as f64);
                     break;
                 }
             }
         }
     }
-}
+}
