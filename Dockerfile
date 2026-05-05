@@ -10,7 +10,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install cargo-chef (download binary instead of compiling from source to save ~3-5 mins)
-RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-installer.sh | sh && mv cargo-chef /usr/local/bin/
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-installer.sh | sh
 
 WORKDIR /app
 
