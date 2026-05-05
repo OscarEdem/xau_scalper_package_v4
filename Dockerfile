@@ -35,6 +35,8 @@ COPY rust-server/src ./src
 # Normalize line endings in migrations (dos2unix installed in chef stage)
 RUN find migrations -type f -exec dos2unix {} +
 RUN cargo build --release --bin xau-scalper-server
+# Clean up build artifacts not needed for the final binary to reduce cache size
+RUN cargo clean --doc
 
 # Stage 2: Create the final, minimal production image
 FROM ubuntu:24.04

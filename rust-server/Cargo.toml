@@ -49,3 +49,10 @@ version = "0.15"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+
+[profile.release]
+strip = true      # Automatically strip symbols from the binary.
+opt-level = 3     # Maximum optimization.
+lto = true        # Link Time Optimization.
+codegen-units = 1 # Better optimizations, but slower build.
+panic = "abort"   # Reduce binary size by removing panic unwinding.

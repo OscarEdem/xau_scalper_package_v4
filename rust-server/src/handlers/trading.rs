@@ -6,7 +6,7 @@ use axum::{
 use std::sync::Arc;
 use std::collections::HashMap;
 use chrono::Utc;
-use xau_scalper_server::{EvalRequest, HistoricalSignal, ActiveSignal};
+use xau_scalper_server::{EvalRequest, HistoricalSignal};
 use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
@@ -21,10 +21,10 @@ pub async fn tick_ingest_handler(
     Json(tick_data): Json<TickData>, 
 ) -> StatusCode {
     state.inner.metrics.http_requests.inc();
-    let service = crate::services::trading::TradingService::new(state);
-    if let Ok(tick_json) = serde_json::to_string(&tick_data) {
+    let _service = crate::services::trading::TradingService::new(state);
+    if let Ok(_tick_json) = serde_json::to_string(&tick_data) {
         // Broadcast disabled: Sidecar handles local ticks
-        // service.broadcast_tick(tick_json);
+        // _service.broadcast_tick(_tick_json);
         StatusCode::OK
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

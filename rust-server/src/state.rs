@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Mutex, broadcast};
 use dashmap::DashMap;
-use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager, NewsItem, CalendarEvent, ActiveSignal, HistoricalSignal};
+use xau_scalper_server::{EvalResponse, NewsEvent, SessionManager, NewsItem, CalendarEvent, HistoricalSignal};
 use xau_scalper_server::config::Settings;
 use xau_scalper_server::metrics::AppMetrics;
 
