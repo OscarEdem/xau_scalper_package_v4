@@ -2,7 +2,7 @@
 # Using Ubuntu 24.04 (Noble) as builder for glibc 2.39 compatibility (required by ort/ONNX Runtime)
 FROM ubuntu:24.04 AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates build-essential pkg-config libssl-dev dos2unix && \
+    curl ca-certificates build-essential pkg-config libssl-dev dos2unix xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Rust
@@ -10,7 +10,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install cargo-chef (download binary instead of compiling from source to save ~3-5 mins)
-RUN curl -L https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-installer.sh | sh -s -- --to /usr/local/bin
 
 WORKDIR /app
 
