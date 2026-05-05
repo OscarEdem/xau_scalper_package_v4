@@ -2,7 +2,7 @@
 # Using Ubuntu 24.04 (Noble) as builder for glibc 2.39 compatibility (required by ort/ONNX Runtime)
 FROM ubuntu:24.04 AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates build-essential pkg-config libssl-dev && \
+    curl ca-certificates build-essential pkg-config libssl-dev dos2unix && \
     rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -26,10 +26,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Copy actual source code and build the final binary
 COPY rust-server/migrations ./migrations
 COPY rust-server/src ./src
-# Install dos2unix for migration normalization
-RUN apt-get update && apt-get install -y --no-install-recommends dos2unix && \
-    rm -rf /var/lib/apt/lists/* && \
-    find migrations -type f -exec dos2unix {} +
+# Normalize line endings in migrations (dos2unix installed in chef stage)
+RUN find migrations -type f -exec dos2unix {} +
 RUN cargo build --release --bin xau-scalper-server
 
 # Stage 2: Create the final, minimal production image
