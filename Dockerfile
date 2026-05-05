@@ -4,13 +4,19 @@ FROM ubuntu:24.04 AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates build-essential pkg-config libssl-dev dos2unix && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install cargo-chef --locked
+
+# Install cargo-chef (download binary instead of compiling from source to save ~3-5 mins)
+RUN curl -L https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
+
 WORKDIR /app
 
 FROM chef AS planner
 # Copy only the files needed for dependency resolution
+# We only copy the rust-server folder as it's the main workspace
 COPY rust-server/Cargo.toml rust-server/Cargo.lock ./rust-server/
 COPY rust-server/src ./rust-server/src
 WORKDIR /app/rust-server

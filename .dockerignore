@@ -1,0 +1,11 @@
+.git
+.github
+rust-server/target
+target
+**/target
+.vscode
+.env
+*.dockerbuild
+mt5-ea
+monitor
+node_modules
