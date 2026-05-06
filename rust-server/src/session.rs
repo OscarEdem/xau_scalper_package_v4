@@ -95,11 +95,17 @@ impl ExecutionManager {
 
         // Check if this is the same signal ID we are already tracking
         if self.last_notified_signal_id.as_ref() == Some(&signal.signal_id) {
-            // If conviction increased since last notification, allow update (higher-confidence heartbeat)
+            // If conviction increased significantly since last notification, allow update (higher-confidence heartbeat)
             let current_conv = signal.conviction_score.unwrap_or(0.0);
-            if current_conv > self.last_notified_conviction {
+            let time_since_last = current_time - self.last_notified_time;
+            
+            // CONVICTION BLOOM THROTTLING: 
+            // Allow update if conviction grew by >= 5.0 points, OR if 60s passed and it grew at all.
+            // This prevents "signal storms" when conviction jitters upwards on every tick.
+            if (current_conv >= self.last_notified_conviction + 5.0) || (time_since_last > 60 && current_conv > self.last_notified_conviction) {
                 return true;
             }
+            
             // Reminder Logic: Re-broadcast every 15 minutes (900 seconds) if signal persists with high conviction
             if current_time - self.last_reminder_time > 900 {
                 // Only remind if conviction is still high enough to be noteworthy, preventing stale reminders.
@@ -561,9 +567,22 @@ impl TradingSession {
             }
         }
 
+        // Determine if we should evaluate swing engine (HTF is slower, but needs structure checks)
+        tracing::trace!(symbol = %self.symbol, new_m1 = is_new_candle, new_h1 = is_new_h1_candle, run_swing, "Swing evaluation check triggered.");
+
         if run_swing {
             let swing_notifications = self.process_swing_logic(&req, predictor_cache, &settings);
-            notifications.extend(swing_notifications);
+            
+            if swing_notifications.is_empty() {
+                // Peek at the latest engine response for debugging
+                let (scalp, swing) = self.get_latest_signals();
+                if let Some(s) = swing {
+                     tracing::debug!(symbol = %self.symbol, reason = %s.reason, "Swing evaluation complete - No signal broadcast.");
+                }
+            } else {
+                notifications.extend(swing_notifications);
+            }
+            
             // mark last eval time
             self.last_swing_eval_time = req.last_h1_timestamp.unwrap_or(req.last_m1_timestamp);
         }
@@ -897,7 +916,11 @@ impl TradingSession {
         } else if swing_signal.entry_type != SignalDirection::None {
             // Fallback: Broadcast valid signals even if execution manager suppressed them (e.g. Strict Mode repeats with new ID).
             // This ensures the UI shows the active signal even if it's not a "new entry" notification.
-            self.broadcast_signal(&swing_signal);
+            // ADDED: Throttling to prevent broadcast on every tick.
+            let time_since_last = current_time - self.swing_execution.last_notified_time;
+            if time_since_last > 30 || self.swing_execution.last_notified_signal_id.as_ref() != Some(&swing_signal.signal_id) {
+                self.broadcast_signal(&swing_signal);
+            }
 
             // NEW: Save suppressed signals to DB if they are new IDs.
             // This ensures the DB records the signal even if we didn't send a Push Notification (e.g. Strict Mode blocked it).
