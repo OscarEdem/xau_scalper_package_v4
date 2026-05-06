@@ -492,8 +492,10 @@ impl TradingSession {
         let atr_multiplier = settings.swing.eval_atr_multiplier; // trigger multiplier (configurable)
 
         // Trigger on new H1 candle
+        let mut is_new_h1_candle = false;
         if let Some(last_h1_ts) = req.last_h1_timestamp {
             if last_h1_ts > self.last_swing_eval_time {
+                is_new_h1_candle = true;
                 run_swing = true;
             }
         }
@@ -575,7 +577,7 @@ impl TradingSession {
             
             if swing_notifications.is_empty() {
                 // Peek at the latest engine response for debugging
-                let (scalp, swing) = self.get_latest_signals();
+                let (_scalp, swing) = self.get_latest_signals();
                 if let Some(s) = swing {
                      tracing::debug!(symbol = %self.symbol, reason = %s.reason, "Swing evaluation complete - No signal broadcast.");
                 }
