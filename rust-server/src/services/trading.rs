@@ -82,7 +82,8 @@ impl TradingService {
             let mut history = state_clone.inner.signal_history.blocking_lock();
             let now = Utc::now().timestamp();
 
-            for sig in new_signals {
+            for mut sig in new_signals {
+                sig.symbol = symbol.clone();
                 signals.push((sig.clone(), symbol.clone()));
                 history.push_front(HistoricalSignal {
                     signal: ActiveSignal { symbol: symbol.clone(), signal: sig },

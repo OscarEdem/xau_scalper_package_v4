@@ -216,6 +216,7 @@ impl std::fmt::Display for SignalDirection {
 #[serde(rename_all = "camelCase")]
 pub struct EvalResponse {
     pub signal_id: String, // e.g., a UUID or timestamp-based ID
+    pub symbol: String,    // The trading symbol
     pub entry_type: SignalDirection, // "long", "short", "none"
     pub entry_price: f64,
     pub atr: f64,
@@ -275,6 +276,7 @@ impl Default for EvalResponse {
     fn default() -> Self {
         Self {
             signal_id: "".to_string(),
+            symbol: String::new(),
             entry_type: SignalDirection::None,
             entry_price: 0.0,
             atr: 0.0,
