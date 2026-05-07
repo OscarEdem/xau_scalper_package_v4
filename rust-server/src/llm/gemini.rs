@@ -53,7 +53,7 @@ pub async fn generate_analysis(
             "parts": parts
         }],
         "tools": [{
-            "google_search_retrieval": {}
+            "google_search": {}
         }],
         "generationConfig": {
             "response_mime_type": "application/json",
@@ -101,7 +101,7 @@ pub async fn generate_analysis(
         "gemini-3-flash-preview",        // Secondary Flash
         "gemini-2.5-flash-lite",         // Pro-tier Lite
         "gemini-2.5-flash",              // Pro-tier Standard
-        "gemini-2.0-flash",              // Legacy (Active until June 2026)
+        "gemini-2.0-flash",              // Legacy Support
     ];
     let mut last_error = anyhow!("No models available");
 
@@ -249,7 +249,7 @@ pub async fn stream_generate_content(
             "parts": parts
         }],
         "tools": [{
-            "google_search_retrieval": {}
+            "google_search": {}
         }],
         "generationConfig": {
             "temperature": 0.7,
