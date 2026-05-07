@@ -118,26 +118,43 @@ pub async fn generate_analysis(
                 let structured_res: serde_json::Value = match serde_json::from_str(result_text) {
                     Ok(json) => json,
                     Err(e) => {
-                        tracing::error!(model = %model, error = %e, raw_text = %result_text, "Failed to parse Gemini structured output. Attempting to extract JSON from markdown if present.");
                         // Fallback: try to extract from ```json ... ```
                         if let Some(start) = result_text.find("```json") {
                             let content = &result_text[start + 7..];
                             if let Some(end) = content.find("```") {
                                 let json_str = content[..end].trim();
-                                serde_json::from_str(json_str).map_err(|_| anyhow!("Failed to parse JSON from markdown: {}", e))?
+                                match serde_json::from_str(json_str) {
+                                    Ok(json) => {
+                                        tracing::info!(model = %model, "Successfully extracted JSON from markdown block.");
+                                        json
+                                    },
+                                    Err(e2) => {
+                                        tracing::error!(model = %model, error = %e2, "Failed to parse JSON even after markdown extraction.");
+                                        return Err(anyhow!("Failed to parse JSON from markdown: {}", e2));
+                                    }
+                                }
                             } else {
-                                return Err(anyhow!("Found ```json but no closing ```: {}", e));
+                                return Err(anyhow!("Found ```json but no closing ```"));
                             }
                         } else if let Some(start) = result_text.find('{') {
-                             // Try finding first { and last }
                              if let Some(end) = result_text.rfind('}') {
                                  let json_str = &result_text[start..end+1];
-                                 serde_json::from_str(json_str).map_err(|_| anyhow!("Failed to parse JSON by braces: {}", e))?
+                                 match serde_json::from_str(json_str) {
+                                     Ok(json) => {
+                                         tracing::info!(model = %model, "Successfully extracted JSON from raw text braces.");
+                                         json
+                                     },
+                                     Err(e2) => {
+                                         tracing::error!(model = %model, error = %e2, "Failed to parse JSON from braces.");
+                                         return Err(anyhow!("Failed to parse JSON by braces: {}", e2));
+                                     }
+                                 }
                              } else {
                                  return Err(anyhow!("Failed to parse structured output and no braces found: {}", e));
                              }
                         } else {
-                            return Err(anyhow!("Failed to parse Gemini structured output and no fallback worked: {}. Raw: {}", e, result_text));
+                            tracing::error!(model = %model, error = %e, raw_text = %result_text, "Gemini output is not JSON and no fallback found.");
+                            return Err(anyhow!("Failed to parse Gemini structured output: {}. Raw: {}", e, result_text));
                         }
                     }
                 };
