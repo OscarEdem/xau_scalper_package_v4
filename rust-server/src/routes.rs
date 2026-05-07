@@ -8,7 +8,10 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     Json,
+    response::sse::{Event, Sse},
 };
+use std::convert::Infallible;
+use futures_util::StreamExt;
 use chrono::{Datelike, Timelike, Utc};
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -34,6 +37,15 @@ pub struct ChatRequest {
     pub period: String,
     #[schema(example = "What are the key risks mentioned in the report?")]
     pub query: String,
+    #[schema(example = "base64_encoded_image_data")]
+    #[serde(default)]
+    pub image_base64: Option<String>,
+    #[serde(default)]
+    pub account_balance: Option<f64>,
+    #[serde(default)]
+    pub account_equity: Option<f64>,
+    #[serde(default)]
+    pub account_drawdown: Option<f64>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -164,8 +176,14 @@ pub async fn chat_analysis_handler(
         system_instruction, history_str, candle_scribe, req.query
     );
 
+    let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
+        Some((b, e, d))
+    } else {
+        None
+    };
+
     // 3. Call LLM (Now returns structured JSON)
-    match generate_analysis(&state.inner.http_client, &req.symbol, &cached_report, &full_prompt, &state.inner.metrics).await {
+    match generate_analysis(&state.inner.http_client, &req.symbol, &cached_report, &full_prompt, &state.inner.metrics, req.image_base64.as_deref(), account_info).await {
         Ok(structured_res) => {
             // Update history
             let mut history = state.inner.chat_sessions.entry(req.symbol.clone()).or_insert_with(|| VecDeque::with_capacity(10));
@@ -198,6 +216,72 @@ pub async fn chat_analysis_handler(
         }
     }
 }
+
+#[utoipa::path(
+    post, path = "/chat-analysis/stream", request_body = ChatRequest,
+    responses(
+        (status = 200, description = "Streams the LLM response as SSE events")
+    )
+)]
+pub async fn chat_analysis_stream_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // Re-use logic from chat_analysis_handler for context building
+    let mut history_str = String::new();
+    if let Some(history) = state.inner.chat_sessions.get(&req.symbol) {
+        for msg in history.value() {
+            history_str.push_str(&format!("{}: {}\n", msg.role, msg.content));
+        }
+    }
+
+    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
+    let cache_key = format!("{}_{}", normalized_symbol, req.period);
+
+    let cached_report = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
+        entry.value().1.clone()
+    } else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA. Use the CHAT HISTORY for context. Be concise and professional.";
+    let full_prompt = format!(
+        "{}\n\nCHAT HISTORY:\n{}\nUSER QUESTION: {}", 
+        system_instruction, history_str, req.query
+    );
+
+    let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
+        Some((b, e, d))
+    } else {
+        None
+    };
+
+    // Call streaming LLM
+    let stream = crate::llm::gemini::stream_generate_content(
+        &state.inner.http_client, 
+        &req.symbol, 
+        &cached_report, 
+        &full_prompt,
+        req.image_base64.as_deref(),
+        account_info
+    )
+        .await
+        .map_err(|e| {
+            tracing::error!("LLM Stream failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Transform Gemini stream into Axum SSE stream
+    let sse_stream = stream.map(|result| {
+        match result {
+            Ok(text) => Ok(Event::default().data(text)),
+            Err(_) => Ok(Event::default().data("[ERROR]")),
+        }
+    });
+
+    Ok(Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()))
+}
+
 
 #[utoipa::path(
     post, path = "/test-push",

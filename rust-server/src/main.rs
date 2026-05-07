@@ -290,6 +290,7 @@ pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
         .route("/daily-analysis", get(routes::daily_analysis))
         .route("/weekly-analysis", get(routes::weekly_analysis))
         .route("/chat-analysis", post(routes::chat_analysis_handler))
+        .route("/chat-analysis/stream", post(routes::chat_analysis_stream_handler))
         .route("/test-push", post(routes::test_push_handler))
         // Provide the state to all handlers
         .with_state(state)

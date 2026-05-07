@@ -14,15 +14,6 @@ use tokio::sync::{Mutex, broadcast};
 use crate::metrics::AppMetrics;
 use chrono::Utc;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WsSignal<'a> {
-    symbol: &'a str,
-    #[serde(flatten)]
-    signal: &'a EvalResponse,
-    created_at: i64,
-}
-
 /// Represents the dominant trend direction determined by the SwingEngine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrendDirection {
@@ -415,23 +406,7 @@ impl TradingSession {
         }
     }
 
-    /// Helper to safely broadcast a signal to WebSocket clients.
-    /// Handles serialization and error logging to prevent stream interruptions.
-    fn broadcast_signal(&self, signal: &EvalResponse) {
-        if let Some(tx) = &self.broadcast_tx {
-            let ws_msg = WsSignal { 
-                symbol: &self.symbol, 
-                signal,
-                created_at: Utc::now().timestamp()
-            };
-            if let Ok(msg) = serde_json::to_string(&ws_msg) {
-                tracing::info!(symbol = %self.symbol, signal_id = %signal.signal_id, type = "ws_broadcast", "Broadcasting signal to WebSocket clients.");
-                let _ = tx.send(msg);
-            } else {
-                tracing::error!(symbol = %self.symbol, "Failed to serialize signal for broadcast");
-            }
-        }
-    }
+
 
     /// The main entry point for processing new data for this session.
     /// It updates internal buffers and then runs both trading engines.
@@ -845,7 +820,7 @@ impl TradingSession {
             }
 
             notifications.push(history_signal);
-            self.broadcast_signal(&swing_signal);
+
         } else if active_trade_closed {
             // --- NEW: Notify on Trade Closure (SL Hit / Invalidation) ---
             // We detected a closure via manual management logic above.
@@ -1044,7 +1019,7 @@ impl TradingSession {
             }
 
             notifications.push(scalp_signal.clone());
-            self.broadcast_signal(&scalp_signal);
+
             self.latest_scalp_signal = Some(scalp_signal);
         } else if is_same_scalp_id {
             // Keep active for API visibility, but don't re-notify

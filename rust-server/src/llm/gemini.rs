@@ -1,9 +1,11 @@
 use reqwest::Client;
 use serde_json::json;
-use anyhow::{anyhow, Result}; // Changed to anyhow::Result for clarity
+use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::time::sleep;
 use xau_scalper_server::metrics::AppMetrics;
+use futures_util::{Stream, StreamExt};
+use std::pin::Pin;
 
 // Use the v1beta endpoint for the latest models
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -14,20 +16,44 @@ pub async fn generate_analysis(
     recent_data: &str,
     prompt: &str,
     metrics: &AppMetrics,
+    image_base64: Option<&str>,
+    account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
 ) -> Result<serde_json::Value> {
     // 1. Get API Key
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
     // 2. Build Request Body with JSON Schema for stability
+    let mut system_info = String::new();
+    if let Some((bal, eq, dd)) = account_info {
+        system_info = format!(
+            "\n[LIVE TERMINAL STATE - MANDATORY PRIORITY]\n- Current Balance: ${:.2}\n- Current Equity: ${:.2}\n- Live Drawdown: {:.2}%\nNote: These values are fetched directly from the MT5 terminal and represent your actual live standing, ignoring any static default settings.\n",
+            bal, eq, dd
+        );
+    }
+
+    let mut parts = vec![json!({
+        "text": format!(
+            "{}{}\n\nPAIR: {}\nRECENT DATA (Includes current_price for grounding):\n{}",
+            prompt, system_info, pair, recent_data
+        )
+    })];
+
+    if let Some(img) = image_base64 {
+        parts.push(json!({
+            "inline_data": {
+                "mime_type": "image/png",
+                "data": img
+            }
+        }));
+    }
+
     let body = json!({
         "contents": [{
-            "parts": [{
-                "text": format!(
-                    "{}\n\nPAIR: {}\nRECENT DATA (Includes current_price for grounding):\n{}",
-                    prompt, pair, recent_data
-                )
-            }]
+            "parts": parts
+        }],
+        "tools": [{
+            "google_search_retrieval": {}
         }],
         "generationConfig": {
             "response_mime_type": "application/json",
@@ -151,4 +177,112 @@ pub async fn generate_analysis(
     }
     
     Err(last_error)
+}
+
+/// Streams content from Gemini, allowing for real-time "typing" effect in the UI.
+/// This version is optimized for the Chat Assistant.
+pub async fn stream_generate_content(
+    client: &Client,
+    pair: &str,
+    recent_data: &str,
+    prompt: &str,
+    image_base64: Option<&str>,
+    account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
+) -> Result<Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
+
+    // We use a high-performance vision-capable model
+    let model = "gemini-1.5-flash"; 
+    let url = format!("{}/{}:streamGenerateContent?alt=sse", GEMINI_BASE_URL, model);
+
+    let mut system_info = String::new();
+    if let Some((bal, eq, dd)) = account_info {
+        system_info = format!(
+            "\n[LIVE TERMINAL STATE - MANDATORY PRIORITY]\n- Current Balance: ${:.2}\n- Current Equity: ${:.2}\n- Live Drawdown: {:.2}%\nNote: These values are fetched directly from the MT5 terminal and represent your actual live standing, ignoring any static default settings.\n",
+            bal, eq, dd
+        );
+    }
+
+    let mut parts = vec![json!({
+        "text": format!(
+            "{}{}\n\nPAIR: {}\nRECENT DATA:\n{}",
+            prompt, system_info, pair, recent_data
+        )
+    })];
+
+    if let Some(img) = image_base64 {
+        parts.push(json!({
+            "inline_data": {
+                "mime_type": "image/png",
+                "data": img
+            }
+        }));
+    }
+
+    let body = json!({
+        "contents": [{
+            "parts": parts
+        }],
+        "tools": [{
+            "google_search_retrieval": {}
+        }],
+        "generationConfig": {
+            "temperature": 0.7,
+            "topP": 0.95,
+            "topK": 40,
+            "maxOutputTokens": 1024,
+        }
+    });
+
+    let res = client
+        .post(&url)
+        .header("x-goog-api-key", &api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to start stream: {}", e))?;
+
+    if !res.status().is_success() {
+        let err = res.text().await.unwrap_or_default();
+        return Err(anyhow!("Gemini Stream Error {}: {}", res.status(), err));
+    }
+
+    let stream = res.bytes_stream();
+    
+    // Map the byte stream to text chunks
+    let mapped_stream = stream.map(|result| {
+        match result {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                // SSE format: data: {"candidates": [...]}
+                // We need to extract the text from each event
+                let mut full_text = String::new();
+                for line in text.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(text_part) = json["candidates"]
+                                .as_array()
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c["content"].as_object())
+                                .and_then(|c| c["parts"].as_array())
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c["text"].as_str()) {
+                                full_text.push_str(text_part);
+                            }
+                        }
+                    }
+                }
+                if full_text.is_empty() {
+                    Err("Empty chunk".to_string())
+                } else {
+                    Ok(full_text)
+                }
+            }
+            Err(e) => Err(format!("Stream error: {}", e))
+        }
+    })
+    .filter(|r| futures_util::future::ready(r.is_ok())); // Filter out empty/error chunks for now
+
+    Ok(Box::pin(mapped_stream))
 }

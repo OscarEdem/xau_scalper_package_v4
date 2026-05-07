@@ -36,33 +36,9 @@ async fn websocket_stream(mut socket: WebSocket, state: Arc<ApplicationStateWith
                     Ok(Message::Text(text)) => {
                         // Attempt to parse as market data
                         if let Ok(req) = serde_json::from_str::<xau_scalper_server::EvalRequest>(&text) {
-                            let symbol = req.symbol.to_string();
-                            
-                            // Process via Trading Session (Managed by SessionManager)
-                            let session_arc = {
-                                if let Some(s) = state.inner.session_manager.sessions.get(&symbol) {
-                                    s.clone()
-                                } else {
-                                    let settings = state.inner.session_manager.settings.read().unwrap();
-                                    let new_session = Arc::new(tokio::sync::Mutex::new(xau_scalper_server::TradingSession::new(
-                                        symbol.clone(),
-                                        settings.scalp.filter_scalp_by_swing,
-                                        settings.max_buffer_size,
-                                        Some(state.tick_tx.clone()),
-                                        Some(state.inner.db.clone()),
-                                        Some(Arc::new(state.inner.metrics.clone())),
-                                    )));
-                                    state.inner.session_manager.sessions.insert(symbol.clone(), new_session.clone());
-                                    new_session
-                                }
-                            };
-
-                            let mut session = session_arc.lock().await;
-                            let signals = session.on_data(req, &state.inner.predictor_cache, &state.inner.session_manager.settings);
-                            
-                            // The session.on_data already broadcasts signals to WS if they are valid.
-                            if !signals.is_empty() {
-                                tracing::info!(symbol = %symbol, count = signals.len(), "Generated signals from WebSocket data ingestion.");
+                            let service = crate::services::trading::TradingService::new(state.clone());
+                            if let Err(e) = service.process_eval_request(req).await {
+                                tracing::error!("Failed to process WS data ingestion: {:?}", e);
                             }
                         }
                     }
