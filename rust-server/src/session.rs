@@ -1424,6 +1424,15 @@ impl TradingSession {
         self.latest_swing_signal = None;
         had_signals
     }
+
+    /// Broadcasts a signal to all connected WebSocket clients.
+    pub fn broadcast_signal(&self, signal: &EvalResponse) {
+        if let Some(tx) = &self.broadcast_tx {
+            if let Ok(json) = serde_json::to_string(signal) {
+                let _ = tx.send(json);
+            }
+        }
+    }
 }
 
 /// Manages all active TradingSessions, keyed by symbol.
