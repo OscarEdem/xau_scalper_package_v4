@@ -253,8 +253,8 @@ pub async fn stream_generate_content(
     // Map the byte stream to text chunks
     let mapped_stream = stream.map(|result| {
         match result {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).to_string();
+            Ok(chunk) => {
+                let text = String::from_utf8_lossy(&chunk).to_string();
                 // SSE format: data: {"candidates": [...]}
                 // We need to extract the text from each event
                 let mut full_text = String::new();

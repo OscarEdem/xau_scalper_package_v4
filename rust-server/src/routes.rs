@@ -518,7 +518,7 @@ pub async fn generate_fundamental_report(
     let context_json = serde_json::to_string(&context_map).unwrap_or_else(|_| "{}".to_string());
 
     // --- LLM CALL ---
-    let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1, &state.inner.metrics)
+    let llm_response = generate_analysis(&state.inner.http_client, symbol, &context_json, MACRO_SYSTEM_PROMPT_V1, &state.inner.metrics, None, None)
         .await;
 
     let mut result: serde_json::Value = match llm_response {
