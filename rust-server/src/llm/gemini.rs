@@ -201,9 +201,7 @@ pub async fn stream_generate_content(
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
-    // We use a high-performance vision-capable model
-    let model = "gemini-1.5-flash"; 
-    let url = format!("{}/{}:streamGenerateContent?alt=sse", GEMINI_BASE_URL, model);
+    // Using your high-quota specialized model tier
 
     let mut system_info = String::new();
     if let Some((bal, eq, dd)) = account_info {
@@ -244,55 +242,67 @@ pub async fn stream_generate_content(
         }
     });
 
-    let res = client
-        .post(&url)
-        .header("x-goog-api-key", &api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to start stream: {}", e))?;
+    // List of models available in your project for streaming
+    let models = [
+        "gemini-3.1-flash-lite-preview", 
+        "gemini-3-flash-preview", 
+        "gemini-2.5-flash-lite"
+    ];
+    let mut last_res = None;
 
-    if !res.status().is_success() {
-        let status = res.status();
-        let err = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Gemini Stream Error {}: {}", status, err));
-    }
+    for model in models {
+        let url = format!("{}/{}:streamGenerateContent?alt=sse", GEMINI_BASE_URL, model);
+        
+        let res = client
+            .post(&url)
+            .header("x-goog-api-key", &api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to start stream: {}", e))?;
 
-    let stream = res.bytes_stream();
-    
-    // Map the byte stream to text chunks
-    let mapped_stream = stream.map(|result| {
-        match result {
-            Ok(chunk) => {
-                let text = String::from_utf8_lossy(&chunk).to_string();
-                // SSE format: data: {"candidates": [...]}
-                // We need to extract the text from each event
-                let mut full_text = String::new();
-                for line in text.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                            if let Some(text_part) = json["candidates"]
-                                .as_array()
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c["content"].as_object())
-                                .and_then(|c| c["parts"].as_array())
-                                .and_then(|c| c.get(0))
-                                .and_then(|c| c["text"].as_str()) {
-                                full_text.push_str(text_part);
+        if res.status().is_success() {
+            let stream = res.bytes_stream();
+            
+            let mapped_stream = stream.map(|result| {
+                match result {
+                    Ok(chunk) => {
+                        let text = String::from_utf8_lossy(&chunk).to_string();
+                        let mut full_text = String::new();
+                        for line in text.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                    if let Some(text_part) = json["candidates"]
+                                        .as_array()
+                                        .and_then(|c| c.get(0))
+                                        .and_then(|c| c["content"].as_object())
+                                        .and_then(|c| c["parts"].as_array())
+                                        .and_then(|c| c.get(0))
+                                        .and_then(|c| c["text"].as_str()) {
+                                        full_text.push_str(text_part);
+                                    }
+                                }
                             }
                         }
+                        if full_text.is_empty() {
+                            Err("Empty chunk".to_string())
+                        } else {
+                            Ok(full_text)
+                        }
                     }
+                    Err(e) => Err(format!("Stream error: {}", e))
                 }
-                if full_text.is_empty() {
-                    Err("Empty chunk".to_string())
-                } else {
-                    Ok(full_text)
-                }
-            }
-            Err(e) => Err(format!("Stream error: {}", e))
-        }
-    })
-    .filter(|r| futures_util::future::ready(r.is_ok())); // Filter out empty/error chunks for now
+            })
+            .filter(|r| futures_util::future::ready(r.is_ok()));
 
-    Ok(Box::pin(mapped_stream))
+            return Ok(Box::pin(mapped_stream));
+        } else {
+            let status = res.status();
+            let err_body = res.text().await.unwrap_or_default();
+            tracing::warn!("Streaming failed for model {}: {} - {}", model, status, err_body);
+            last_res = Some(anyhow!("Gemini Stream Error {}: {}", status, err_body));
+        }
+    }
+
+    Err(last_res.unwrap_or_else(|| anyhow!("No models available for streaming in your tier")))
 }
