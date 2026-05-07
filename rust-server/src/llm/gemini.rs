@@ -56,41 +56,9 @@ pub async fn generate_analysis(
             "google_search": {}
         }],
         "generationConfig": {
-            "response_mime_type": "application/json",
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "bias": { "type": "string", "enum": ["Bullish", "Bearish", "Neutral"], "description": "Market outlook bias." },
-                    "confidence": { "type": "number", "description": "Confidence score from 0.0 to 1.0" },
-                    "macro_narrative": { "type": "string", "description": "Detailed institutional narrative." },
-                    "high_impact_drivers": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "event": { "type": "string" },
-                                "how_it_shapes_direction": { "type": "string" },
-                                "date": { "type": "string" }
-                            },
-                            "required": ["event", "how_it_shapes_direction"]
-                        }
-                    },
-                    "risks": { "type": "array", "items": { "type": "string" } },
-                    "targets": {
-                        "type": "array",
-                        "description": "Optional price coordinates for visual grounding (e.g. liquidity zones, FVG gaps).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "price": { "type": "number" },
-                                "label": { "type": "string", "description": "Short label (max 10 chars)" }
-                            },
-                            "required": ["price", "label"]
-                        }
-                    }
-                },
-                "required": ["bias", "confidence", "macro_narrative", "high_impact_drivers", "risks"]
-            }
+            "temperature": 0.4,
+            "topP": 0.9,
+            "maxOutputTokens": 2048,
         }
     });
 
