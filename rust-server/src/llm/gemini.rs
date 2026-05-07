@@ -244,8 +244,9 @@ pub async fn stream_generate_content(
         .map_err(|e| anyhow!("Failed to start stream: {}", e))?;
 
     if !res.status().is_success() {
+        let status = res.status();
         let err = res.text().await.unwrap_or_default();
-        return Err(anyhow!("Gemini Stream Error {}: {}", res.status(), err));
+        return Err(anyhow!("Gemini Stream Error {}: {}", status, err));
     }
 
     let stream = res.bytes_stream();
