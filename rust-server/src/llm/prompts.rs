@@ -18,6 +18,7 @@ Output Requirements:
 - 'bias': Bullish, Bearish, or Neutral.
 - 'macro_narrative': A professional 2-3 sentence summary. Incorporate search insights if they differ from static data.
 - 'high_impact_drivers': Array of objects with 'event' and 'how_it_shapes_direction'.
+- 'risks': Array of strings describing potential critical risks to the bias.
 - 'targets': Array of objects with 'price' and 'label'. 
   * IMPORTANT: Identify 1-2 key price levels (e.g. FVGs, Liquidity Pools) from the input that are relevant to the CURRENT PRICE.
   * If the input provides FVG zones or Liquidity zones, select the most relevant ones as targets.

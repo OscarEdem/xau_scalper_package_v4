@@ -147,8 +147,32 @@ pub async fn generate_analysis(
                     .ok_or_else(|| anyhow!("Failed to extract text from Gemini response: {:?}", json))?;
 
                 // Parse the inner JSON string returned by Gemini in JSON mode
-                let structured_res: serde_json::Value = serde_json::from_str(result_text)
-                    .map_err(|e| anyhow!("Failed to parse Gemini structured output: {}. Raw: {}", e, result_text))?;
+                let structured_res: serde_json::Value = match serde_json::from_str(result_text) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        tracing::error!(model = %model, error = %e, raw_text = %result_text, "Failed to parse Gemini structured output. Attempting to extract JSON from markdown if present.");
+                        // Fallback: try to extract from ```json ... ```
+                        if let Some(start) = result_text.find("```json") {
+                            let content = &result_text[start + 7..];
+                            if let Some(end) = content.find("```") {
+                                let json_str = content[..end].trim();
+                                serde_json::from_str(json_str).map_err(|_| anyhow!("Failed to parse JSON from markdown: {}", e))?
+                            } else {
+                                return Err(anyhow!("Found ```json but no closing ```: {}", e));
+                            }
+                        } else if let Some(start) = result_text.find('{') {
+                             // Try finding first { and last }
+                             if let Some(end) = result_text.rfind('}') {
+                                 let json_str = &result_text[start..end+1];
+                                 serde_json::from_str(json_str).map_err(|_| anyhow!("Failed to parse JSON by braces: {}", e))?
+                             } else {
+                                 return Err(anyhow!("Failed to parse structured output and no braces found: {}", e));
+                             }
+                        } else {
+                            return Err(anyhow!("Failed to parse Gemini structured output and no fallback worked: {}. Raw: {}", e, result_text));
+                        }
+                    }
+                };
 
                 metrics.gemini_success_model.with_label_values(&[model]).inc();
                 return Ok(structured_res);

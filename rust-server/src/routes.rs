@@ -545,9 +545,13 @@ pub async fn generate_fundamental_report(
         obj.insert("final_conviction".to_string(), serde_json::json!(final_conviction));
     }
 
-    // --- Cache the new result ---
-    tracing::info!("Caching new fundamental analysis for '{}'.", cache_key);
-    state.inner.fundamental_analysis_cache.insert(cache_key, (events_hash, result.to_string()));
+    // --- Cache the new result (Only if it's not an error) ---
+    if !result.get("error").is_some() {
+        tracing::info!("Caching new fundamental analysis for '{}'.", cache_key);
+        state.inner.fundamental_analysis_cache.insert(cache_key, (events_hash, result.to_string()));
+    } else {
+        tracing::warn!("Analysis failed for '{}'. Not caching error result.", cache_key);
+    }
     
     // --- Save to Database ---
     let db_pool = &state.inner.db;
