@@ -15,7 +15,7 @@ use utoipa::{OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 use tokio::fs; // Use tokio's async fs module
 pub use xau_scalper_server::{
-    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory, NewsItem, CalendarEvent, HistoricalSignal, ActiveSignal
+    EvalRequest, EvalResponse, SessionManager, PriceLevel, VwapBands, NewsEvent, TradingSession, MacroCategory, NewsItem, CalendarEvent, HistoricalSignal, ActiveSignal, SignalDirection
 };
 use tokio::sync::Mutex;
 

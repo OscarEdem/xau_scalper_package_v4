@@ -105,13 +105,15 @@ pub async fn generate_analysis(
                 // 4. Parse Response
                 let json: serde_json::Value = res.json().await?;
                 
-                let result_text = json["candidates"]
-                    .as_array()
+                let result_text = json.get("candidates")
+                    .and_then(|c| c.as_array())
                     .and_then(|c| c.get(0))
-                    .and_then(|c| c["content"].as_object())
-                    .and_then(|c| c["parts"].as_array())
+                    .and_then(|c| c.get("content"))
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|c| c.as_array())
                     .and_then(|c| c.get(0))
-                    .and_then(|c| c["text"].as_str())
+                    .and_then(|c| c.get("text"))
+                    .and_then(|c| c.as_str())
                     .ok_or_else(|| anyhow!("Failed to extract text from Gemini response: {:?}", json))?;
 
                 // Parse the inner JSON string returned by Gemini in JSON mode
@@ -272,13 +274,15 @@ pub async fn stream_generate_content(
                         for line in text.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                    if let Some(text_part) = json["candidates"]
-                                        .as_array()
+                                    if let Some(text_part) = json.get("candidates")
+                                        .and_then(|c| c.as_array())
                                         .and_then(|c| c.get(0))
-                                        .and_then(|c| c["content"].as_object())
-                                        .and_then(|c| c["parts"].as_array())
+                                        .and_then(|c| c.get("content"))
+                                        .and_then(|c| c.get("parts"))
+                                        .and_then(|c| c.as_array())
                                         .and_then(|c| c.get(0))
-                                        .and_then(|c| c["text"].as_str()) {
+                                        .and_then(|c| c.get("text"))
+                                        .and_then(|c| c.as_str()) {
                                         full_text.push_str(text_part);
                                     }
                                 }
