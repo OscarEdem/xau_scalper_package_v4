@@ -81,17 +81,41 @@ jobs:
           script: |
             # Login to ECR
             aws ecr get-login-password --region ${{ env.ECR_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.ECR_REGION }}.amazonaws.com
-            
-            # Pull and Restart
+
+            # Create Network if not exists
+            docker network create xau-net || true
+
+            # Pull and Restart Scalper
             docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.ECR_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
             docker stop xau-scalper || true
             docker rm xau-scalper || true
             
             docker run -d \
               --name xau-scalper \
-              -p 80:3000 \
+              --network xau-net \
               -p 3000:3000 \
               -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
               -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
               --restart always \
               ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.ECR_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+
+            # Create Caddyfile on the fly
+            cat <<EOF > Caddyfile
+            xau-scalper-pro.duckdns.org {
+                reverse_proxy xau-scalper:3000
+            }
+            EOF
+
+            # Start Caddy for SSL
+            docker stop caddy || true
+            docker rm caddy || true
+            docker run -d \
+              --name caddy \
+              --network xau-net \
+              -p 80:80 \
+              -p 443:443 \
+              -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile \
+              -v caddy_data:/data \
+              -v caddy_config:/config \
+              --restart always \
+              caddy:latest

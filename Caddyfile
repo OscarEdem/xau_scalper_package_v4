@@ -1,0 +1,3 @@
+xau-scalper-pro.duckdns.org {
+    reverse_proxy xau-scalper:3000
+}
