@@ -35,6 +35,13 @@ pub fn spawn_stale_signal_cleanup_task(state: Arc<ApplicationStateWithTicks>, mu
                     let mut session = session_arc.lock().await;
                     if session.invalidate_signals() {
                         info!(event = "stale_invalidation", symbol = %symbol, "Invalidated stale signals for symbol: {}", symbol);
+                        
+                        // BROADCAST the invalidation to the UI/Sidecar
+                        let mut clear_signal = crate::indicators::EvalResponse::default();
+                        clear_signal.symbol = symbol.clone();
+                        clear_signal.entry_type = crate::indicators::SignalDirection::None;
+                        clear_signal.reason = "Stale: No data received for 5 minutes".to_string();
+                        session.broadcast_signal(&clear_signal);
                     }
                 }
             }
