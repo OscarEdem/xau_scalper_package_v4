@@ -101,13 +101,11 @@ pub async fn generate_analysis(
         }
     });
 
-    // Stable GA models only — gemini-3.x preview models require allowlist access
-    // and always return 429 if your key is not whitelisted.
+    // Free-tier GA models only (Gemini 2.5 and 2.0 families)
     let models = [
-        "gemini-2.5-flash-lite",  // Primary: fastest, highest free-tier quota
-        "gemini-2.5-flash",       // Secondary: higher quality
-        "gemini-2.0-flash",       // Fallback A
-        "gemini-1.5-flash",       // Fallback B: most permissive quota
+        "gemini-2.5-flash-lite",  // Free tier: fastest, highest RPM/RPD
+        "gemini-2.5-flash",       // Free tier: higher quality
+        "gemini-2.0-flash",       // Free tier: solid fallback
     ];
     let mut last_error = anyhow!("No models available");
 
@@ -143,15 +141,19 @@ pub async fn generate_analysis(
                 // 4. Parse Response
                 let json: serde_json::Value = res.json().await?;
                 
-                let result_text = json.get("candidates")
+                // Extract text from the first candidate — search all parts for a text entry
+                // (google_search grounding can insert non-text parts before the actual text)
+                let candidate_parts = json.get("candidates")
                     .and_then(|c| c.as_array())
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("content"))
                     .and_then(|c| c.get("parts"))
-                    .and_then(|c| c.as_array())
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("text"))
-                    .and_then(|c| c.as_str())
+                    .and_then(|c| c.as_array());
+
+                let result_text = candidate_parts
+                    .and_then(|parts| {
+                        parts.iter().find_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    })
                     .ok_or_else(|| anyhow!("Failed to extract text from Gemini response: {:?}", json))?;
 
                 // Parse the inner JSON string returned by Gemini in JSON mode
@@ -282,11 +284,11 @@ pub async fn stream_generate_content(
         }
     });
 
-    // Stable GA models only for streaming
+    // Free-tier GA models only for streaming
     let models = [
         "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-1.5-flash",
     ];
     let mut last_res = None;
 
