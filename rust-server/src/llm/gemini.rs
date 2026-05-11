@@ -6,6 +6,42 @@ use tokio::time::sleep;
 use xau_scalper_server::metrics::AppMetrics;
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
+use chrono::Utc;
+
+// --- Circuit Breaker State ---
+static LAST_429_TIME: AtomicI64 = AtomicI64::new(0);
+static ERROR_COUNT_429: AtomicI64 = AtomicI64::new(0);
+const CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
+const CIRCUIT_BREAKER_COOLDOWN_SEC: i64 = 600; // 10 minutes
+
+fn check_circuit_breaker() -> Result<()> {
+    let now = Utc::now().timestamp();
+    let last_429 = LAST_429_TIME.load(Ordering::SeqCst);
+    
+    if now - last_429 < CIRCUIT_BREAKER_COOLDOWN_SEC {
+        if ERROR_COUNT_429.load(Ordering::SeqCst) >= CIRCUIT_BREAKER_THRESHOLD {
+            return Err(anyhow!("Gemini API circuit breaker engaged (Too Many 429s). Cooldown: {}s remaining.", CIRCUIT_BREAKER_COOLDOWN_SEC - (now - last_429)));
+        }
+    } else {
+        // Reset count after cooldown period has passed
+        if ERROR_COUNT_429.load(Ordering::SeqCst) >= CIRCUIT_BREAKER_THRESHOLD {
+            ERROR_COUNT_429.store(0, Ordering::SeqCst);
+            tracing::info!("Gemini API circuit breaker reset.");
+        }
+    }
+    Ok(())
+}
+
+fn record_429() {
+    LAST_429_TIME.store(Utc::now().timestamp(), Ordering::SeqCst);
+    ERROR_COUNT_429.fetch_add(1, Ordering::SeqCst);
+}
+
+fn record_success() {
+    // Only reset if we were below threshold, or just clear it
+    ERROR_COUNT_429.store(0, Ordering::SeqCst);
+}
 
 // Use the v1beta endpoint for the latest models
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -19,7 +55,10 @@ pub async fn generate_analysis(
     image_base64: Option<&str>,
     account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
 ) -> Result<serde_json::Value> {
-    // 1. Get API Key
+    // 1. Check Circuit Breaker
+    check_circuit_breaker()?;
+
+    // 2. Get API Key
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
@@ -62,14 +101,13 @@ pub async fn generate_analysis(
         }
     });
 
-    // Fallback models in order of preference
-    // Fallback models prioritizing "Flash Lite" variants for higher RPD/RPM on Free Tier
+    // Stable GA models only — gemini-3.x preview models require allowlist access
+    // and always return 429 if your key is not whitelisted.
     let models = [
-        "gemini-3.1-flash-lite-preview", // 500 RPD High-Quota Primary
-        "gemini-3-flash-preview",        // Secondary Flash
-        "gemini-2.5-flash-lite",         // Pro-tier Lite
-        "gemini-2.5-flash",              // Pro-tier Standard
-        "gemini-2.0-flash",              // Legacy Support
+        "gemini-2.5-flash-lite",  // Primary: fastest, highest free-tier quota
+        "gemini-2.5-flash",       // Secondary: higher quality
+        "gemini-2.0-flash",       // Fallback A
+        "gemini-1.5-flash",       // Fallback B: most permissive quota
     ];
     let mut last_error = anyhow!("No models available");
 
@@ -244,11 +282,11 @@ pub async fn stream_generate_content(
         }
     });
 
-    // List of models available in your project for streaming
+    // Stable GA models only for streaming
     let models = [
-        "gemini-3.1-flash-lite-preview", 
-        "gemini-3-flash-preview", 
-        "gemini-2.5-flash-lite"
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
     ];
     let mut last_res = None;
 
