@@ -33,16 +33,6 @@ fn check_circuit_breaker() -> Result<()> {
     Ok(())
 }
 
-fn record_429() {
-    LAST_429_TIME.store(Utc::now().timestamp(), Ordering::SeqCst);
-    ERROR_COUNT_429.fetch_add(1, Ordering::SeqCst);
-}
-
-fn record_success() {
-    // Only reset if we were below threshold, or just clear it
-    ERROR_COUNT_429.store(0, Ordering::SeqCst);
-}
-
 // Use the v1beta endpoint for the latest models
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
