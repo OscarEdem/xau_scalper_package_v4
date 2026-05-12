@@ -131,10 +131,16 @@ pub async fn chat_analysis_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Normalize symbol for institutional context lookups (Handle both 'm' and 'M')
+    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches('M').trim_end_matches(".pro").trim_end_matches(".k").to_string();
+
     // --- NEW: Price Action Mini-Scribe (M5 Context) ---
     let mut candle_scribe = String::new();
     let mut technical_levels = Vec::new();
-    if let Some(session_entry) = state.inner.session_manager.sessions.get(&req.symbol) {
+    let mut session_found = false;
+
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(&normalized_symbol) {
+        session_found = true;
         let session = session_entry.value().lock().await;
         let m5 = &session.market_data;
         let count = m5.m5_closes.len();
@@ -160,19 +166,20 @@ pub async fn chat_analysis_handler(
         }
     }
 
-    let tech_ctx = technical_levels.join(" | ");
+    if !session_found {
+        tracing::warn!(symbol = %req.symbol, normalized = %normalized_symbol, "No active session found for AI chat context. Candle data will be empty.");
+    }
 
     // --- NEW: Multi-Turn Contextual Memory ---
     let mut history_str = String::new();
     {
-        if let Some(history) = state.inner.chat_sessions.get(&req.symbol) {
+        if let Some(history) = state.inner.chat_sessions.get(&normalized_symbol) {
             for msg in history.value() {
                 history_str.push_str(&format!("{}: {}\n", msg.role, msg.content));
             }
         }
     }
 
-    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
     let cache_key = format!("{}_{}", normalized_symbol, req.period);
 
     // 1. Retrieve cached analysis
@@ -182,6 +189,20 @@ pub async fn chat_analysis_handler(
         return Err(StatusCode::NOT_FOUND);
     };
 
+    // FALLBACK: If technical_levels is still empty, try to extract from the raw_context/cached_report
+    if technical_levels.is_empty() {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cached_report) {
+            if let Some(levels) = json["technical_analysis"]["key_levels"].as_array() {
+                for l in levels {
+                    if let (Some(label), Some(price)) = (l["label"].as_str(), l["price"].as_f64()) {
+                        technical_levels.push(format!("{} @ {:.2}", label, price));
+                    }
+                }
+            }
+        }
+    }
+    let tech_ctx = if technical_levels.is_empty() { "None identified yet".to_string() } else { technical_levels.join(" | ") };
+    
     // 2. Construct Prompt
     let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
         Use the CHAT HISTORY for context. You MUST provide specific price levels (Support/Resistance/FVG) from the provided 'TECHNICAL LEVELS'. \
@@ -200,10 +221,10 @@ pub async fn chat_analysis_handler(
     };
 
     // 3. Call LLM (Now returns structured JSON)
-    match generate_analysis(&state.inner.http_client, &req.symbol, &cached_report, &full_prompt, &state.inner.metrics, req.image_base64.as_deref(), account_info).await {
+    match generate_analysis(&state.inner.http_client, &normalized_symbol, &cached_report, &full_prompt, &state.inner.metrics, req.image_base64.as_deref(), account_info).await {
         Ok(structured_res) => {
             // Update history
-            let mut history = state.inner.chat_sessions.entry(req.symbol.clone()).or_insert_with(|| VecDeque::with_capacity(10));
+            let mut history = state.inner.chat_sessions.entry(normalized_symbol.clone()).or_insert_with(|| VecDeque::with_capacity(10));
             history.push_back(crate::state::ChatMessage { 
                 role: "user".to_string(), 
                 content: req.query.clone(), 
@@ -244,15 +265,16 @@ pub async fn chat_analysis_stream_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // Re-use logic from chat_analysis_handler for context building
+    // Normalize symbol for institutional context lookups
+    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches('M').trim_end_matches(".pro").trim_end_matches(".k").to_string();
+
     let mut history_str = String::new();
-    if let Some(history) = state.inner.chat_sessions.get(&req.symbol) {
+    if let Some(history) = state.inner.chat_sessions.get(&normalized_symbol) {
         for msg in history.value() {
             history_str.push_str(&format!("{}: {}\n", msg.role, msg.content));
         }
     }
 
-    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
     let cache_key = format!("{}_{}", normalized_symbol, req.period);
 
     let (cached_report, raw_context) = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
@@ -264,7 +286,7 @@ pub async fn chat_analysis_stream_handler(
     // --- NEW: Price Action Mini-Scribe (M5 Context) ---
     let mut candle_scribe = String::new();
     let mut technical_levels = Vec::new();
-    if let Some(session_entry) = state.inner.session_manager.sessions.get(&req.symbol) {
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(&normalized_symbol) {
         let session = session_entry.value().lock().await;
         let m5 = &session.market_data;
         let count = m5.m5_closes.len();
