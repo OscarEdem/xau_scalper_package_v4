@@ -160,20 +160,21 @@ pub async fn chat_analysis_handler(
     let cache_key = format!("{}_{}", normalized_symbol, req.period);
 
     // 1. Retrieve cached analysis
-    let cached_report = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
-        entry.value().1.clone()
+    let (cached_report, raw_context) = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
+        (entry.value().report.clone(), entry.value().raw_context.clone())
     } else {
         return Err(StatusCode::NOT_FOUND);
     };
 
     // 2. Construct Prompt
     let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA and RECENT CANDLES. \
-        Use the CHAT HISTORY for context. If you mention specific price levels, include them in the 'targets' array in the JSON response \
+        Use the CHAT HISTORY for context. You have access to detailed technical levels, headlines, and sentiment data in the 'RECENT DATA' section. \
+        If you mention specific price levels, include them in the 'targets' array in the JSON response \
         so they can be drawn on the chart. Be concise, professional, and insight-driven.";
     
     let full_prompt = format!(
-        "{}\n\nCHAT HISTORY:\n{}\nRECENT CANDLES (M5):\n{}\n\nUSER QUESTION: {}", 
-        system_instruction, history_str, candle_scribe, req.query
+        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
+        req.period.to_uppercase(), system_instruction, history_str, candle_scribe, raw_context, req.query
     );
 
     let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
@@ -238,16 +239,17 @@ pub async fn chat_analysis_stream_handler(
     let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches(".pro").trim_end_matches(".k").to_string();
     let cache_key = format!("{}_{}", normalized_symbol, req.period);
 
-    let cached_report = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
-        entry.value().1.clone()
+    let (cached_report, raw_context) = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
+        (entry.value().report.clone(), entry.value().raw_context.clone())
     } else {
         return Err(StatusCode::NOT_FOUND);
     };
 
-    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA. Use the CHAT HISTORY for context. Be concise and professional.";
+    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA and CHAT HISTORY. \
+        You have access to detailed technical levels and institutional news. Be concise, professional, and highly technical.";
     let full_prompt = format!(
-        "{}\n\nCHAT HISTORY:\n{}\nUSER QUESTION: {}", 
-        system_instruction, history_str, req.query
+        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
+        req.period.to_uppercase(), system_instruction, history_str, raw_context, req.query
     );
 
     let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
@@ -258,12 +260,12 @@ pub async fn chat_analysis_stream_handler(
 
     // Call streaming LLM
     let stream = crate::llm::gemini::stream_generate_content(
-        &state.inner.http_client, 
-        &req.symbol, 
-        &cached_report, 
+        &state.inner.http_client,
+        &req.symbol,
+        &cached_report,
         &full_prompt,
         req.image_base64.as_deref(),
-        account_info
+        account_info,
     )
         .await
         .map_err(|e| {
@@ -548,7 +550,11 @@ pub async fn generate_fundamental_report(
     // --- Cache the new result (Only if it's not an error) ---
     if !result.get("error").is_some() {
         tracing::info!("Caching new fundamental analysis for '{}'.", cache_key);
-        state.inner.fundamental_analysis_cache.insert(cache_key, (events_hash, result.to_string()));
+        state.inner.fundamental_analysis_cache.insert(cache_key, crate::state::FundamentalAnalysisCacheEntry {
+            hash: events_hash,
+            report: result.to_string(),
+            raw_context: context_json,
+        });
     } else {
         tracing::warn!("Analysis failed for '{}'. Not caching error result.", cache_key);
     }

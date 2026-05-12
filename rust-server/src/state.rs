@@ -15,6 +15,13 @@ pub struct ChatMessage {
     pub timestamp: i64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct FundamentalAnalysisCacheEntry {
+    pub hash: u64,
+    pub report: String,
+    pub raw_context: String, // The context_json used to generate the report
+}
+
 /// A more flexible state for the whole application, including the new SessionManager.
 #[derive(Clone)]
 pub struct ApplicationState {
@@ -25,8 +32,8 @@ pub struct ApplicationState {
     pub news_events: Arc<Mutex<Vec<NewsEvent>>>,
     pub external_calendar_events: Arc<Mutex<Vec<CalendarEvent>>>,
     pub external_rss_news: Arc<Mutex<Vec<NewsItem>>>,
-    /// Cache for fundamental analysis reports. Key: "PAIR_period", Value: (events_hash, report)
-    pub fundamental_analysis_cache: Arc<DashMap<String, (u64, String)>>,
+    /// Cache for fundamental analysis reports. Key: "PAIR_period"
+    pub fundamental_analysis_cache: Arc<DashMap<String, FundamentalAnalysisCacheEntry>>,
     pub ws_clients: Arc<AtomicUsize>,
     // NEW: Metrics
     /// Rate limiter for chat requests: Key = IP/User/Symbol, Value = (count, window_start_timestamp)
