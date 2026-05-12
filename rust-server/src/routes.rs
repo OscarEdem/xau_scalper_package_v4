@@ -264,6 +264,7 @@ pub async fn chat_analysis_stream_handler(
         &req.symbol,
         &cached_report,
         &full_prompt,
+        &state.inner.metrics,
         req.image_base64.as_deref(),
         account_info,
     )
@@ -490,11 +491,11 @@ pub async fn generate_fundamental_report(
     // 3. Check the cache.
     if !force_refresh {
         if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
-            let (cached_hash, cached_report) = entry.value();
-            if *cached_hash == events_hash {
+            let cache_entry = entry.value();
+            if cache_entry.hash == events_hash {
                 // The events haven't changed, so we can return the cached report.
                 tracing::info!("Serving fundamental analysis for '{}' from cache.", cache_key);
-                let analysis_json: serde_json::Value = serde_json::from_str(cached_report).unwrap_or(serde_json::Value::String(cached_report.clone()));
+                let analysis_json: serde_json::Value = serde_json::from_str(&cache_entry.report).unwrap_or(serde_json::Value::String(cache_entry.report.clone()));
                 return serde_json::json!({ "analysis": analysis_json, "source": "cache" });
             }
         }

@@ -237,9 +237,11 @@ pub async fn stream_generate_content(
     pair: &str,
     recent_data: &str,
     prompt: &str,
+    metrics: &crate::state::AppMetrics,
     image_base64: Option<&str>,
     account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>> {
+    metrics.llm_requests_total.inc();
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
