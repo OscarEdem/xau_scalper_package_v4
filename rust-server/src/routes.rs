@@ -131,8 +131,9 @@ pub async fn chat_analysis_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // --- NEW: Price Action Mini-Scribe ---
+    // --- NEW: Price Action Mini-Scribe (M5 Context) ---
     let mut candle_scribe = String::new();
+    let mut technical_levels = Vec::new();
     if let Some(session_entry) = state.inner.session_manager.sessions.get(&req.symbol) {
         let session = session_entry.value().lock().await;
         let m5 = &session.market_data;
@@ -144,7 +145,22 @@ pub async fn chat_analysis_handler(
                 m5.m5_lows.get(i).unwrap_or(&0.0), 
                 m5.m5_closes.get(i).unwrap_or(&0.0)));
         }
+
+        // Extract Institutional Liquidity & FVG Zones
+        let (_, swing_signal) = session.get_latest_signals();
+        if let Some(signal) = swing_signal {
+            for zone in &signal.liquidity_zones {
+                let label = if zone.is_bullish.unwrap_or(false) { "Inst. Support" } else { "Inst. Resistance" };
+                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
+            }
+            for zone in &signal.imbalance_zones {
+                let label = if zone.is_bullish.unwrap_or(false) { "Bullish FVG" } else { "Bearish FVG" };
+                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
+            }
+        }
     }
+
+    let tech_ctx = technical_levels.join(" | ");
 
     // --- NEW: Multi-Turn Contextual Memory ---
     let mut history_str = String::new();
@@ -167,14 +183,14 @@ pub async fn chat_analysis_handler(
     };
 
     // 2. Construct Prompt
-    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA and RECENT CANDLES. \
-        Use the CHAT HISTORY for context. You have access to detailed technical levels, headlines, and sentiment data in the 'RECENT DATA' section. \
+    let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
+        Use the CHAT HISTORY for context. You MUST provide specific price levels (Support/Resistance/FVG) from the provided 'TECHNICAL LEVELS'. \
         If you mention specific price levels, include them in the 'targets' array in the JSON response \
         so they can be drawn on the chart. Be concise, professional, and insight-driven.";
     
     let full_prompt = format!(
-        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
-        req.period.to_uppercase(), system_instruction, history_str, candle_scribe, raw_context, req.query
+        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nTECHNICAL LEVELS: {}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
+        req.period.to_uppercase(), system_instruction, history_str, tech_ctx, candle_scribe, raw_context, req.query
     );
 
     let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
@@ -245,11 +261,44 @@ pub async fn chat_analysis_stream_handler(
         return Err(StatusCode::NOT_FOUND);
     };
 
-    let system_instruction = "You are an elite financial analyst. Answer questions based on the RECENT DATA and CHAT HISTORY. \
-        You have access to detailed technical levels and institutional news. Be concise, professional, and highly technical.";
+    // --- NEW: Price Action Mini-Scribe (M5 Context) ---
+    let mut candle_scribe = String::new();
+    let mut technical_levels = Vec::new();
+    if let Some(session_entry) = state.inner.session_manager.sessions.get(&req.symbol) {
+        let session = session_entry.value().lock().await;
+        let m5 = &session.market_data;
+        let count = m5.m5_closes.len();
+        let start = if count > 20 { count - 20 } else { 0 };
+        for i in start..count {
+            candle_scribe.push_str(&format!("H:{:.2},L:{:.2},C:{:.2};", 
+                m5.m5_highs.get(i).unwrap_or(&0.0), 
+                m5.m5_lows.get(i).unwrap_or(&0.0), 
+                m5.m5_closes.get(i).unwrap_or(&0.0)));
+        }
+
+        // Extract Institutional Liquidity & FVG Zones
+        let (_, swing_signal) = session.get_latest_signals();
+        if let Some(signal) = swing_signal {
+            for zone in &signal.liquidity_zones {
+                let label = if zone.is_bullish.unwrap_or(false) { "Inst. Support" } else { "Inst. Resistance" };
+                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
+            }
+            for zone in &signal.imbalance_zones {
+                let label = if zone.is_bullish.unwrap_or(false) { "Bullish FVG" } else { "Bearish FVG" };
+                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
+            }
+        }
+    }
+
+    let tech_ctx = technical_levels.join(" | ");
+
+    let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
+        You MUST provide specific support and resistance levels from the 'TECHNICAL LEVELS' provided. \
+        Use these for visual grounding. Be professional, concise, and technically accurate.";
+        
     let full_prompt = format!(
-        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
-        req.period.to_uppercase(), system_instruction, history_str, raw_context, req.query
+        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nTECHNICAL LEVELS: {}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
+        req.period.to_uppercase(), system_instruction, history_str, tech_ctx, candle_scribe, raw_context, req.query
     );
 
     let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
