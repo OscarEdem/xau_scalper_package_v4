@@ -189,10 +189,14 @@ pub async fn chat_analysis_handler(
         return Err(StatusCode::NOT_FOUND);
     };
 
-    // FALLBACK: If technical_levels is still empty, try to extract from the raw_context/cached_report
+    // FALLBACK: If technical_levels is still empty, try to extract from the cached_report
     if technical_levels.is_empty() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cached_report) {
-            if let Some(levels) = json["technical_analysis"]["key_levels"].as_array() {
+            // Check both "analysis" -> "targets" (Standard) and "targets" (Legacy/Direct)
+            let targets = json["analysis"]["targets"].as_array()
+                .or_else(|| json["targets"].as_array());
+
+            if let Some(levels) = targets {
                 for l in levels {
                     if let (Some(label), Some(price)) = (l["label"].as_str(), l["price"].as_f64()) {
                         technical_levels.push(format!("{} @ {:.2}", label, price));
@@ -312,7 +316,23 @@ pub async fn chat_analysis_stream_handler(
         }
     }
 
-    let tech_ctx = technical_levels.join(" | ");
+    // FALLBACK: If technical_levels is still empty, try to extract from the cached_report
+    if technical_levels.is_empty() {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cached_report) {
+            let targets = json["analysis"]["targets"].as_array()
+                .or_else(|| json["targets"].as_array());
+
+            if let Some(levels) = targets {
+                for l in levels {
+                    if let (Some(label), Some(price)) = (l["label"].as_str(), l["price"].as_f64()) {
+                        technical_levels.push(format!("{} @ {:.2}", label, price));
+                    }
+                }
+            }
+        }
+    }
+
+    let tech_ctx = if technical_levels.is_empty() { "None identified yet".to_string() } else { technical_levels.join(" | ") };
 
     let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
         You MUST provide specific support and resistance levels from the 'TECHNICAL LEVELS' provided. \
