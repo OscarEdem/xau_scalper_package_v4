@@ -336,7 +336,9 @@ pub async fn chat_analysis_stream_handler(
 
     let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
         You MUST provide specific support and resistance levels from the 'TECHNICAL LEVELS' provided. \
-        Use these for visual grounding. Be professional, concise, and technically accurate.";
+        If you mention specific price levels, you MUST also append a JSON block at the very end of your response \
+        in the format: ```json {\"targets\": [{\"label\": \"Support\", \"price\": 1234.56}]} ``` \
+        This allows the system to draw them on the chart. Be professional, concise, and technically accurate.";
         
     let full_prompt = format!(
         "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nTECHNICAL LEVELS: {}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
