@@ -208,8 +208,9 @@ pub async fn chat_analysis_handler(
     let tech_ctx = if technical_levels.is_empty() { "None identified yet".to_string() } else { technical_levels.join(" | ") };
     
     // 2. Construct Prompt
-    let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
+    let system_instruction = "You are an elite financial analyst and trading mentor. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
         Use the CHAT HISTORY for context. You MUST provide specific price levels (Support/Resistance/FVG) from the provided 'TECHNICAL LEVELS'. \
+        Include actionable trade considerations (Entry, SL, TP) when the data supports a high-conviction setup. \
         If you mention specific price levels, include them in the 'targets' array in the JSON response \
         so they can be drawn on the chart. Be concise, professional, and insight-driven.";
     
@@ -334,8 +335,9 @@ pub async fn chat_analysis_stream_handler(
 
     let tech_ctx = if technical_levels.is_empty() { "None identified yet".to_string() } else { technical_levels.join(" | ") };
 
-    let system_instruction = "You are an elite financial analyst. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
+    let system_instruction = "You are an elite financial analyst and trading mentor. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
         You MUST provide specific support and resistance levels from the 'TECHNICAL LEVELS' provided. \
+        Include actionable trade considerations (Entry, SL, TP) when the data supports a high-conviction setup. \
         If you mention specific price levels, you MUST also append a JSON block at the very end of your response \
         in the format: ```json {\"targets\": [{\"label\": \"Support\", \"price\": 1234.56}]} ``` \
         This allows the system to draw them on the chart. Be professional, concise, and technically accurate.";

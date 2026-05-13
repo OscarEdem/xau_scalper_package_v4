@@ -22,9 +22,10 @@ Output Requirements:
 - 'targets': Array of objects with 'price' and 'label'. 
   * IMPORTANT: Identify 1-2 key price levels (e.g. FVGs, Liquidity Pools) from the input that are relevant to the CURRENT PRICE.
   * If the input provides FVG zones or Liquidity zones, select the most relevant ones as targets.
+- 'confidence': A float between 0.0 and 1.0 representing your conviction in the bias.
 
 Rules:
-- No trade advice.
+- Provide specific, actionable trade setups (Entry, SL, TP) based on the input technical levels and your macro analysis.
 - Do not invent prices or events.
 - Confidence should be 0.0 to 1.0.
 
