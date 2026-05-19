@@ -20,3 +20,23 @@ python train_lstm.py
 # Run this from the ml_training/ directory:
 # Windows:  Copy-Item "models\*.onnx","models\*.json" "..\rust-server\models\" -Force
 # Linux:    cp models/*.onnx models/*.json ../rust-server/models/
+
+
+
+
+
+
+# Activate (if not already active) for windows
+.\.venv\Scripts\Activate.ps1
+
+# Install deps
+pip install -r requirements.txt
+
+# Train (run one at a time)
+python train_gbm.py
+python train_heston.py
+python train_lstm.py
+
+# Copy models to rust-server
+Copy-Item "models\*.onnx","models\*.json" "..\rust-server\models\" -Force
+
