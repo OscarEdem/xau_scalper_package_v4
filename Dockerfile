@@ -52,11 +52,12 @@ WORKDIR /app
 # Copy the compiled binary from the builder
 COPY --from=builder /app/rust-server/target/release/xau-scalper-server /usr/local/bin/xau_scalper_server
 
-# Copy model assets
-# We copy them directly into /app/models to keep the structure clean
-COPY rust-server/src/engines/gbm/models /app/models
-COPY rust-server/src/engines/heston/models /app/models
-COPY rust-server/src/engines/lstm/models /app/models
+# Copy model assets — all trained ONNX files live in rust-server/models/
+# After training in ml_training/, copy the outputs here:
+#   feature_mlp_{tf}.onnx + _scaler.json  (replaces GBM)
+#   regime_mlp_{tf}.onnx  + _scaler.json  (replaces Heston)
+#   lstm_{tf}.onnx         + _scaler.json  (sequence model, unchanged)
+COPY rust-server/models /app/models
 
 # Expose port
 EXPOSE 3000

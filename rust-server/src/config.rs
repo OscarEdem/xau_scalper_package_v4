@@ -181,6 +181,15 @@ pub struct ScalpSettings {
     pub pullback_entry_displacement_atr: f64,
     #[serde(default = "default_momentum_require_ml_confluence")]
     pub momentum_require_ml_confluence: bool,
+
+    // Daily Circuit Breaker
+    /// Maximum number of signals the scalp engine may emit per UTC day.
+    /// When hit, the engine goes silent until the next UTC midnight.
+    #[serde(default = "default_max_scalp_signals_per_day")]
+    pub max_signals_per_day: usize,
+    /// Master switch for the daily circuit breaker.
+    #[serde(default = "default_circuit_breaker_enabled")]
+    pub circuit_breaker_enabled: bool,
 }
 
 impl Default for ScalpSettings {
@@ -222,7 +231,10 @@ impl Default for ScalpSettings {
             momentum_tp2_atr_mult: 3.0, // Widened from 1.3
             pullback_tp1_atr_mult: 1.0, // Widened from 0.5
             pullback_tp2_atr_mult: 2.0, // Widened from 1.0
-            pullback_sl_atr_mult: 0.09,
+            // FIXED: Raised from 0.09 → 0.30 ATR. The original 0.09 ATR stop
+            // (~$0.30–$0.80 on XAUUSD) was smaller than typical broker spread
+            // and would be hit by spread widening alone on market execution.
+            pullback_sl_atr_mult: 0.30,
             min_sl_atr_mult: 0.15,
             max_sl_atr_mult: 1.5,
             kalman_weight: 0.6,
@@ -244,12 +256,16 @@ impl Default for ScalpSettings {
             pullback_entry_displacement_atr: 0.30, // RAISED: Require deeper pullbacks to fair value (was 0.20)
             momentum_require_ml_confluence: true,
             // note: swing evaluation knobs belong to `SwingSettings`
+            max_signals_per_day: 8,
+            circuit_breaker_enabled: true,
         }
     }
 }
 
 fn default_pullback_entry_displacement_atr() -> f64 { 0.20 }
 fn default_momentum_require_ml_confluence() -> bool { true }
+fn default_max_scalp_signals_per_day() -> usize { 8 }
+fn default_circuit_breaker_enabled() -> bool { true }
 fn default_eval_on_h1_only() -> bool { false }
 fn default_eval_atr_multiplier() -> f64 { 1.5 }
 fn default_eval_struct_margin_atr() -> f64 { 0.5 }
@@ -329,6 +345,14 @@ pub struct SwingSettings {
     pub eval_struct_margin_atr: f64,
     #[serde(default = "default_eval_m15_check_enabled")]
     pub eval_m15_check_enabled: bool,
+
+    // Daily Circuit Breaker
+    /// Maximum swing signals per UTC day before silencing the engine.
+    #[serde(default = "default_max_swing_signals_per_day")]
+    pub max_signals_per_day: usize,
+    /// Master switch for the swing daily circuit breaker.
+    #[serde(default = "default_circuit_breaker_enabled")]
+    pub circuit_breaker_enabled: bool,
 }
 
 impl Default for SwingSettings {
@@ -382,6 +406,8 @@ impl Default for SwingSettings {
             eval_atr_multiplier: 1.5,
             eval_struct_margin_atr: 0.5,
             eval_m15_check_enabled: true,
+            max_signals_per_day: 4,
+            circuit_breaker_enabled: true,
         }
     }
 }
@@ -393,6 +419,7 @@ fn default_m30_swing_lookback() -> usize { 30 }
 fn default_fractal_penalty() -> f64 { 25.0 }
 fn default_push_notifications_enabled() -> bool { true }
 fn default_push_notification_threshold() -> f64 { 60.0 }
+fn default_max_swing_signals_per_day() -> usize { 4 }
 
 impl SwingSettings {
     pub fn validate(&self) -> Result<(), String> {

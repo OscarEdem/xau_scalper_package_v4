@@ -1,9 +1,9 @@
 use std::error::Error;
-use super::{gbm, heston, lstm};
+use super::{lstm, generic_onnx};
 use std::path::Path;
 
 /// A common trait for all prediction models.
-/// This allows different models (GBM, Heston, LSTM) to be used interchangeably.
+/// This allows different models (FeatureMLP, RegimeMLP, LSTM) to be used interchangeably.
 pub trait Predictor: Send + Sync {
     /// Predicts the price for a number of future periods.
     fn predict(&self, data: &[f64], future_periods: f64) -> Result<f64, Box<dyn Error>>;
@@ -12,23 +12,39 @@ pub trait Predictor: Send + Sync {
 }
 
 /// Factory function to load a specific predictor model.
+///
+/// | model_type    | File loaded                           | Replaces |
+/// |---------------|---------------------------------------|----------|
+/// | feature_mlp   | `feature_mlp_{tf}.onnx` + scaler     | GBM      |
+/// | regime_mlp    | `regime_mlp_{tf}.onnx`  + scaler     | Heston   |
+/// | lstm          | `lstm_{tf}.onnx` + scaler            | (kept)   |
 pub fn load_predictor(model_type: &str, timeframe: &str, models_dir: &str) -> Result<Box<dyn Predictor>, Box<dyn Error>> {
     let base_path = Path::new(models_dir);
     match model_type {
-        "gbm" => {
-            // GBM models are stored as JSON configs named like `gbm_h1_config.json` in `/app/models`.
-            let path = base_path.join(format!("gbm_{}_config.json", timeframe));
-            let gbm = gbm::predict::GBM::load(path.to_str().ok_or("Invalid path")?)?;
-            Ok(Box::new(gbm))
+        "feature_mlp" => {
+            // FeatureMLP: replaces GBM.
+            // Maps 5 technical features → next-bar log-return prediction.
+            // Fully deterministic — no stochastic noise.
+            let path = base_path.join(format!("feature_mlp_{}.onnx", timeframe));
+            let model = generic_onnx::predict::GenericOnnxPredictor::load(
+                path.to_str().ok_or("Invalid path")?,
+                0.70, // confidence: higher than old GBM's 0.50, lower than LSTM's 0.85
+            )?;
+            Ok(Box::new(model))
         }
-       "heston" => {
-            // Heston models are stored as JSON configs named like `heston_h1_config.json` in `/app/models`.
-            let path = base_path.join(format!("heston_{}_config.json", timeframe));
-            let heston = heston::predict::Heston::load(path.to_str().ok_or("Invalid path")?)?;
-            Ok(Box::new(heston))
+        "regime_mlp" => {
+            // RegimeMLP: replaces Heston.
+            // Classifies market regime (trending / sideways) as a continuous bias ∈ (-1,1).
+            // Fully deterministic — no stochastic variance process.
+            let path = base_path.join(format!("regime_mlp_{}.onnx", timeframe));
+            let model = generic_onnx::predict::GenericOnnxPredictor::load(
+                path.to_str().ok_or("Invalid path")?,
+                0.60, // confidence: regime signals are lower-resolution than direct return forecasts
+            )?;
+            Ok(Box::new(model))
         }
         "lstm" => {
-            // LSTM models live as ONNX files named like `lstm_h1.onnx` in `/app/models`.
+            // LSTM: sequence model — unchanged.
             let path = base_path.join(format!("lstm_{}.onnx", timeframe));
             let lstm_model = lstm::predict::LSTM::load(path.to_str().ok_or("Invalid path")?)?;
             Ok(Box::new(lstm_model))
@@ -49,4 +65,4 @@ impl Predictor for NoopPredictor {
     fn confidence(&self) -> Option<f64> {
         None
     }
-}
+}

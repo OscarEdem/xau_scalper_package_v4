@@ -25,7 +25,11 @@ pub fn calculate_bias(
     current_price: f64,
     future_periods: f64,
 ) -> f64 {
-    let model_types = ["gbm", "heston", "lstm"];
+    // Ensemble members:
+    //   feature_mlp — FeatureMLP (replaced GBM): indicator-based return predictor, deterministic
+    //   regime_mlp  — RegimeMLP (replaced Heston): market regime classifier, deterministic
+    //   lstm        — Sequence model: raw price patterns, unchanged
+    let model_types = ["feature_mlp", "regime_mlp", "lstm"];
 
     let mut total_confidence = 0.0;
     let mut weighted_prediction_sum = 0.0;
@@ -38,9 +42,12 @@ pub fn calculate_bias(
         let pred_price = p.predict(closes, future_periods).unwrap_or(current_price);
         let mut confidence = p.confidence().unwrap_or(0.01); // Min confidence floor
 
-        // Custom Weighting: Boost LSTM influence relative to GBM/Heston
+        // LSTM has the highest confidence floor already (0.85) but we boost it slightly
+        // since it captures temporal patterns neither MLP model can see.
+        // With all 3 models now carrying genuine signal, we reduce the LSTM multiplier
+        // from 2.0 → 1.5 to avoid over-weighting any single model.
         if model_type == "lstm" {
-            confidence *= 2.0; 
+            confidence *= 1.5;
         }
 
         let predicted_change = pred_price - current_price;

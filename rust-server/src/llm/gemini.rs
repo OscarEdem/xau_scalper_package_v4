@@ -57,15 +57,15 @@ pub async fn generate_analysis(
     let mut system_info = String::new();
     if let Some((bal, eq, dd)) = account_info {
         system_info = format!(
-            "\n[LIVE TERMINAL STATE - MANDATORY PRIORITY]\n- Current Balance: ${:.2}\n- Current Equity: ${:.2}\n- Live Drawdown: {:.2}%\nNote: These values are fetched directly from the MT5 terminal and represent your actual live standing, ignoring any static default settings.\n",
+            "\n[LIVE TERMINAL STATE - MANDATORY PRIORITY]\n- Current Balance: ${:.2}\n- Current Equity: ${:.2}\n- Live Drawdown: {:.2}%\nNote: These values are fetched directly from the MT5 terminal and represent your actual live standing.\n",
             bal, eq, dd
         );
     }
 
     let mut parts = vec![json!({
         "text": format!(
-            "{}{}\n\nPAIR: {}\nRECENT DATA (Includes current_price for grounding):\n{}",
-            prompt, system_info, pair, recent_data
+            "{}\n\nPAIR: {}\nRECENT DATA:\n{}",
+            system_info, pair, recent_data
         )
     })];
 
@@ -82,6 +82,11 @@ pub async fn generate_analysis(
         "contents": [{
             "parts": parts
         }],
+        "system_instruction": {
+            "parts": [{
+                "text": prompt
+            }]
+        },
         "tools": [{
             "google_search": {}
         }],
@@ -89,6 +94,7 @@ pub async fn generate_analysis(
             "temperature": 0.4,
             "topP": 0.9,
             "maxOutputTokens": 2048,
+            "response_mime_type": "application/json"
         }
     });
 
@@ -248,8 +254,8 @@ pub async fn stream_generate_content(
 
     let mut parts = vec![json!({
         "text": format!(
-            "{}{}\n\nPAIR: {}\nRECENT DATA:\n{}",
-            prompt, system_info, pair, recent_data
+            "{}\n\nPAIR: {}\nRECENT DATA:\n{}",
+            system_info, pair, recent_data
         )
     })];
 
@@ -266,6 +272,11 @@ pub async fn stream_generate_content(
         "contents": [{
             "parts": parts
         }],
+        "system_instruction": {
+            "parts": [{
+                "text": prompt
+            }]
+        },
         "tools": [{
             "google_search": {}
         }],

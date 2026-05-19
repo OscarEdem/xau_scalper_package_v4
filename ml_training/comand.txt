@@ -1,0 +1,22 @@
+pip install -r requirements.txt
+
+# Step 1: Fetch historical market data (SKIP if CSVs already exist in data/)
+# fetch_data_range.py requires a live MT5 terminal connection.
+# The data/ folder already has: m5_data.csv, m30_data.csv, h1_data.csv,
+# h4_data.csv, d1_data.csv — so you can go straight to Step 2.
+# Only re-run this if you want to refresh with more recent price history.
+# python fetch_data_range.py
+
+# Step 2: Train Feature MLP (replaces GBM) — outputs models/feature_mlp_*.onnx
+python train_gbm.py
+
+# Step 3: Train Regime MLP (replaces Heston) — outputs models/regime_mlp_*.onnx
+python train_heston.py
+
+# Step 4: Train LSTM (sequence model) — outputs models/lstm_*.onnx
+python train_lstm.py
+
+# All .onnx files in models/ must be copied to rust-server/models/ before building Docker
+# Run this from the ml_training/ directory:
+# Windows:  Copy-Item "models\*.onnx","models\*.json" "..\rust-server\models\" -Force
+# Linux:    cp models/*.onnx models/*.json ../rust-server/models/

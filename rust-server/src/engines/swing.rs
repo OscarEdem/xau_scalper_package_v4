@@ -509,11 +509,18 @@ impl SwingEngine {
         if is_uptrend && current_close > structure.external_high.1 {
             structure.is_bos_bullish = true;
             // BOS Retest Check: Is price now pulling back toward the broken level?
-            // We require price to close within 0.5 ATR of the broken high to confirm retest.
-            let atr_approx = if closes.len() > 14 {
-                let slice = &closes[closes.len()-14..];
-                let range: f64 = slice.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / 13.0;
-                range.max(0.0001)
+            // FIX: Use proper True Range (high-low) instead of close-to-close approximation.
+            // The original code used avg(|close[i] - close[i-1]|) which underestimates
+            // ATR on doji/inside bars and is inconsistent with the rest of the codebase.
+            let atr_approx = if highs.len() > 14 && lows.len() > 14 {
+                let n = highs.len();
+                let tr_sum: f64 = (n.saturating_sub(14)..n).map(|i| {
+                    let hl = highs[i] - lows[i];
+                    let hc = if i > 0 { (highs[i] - closes[i-1]).abs() } else { 0.0 };
+                    let lc = if i > 0 { (lows[i] - closes[i-1]).abs() } else { 0.0 };
+                    hl.max(hc).max(lc)
+                }).sum::<f64>();
+                (tr_sum / 14.0).max(0.0001)
             } else { 1.0 };
             let retest_zone = structure.external_high.1 + atr_approx * 0.5;
             if current_close <= retest_zone {
@@ -522,10 +529,16 @@ impl SwingEngine {
         }
         if is_downtrend && current_close < structure.external_low.1 {
             structure.is_bos_bearish = true;
-            let atr_approx = if closes.len() > 14 {
-                let slice = &closes[closes.len()-14..];
-                let range: f64 = slice.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / 13.0;
-                range.max(0.0001)
+            // FIX: Same True Range correction as bullish BOS above.
+            let atr_approx = if highs.len() > 14 && lows.len() > 14 {
+                let n = highs.len();
+                let tr_sum: f64 = (n.saturating_sub(14)..n).map(|i| {
+                    let hl = highs[i] - lows[i];
+                    let hc = if i > 0 { (highs[i] - closes[i-1]).abs() } else { 0.0 };
+                    let lc = if i > 0 { (lows[i] - closes[i-1]).abs() } else { 0.0 };
+                    hl.max(hc).max(lc)
+                }).sum::<f64>();
+                (tr_sum / 14.0).max(0.0001)
             } else { 1.0 };
             let retest_zone = structure.external_low.1 - atr_approx * 0.5;
             if current_close >= retest_zone {
@@ -630,7 +643,10 @@ impl SwingEngine {
         let current_price = req.current_price;
         
         // Bullish OB Bounce
-        if let Some(ob) = order_blocks.iter().find(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.998) {
+        // FIX: Widened tolerance from 0.2% (0.998) to 0.5% (0.995).
+        // At $3,000 XAUUSD, 0.2% = $6 below OB bottom. Many legitimate OB touches
+        // wick slightly below the zone before bouncing and were missed.
+        if let Some(ob) = order_blocks.iter().find(|ob| ob.is_bullish.unwrap_or(false) && current_price <= ob.top && current_price >= ob.bottom * 0.995) {
              let has_fvg = fvg_zones.iter().any(|z| z.is_bullish.unwrap_or(false) && z.bottom <= ob.top && z.top >= ob.bottom);
              let depth = (ob.top - current_price) / (ob.top - ob.bottom);
              return Some(SetupDriver::OrderBlockBounce(ObQuality {
@@ -642,7 +658,8 @@ impl SwingEngine {
         }
 
         // Bearish OB Bounce
-        if let Some(ob) = order_blocks.iter().find(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.002) {
+        // FIX: Widened upper tolerance from 0.2% (1.002) to 0.5% (1.005) for symmetry.
+        if let Some(ob) = order_blocks.iter().find(|ob| !ob.is_bullish.unwrap_or(true) && current_price >= ob.bottom && current_price <= ob.top * 1.005) {
              let has_fvg = fvg_zones.iter().any(|z| !z.is_bullish.unwrap_or(true) && z.bottom <= ob.top && z.top >= ob.bottom);
              let depth = (current_price - ob.bottom) / (ob.top - ob.bottom);
              return Some(SetupDriver::OrderBlockBounce(ObQuality {

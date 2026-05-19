@@ -1,5 +1,6 @@
 pub mod ensemble_predictor;
 pub mod gbm;
+pub mod generic_onnx;
 pub mod heston;
 pub mod lstm;
 pub mod news_guard;
