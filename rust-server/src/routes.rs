@@ -59,214 +59,16 @@ pub struct PaginationQuery {
 fn default_page() -> usize { 1 }
 fn default_limit() -> usize { 50 }
 
-#[utoipa::path(
-    get, path = "/daily-analysis", params(SymbolQuery),
-    responses((status = 200, description = "Returns a daily fundamental analysis (Last 24h context + Outlook)"))
-)]
-pub async fn daily_analysis(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Query(q): Query<SymbolQuery>,
-) -> Json<serde_json::Value> {
-    // Daily: Uses events from last 24h + upcoming 24h
-    let result = generate_fundamental_report(state, &q.symbol, "daily", q.force_refresh).await;
-    Json(result)
-}
+
+
 
 #[utoipa::path(
-    get, path = "/weekly-analysis", params(SymbolQuery),
-    responses((status = 200, description = "Returns a weekly fundamental analysis (Last 7d context + Outlook)"))
-)]
-pub async fn weekly_analysis(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Query(q): Query<SymbolQuery>,
-) -> Json<serde_json::Value> {
-    // Weekly: Uses all high-impact events in last 7 days + upcoming
-    let result = generate_fundamental_report(state, &q.symbol, "weekly", q.force_refresh).await;
-    Json(result)
-}
-
-#[utoipa::path(
-    post, path = "/chat-analysis", request_body = ChatRequest,
+    post, path = "/chat", request_body = ChatRequest,
     responses(
-        (status = 200, description = "Returns the LLM response to the user query based on cached analysis", body = String),
-        (status = 404, description = "No analysis found for the given symbol and period. Please run analysis first."),
-        (status = 500, description = "Internal LLM error")
+        (status = 200, description = "Streams the AI analysis response as SSE tokens. Auto-generates context on first call per period.")
     )
 )]
-pub async fn chat_analysis_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // --- Rate Limiting Logic ---
-    // Limit: 5 requests per minute per symbol (simple keying by symbol for now)
-    let limit_key = req.symbol.clone();
-    let window_size = 60; // seconds
-    let max_requests = 5;
-    let now = Utc::now().timestamp();
-
-    let mut allowed = false;
-    {
-        // DashMap entry API handles locking internally for the bucket
-        let mut entry = state.inner.chat_rate_limiter.entry(limit_key).or_insert((0, now));
-        let (count, window_start) = entry.value_mut();
-
-        if now - *window_start > window_size {
-            // Reset window
-            *window_start = now;
-            *count = 1;
-            allowed = true;
-        } else if *count < max_requests {
-            // Increment count
-            *count += 1;
-            allowed = true;
-        }
-    }
-
-    if !allowed {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    // Validate period
-    if req.period != "daily" && req.period != "weekly" {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Normalize symbol for institutional context lookups (Handle both 'm' and 'M')
-    let normalized_symbol = req.symbol.trim_end_matches('m').trim_end_matches('M').trim_end_matches(".pro").trim_end_matches(".k").to_string();
-
-    // --- NEW: Price Action Mini-Scribe (M5 Context) ---
-    let mut candle_scribe = String::new();
-    let mut technical_levels = Vec::new();
-    let mut session_found = false;
-
-    if let Some(session_entry) = state.inner.session_manager.sessions.get(&normalized_symbol) {
-        session_found = true;
-        let session = session_entry.value().lock().await;
-        let m5 = &session.market_data;
-        let count = m5.m5_closes.len();
-        let start = if count > 20 { count - 20 } else { 0 };
-        for i in start..count {
-            candle_scribe.push_str(&format!("H:{:.2},L:{:.2},C:{:.2};", 
-                m5.m5_highs.get(i).unwrap_or(&0.0), 
-                m5.m5_lows.get(i).unwrap_or(&0.0), 
-                m5.m5_closes.get(i).unwrap_or(&0.0)));
-        }
-
-        // Extract Institutional Liquidity & FVG Zones
-        let (_, swing_signal) = session.get_latest_signals();
-        if let Some(signal) = swing_signal {
-            for zone in &signal.liquidity_zones {
-                let label = if zone.is_bullish.unwrap_or(false) { "Inst. Support" } else { "Inst. Resistance" };
-                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
-            }
-            for zone in &signal.imbalance_zones {
-                let label = if zone.is_bullish.unwrap_or(false) { "Bullish FVG" } else { "Bearish FVG" };
-                technical_levels.push(format!("{} @ {:.2}-{:.2}", label, zone.bottom, zone.top));
-            }
-        }
-    }
-
-    if !session_found {
-        tracing::warn!(symbol = %req.symbol, normalized = %normalized_symbol, "No active session found for AI chat context. Candle data will be empty.");
-    }
-
-    // --- NEW: Multi-Turn Contextual Memory ---
-    let mut history_str = String::new();
-    {
-        if let Some(history) = state.inner.chat_sessions.get(&normalized_symbol) {
-            for msg in history.value() {
-                history_str.push_str(&format!("{}: {}\n", msg.role, msg.content));
-            }
-        }
-    }
-
-    let cache_key = format!("{}_{}", normalized_symbol, req.period);
-
-    // 1. Retrieve cached analysis
-    let (cached_report, raw_context) = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
-        (entry.value().report.clone(), entry.value().raw_context.clone())
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-
-    // FALLBACK: If technical_levels is still empty, try to extract from the cached_report
-    if technical_levels.is_empty() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cached_report) {
-            // Check both "analysis" -> "targets" (Standard) and "targets" (Legacy/Direct)
-            let targets = json["analysis"]["targets"].as_array()
-                .or_else(|| json["targets"].as_array());
-
-            if let Some(levels) = targets {
-                for l in levels {
-                    if let (Some(label), Some(price)) = (l["label"].as_str(), l["price"].as_f64()) {
-                        technical_levels.push(format!("{} @ {:.2}", label, price));
-                    }
-                }
-            }
-        }
-    }
-    let tech_ctx = if technical_levels.is_empty() { "None identified yet".to_string() } else { technical_levels.join(" | ") };
-    
-    // 2. Construct Prompt
-    let system_instruction = "You are an elite financial analyst and trading mentor. Answer questions based on RECENT DATA, CANDLES, and TECHNICAL LEVELS. \
-        Use the CHAT HISTORY for context. You MUST provide specific price levels (Support/Resistance/FVG) from the provided 'TECHNICAL LEVELS'. \
-        Include actionable trade considerations (Entry, SL, TP) when the data supports a high-conviction setup. \
-        If you mention specific price levels, include them in the 'targets' array in the JSON response \
-        so they can be drawn on the chart. Be concise, professional, and insight-driven.";
-    
-    let full_prompt = format!(
-        "TIMEFRAME: {}\n{}\n\nCHAT HISTORY:\n{}\nTECHNICAL LEVELS: {}\nRECENT CANDLES (M5):\n{}\nRECENT DATA:\n{}\n\nUSER QUESTION: {}", 
-        req.period.to_uppercase(), system_instruction, history_str, tech_ctx, candle_scribe, raw_context, req.query
-    );
-
-    let account_info = if let (Some(b), Some(e), Some(d)) = (req.account_balance, req.account_equity, req.account_drawdown) {
-        Some((b, e, d))
-    } else {
-        None
-    };
-
-    // 3. Call LLM (Now returns structured JSON)
-    match generate_analysis(&state.inner.http_client, &normalized_symbol, &cached_report, &full_prompt, &state.inner.metrics, req.image_base64.as_deref(), account_info).await {
-        Ok(structured_res) => {
-            // Update history
-            let mut history = state.inner.chat_sessions.entry(normalized_symbol.clone()).or_insert_with(|| VecDeque::with_capacity(10));
-            history.push_back(crate::state::ChatMessage { 
-                role: "user".to_string(), 
-                content: req.query.clone(), 
-                timestamp: Utc::now().timestamp() 
-            });
-            
-            let model_text = structured_res["macro_narrative"].as_str().unwrap_or("").to_string();
-            history.push_back(crate::state::ChatMessage { 
-                role: "model".to_string(), 
-                content: model_text, 
-                timestamp: Utc::now().timestamp() 
-            });
-            
-            if history.len() > 10 {
-                history.pop_front();
-            }
-
-            // --- WS BROADCAST ---
-            let service = TradingService::new(state.clone());
-            service.broadcast_ai_update(structured_res.clone());
-
-            Ok(Json(structured_res))
-        },
-        Err(e) => {
-            tracing::error!("LLM Chat failed: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
-#[utoipa::path(
-    post, path = "/chat-analysis/stream", request_body = ChatRequest,
-    responses(
-        (status = 200, description = "Streams the LLM response as SSE events")
-    )
-)]
-pub async fn chat_analysis_stream_handler(
+pub async fn chat_handler(
     State(state): State<Arc<ApplicationStateWithTicks>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
@@ -285,7 +87,14 @@ pub async fn chat_analysis_stream_handler(
     let (cached_report, raw_context) = if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
         (entry.value().report.clone(), entry.value().raw_context.clone())
     } else {
-        return Err(StatusCode::NOT_FOUND);
+        tracing::info!(symbol = %normalized_symbol, period = %req.period, "Chat stream requested but no cached analysis found. Auto-generating...");
+        let _ = generate_fundamental_report(state.clone(), &normalized_symbol, &req.period, false).await;
+        if let Some(entry) = state.inner.fundamental_analysis_cache.get(&cache_key) {
+            (entry.value().report.clone(), entry.value().raw_context.clone())
+        } else {
+            tracing::error!(symbol = %normalized_symbol, "Failed to generate analysis context for chat stream.");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
 
     // --- NEW: Price Action Mini-Scribe (M5 Context) ---
@@ -378,32 +187,6 @@ pub async fn chat_analysis_stream_handler(
     });
 
     Ok(Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default()))
-}
-
-
-#[utoipa::path(
-    post, path = "/test-push",
-    responses(
-        (status = 200, description = "Test notification sent"),
-        (status = 500, description = "Failed to send notification")
-    )
-)]
-pub async fn test_push_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let service = TradingService::new(state.clone());
-    
-    let mut dummy_signal = EvalResponse::default();
-    dummy_signal.signal_id = format!("TEST-{}", Utc::now().timestamp());
-    dummy_signal.entry_type = SignalDirection::Long;
-    dummy_signal.entry_price = 2000.0;
-    dummy_signal.push_title = Some("🔔 Test Notification".to_string());
-    dummy_signal.push_body = Some("This is a test signal to verify Expo integration.".to_string());
-    dummy_signal.should_push = true;
-
-    service.send_push_notification(&dummy_signal, "TEST-USD").await;
-
-    Ok(Json(serde_json::json!({ "status": "sent", "signal_id": dummy_signal.signal_id })))
 }
 
 #[utoipa::path(

@@ -46,13 +46,7 @@ mod e2e_tests;
     paths(
         handlers::system::health_check_handler,
         handlers::trading::process_data_handler,
-        handlers::trading::documented_tick_ingest_handler,
-        handlers::system::save_push_token_handler,
-        handlers::system::remove_push_token_handler,
-        routes::daily_analysis,
-        routes::weekly_analysis,
-        routes::chat_analysis_handler,
-        routes::test_push_handler,
+        routes::chat_handler,
         handlers::system::get_loaded_models_handler,
         handlers::trading::get_signal_definitions_handler,
         handlers::system::metrics_handler,
@@ -67,7 +61,7 @@ mod e2e_tests;
         routes::get_external_news_handler
     ),
     components(
-        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, ActiveSignal, HistoricalSignal, SavePushTokenRequest, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest, CalendarEvent, NewsItem)
+        schemas(EvalRequest, EvalResponse, PriceLevel, VwapBands, ActiveSignal, HistoricalSignal, TickData, MetricsResponse, SignalReasonInfo, SignalDefinitionsResponse, NewsEvent, TradingSettings, ScalpSettings, SwingSettings, RiskSettings, GuardResult, MacroOutlook, Bias, MacroCategory, ChatRequest, CalendarEvent, NewsItem)
     ),
     info(
         description = "This API provides endpoints for the XAU/USD Scalping and Swing Trading Engines. It processes market data, generates trading signals, and provides a real-time data stream via WebSockets. It also includes AI-powered Technical and Fundamental analysis endpoints."
@@ -267,30 +261,21 @@ pub fn create_app(state: Arc<ApplicationStateWithTicks>) -> Router {
     Router::new()
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)) // 2MB Limit
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .route("/", get(handlers::system::health_check_handler))
+        .route("/health", get(handlers::system::health_check_handler))
         .route("/ws", get(handlers::ws::websocket_handler))
         .route("/metrics", get(handlers::system::metrics_handler))
-        .route("/metrics/prometheus", get(handlers::system::prometheus_metrics_handler)) // NEW: Prometheus endpoint
-        .route("/health", get(handlers::system::health_check_handler))
-        .route("/data", post(handlers::trading::process_data_handler)) // For main analysis
-        .route("/ticks", post(handlers::trading::tick_ingest_handler)) // NEW: For live ticks
-        .route("/signals/paginated", get(routes::get_signals_paginated_handler)) // NEW: Pagination
-        .route("/signals/clear", axum::routing::delete(routes::clear_database_handler)) // NEW: Clear DB
+        .route("/metrics/prometheus", get(handlers::system::prometheus_metrics_handler))
+        .route("/data", post(handlers::trading::process_data_handler))
+        .route("/signals/paginated", get(routes::get_signals_paginated_handler))
+        .route("/signals/clear", axum::routing::delete(routes::clear_database_handler))
         .route("/definitions/reasons", get(handlers::trading::get_signal_definitions_handler))
-        .route("/external/calendar", get(routes::get_external_calendar_handler)) // NEW: External Calendar
-        .route("/external/news", get(routes::get_external_news_handler)) // NEW: External RSS News
-        // --- Add new routes for logging ---
-        .route("/save-push-token", post(handlers::system::save_push_token_handler).delete(handlers::system::remove_push_token_handler))
+        .route("/external/calendar", get(routes::get_external_calendar_handler))
+        .route("/external/news", get(routes::get_external_news_handler))
         .route("/settings", post(handlers::system::update_settings_handler).get(handlers::system::get_settings_handler))
         .route("/settings/reset", post(handlers::system::reset_settings_handler))
         .route("/news-guard/:symbol", get(handlers::trading::get_news_guard_status_handler))
         .route("/models/loaded", get(handlers::system::get_loaded_models_handler))
-        // --- Analysis Endpoints ---
-        .route("/daily-analysis", get(routes::daily_analysis))
-        .route("/weekly-analysis", get(routes::weekly_analysis))
-        .route("/chat-analysis", post(routes::chat_analysis_handler))
-        .route("/chat-analysis/stream", post(routes::chat_analysis_stream_handler))
-        .route("/test-push", post(routes::test_push_handler))
-        // Provide the state to all handlers
+        // --- Chat / AI ---
+        .route("/chat", post(routes::chat_handler))
         .with_state(state)
 }

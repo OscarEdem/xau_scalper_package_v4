@@ -56,65 +56,6 @@ pub async fn prometheus_metrics_handler() -> String {
 }
 
 #[utoipa::path(
-    post,
-    path = "/save-push-token",
-    request_body = SavePushTokenRequest,
-    responses(
-        (status = 200, description = "Token saved successfully"),
-        (status = 400, description = "Invalid token provided")
-    )
-)]
-/// Handler to receive and store a push notification token from a client app.
-pub async fn save_push_token_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(body): Json<SavePushTokenRequest>,
-) -> (StatusCode, Json<&'static str>) {
-    if body.token.is_empty() || !body.token.starts_with("ExponentPushToken[") {
-        return (StatusCode::BAD_REQUEST, Json("Invalid push token format"));
-    }
-
-    let mut tokens = state.inner.push_tokens.lock().await;
-    let token_for_db = body.token.clone();
-    let inserted = tokens.insert(body.token);
-
-    // --- NEW: Persist tokens to DB if a new one was added ---
-    if inserted {
-        tracing::info!("Saved new push token. Total tokens: {}", tokens.len());
-        state.inner.session_manager.save_push_token(token_for_db, "expo".to_string()).await;
-    }
-
-    (StatusCode::OK, Json("Token processed"))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/save-push-token",
-    request_body = SavePushTokenRequest,
-    responses(
-        (status = 200, description = "Token removed successfully"),
-        (status = 500, description = "Failed to remove token")
-    )
-)]
-/// Handler to remove a push notification token.
-pub async fn remove_push_token_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(body): Json<SavePushTokenRequest>,
-) -> (StatusCode, Json<&'static str>) {
-    match crate::db::remove_push_token(&state.inner.db, &body.token, Some(&state.inner.metrics.db_retries_total)).await {
-        Ok(_) => {
-            let mut tokens = state.inner.push_tokens.lock().await;
-            tokens.remove(&body.token);
-            tracing::info!("Removed push token. Total tokens: {}", tokens.len());
-            (StatusCode::OK, Json("Token removed"))
-        },
-        Err(e) => {
-            tracing::error!("Failed to remove push token: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json("Failed to remove token"))
-        }
-    }
-}
-
-#[utoipa::path(
     get,
     path = "/settings",
     responses(

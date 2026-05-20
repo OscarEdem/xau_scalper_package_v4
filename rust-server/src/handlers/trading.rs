@@ -6,43 +6,14 @@ use axum::{
 use std::sync::Arc;
 use std::collections::HashMap;
 use chrono::Utc;
-use xau_scalper_server::{EvalRequest, HistoricalSignal};
+use xau_scalper_server::EvalRequest;
 use xau_scalper_server::engines::news_guard::GuardResult;
 
 use crate::state::{
-    ApplicationStateWithTicks, LatestSignalsForSymbol,
-    SignalDefinitionsResponse, SignalReasonInfo, TickData
+    ApplicationStateWithTicks,
+    SignalDefinitionsResponse, SignalReasonInfo,
 };
 
-/// New handler to ingest a single tick via HTTP POST and broadcast it.
-/// Validates the JSON payload against TickData to ensure stream integrity.
-pub async fn tick_ingest_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(tick_data): Json<TickData>, 
-) -> StatusCode {
-    state.inner.metrics.http_requests.inc();
-    let _service = crate::services::trading::TradingService::new(state);
-    if let Ok(_tick_json) = serde_json::to_string(&tick_data) {
-        // Broadcast disabled: Sidecar handles local ticks
-        // _service.broadcast_tick(_tick_json);
-        StatusCode::OK
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-/// This is a trick for utoipa to document the raw JSON body of `tick_ingest_handler`.
-#[utoipa::path(
-    post,
-    path = "/ticks",
-    request_body(content = TickData, description = "A single market tick in JSON format", content_type = "application/json"),
-    responses(
-        (status = 200, description = "Tick received and broadcasted successfully"),
-    ),
-    tag = "Trading Signal API"
-)]
-#[allow(dead_code)]
-pub async fn documented_tick_ingest_handler() {}
 
 #[utoipa::path(
     get,
@@ -129,98 +100,4 @@ pub async fn get_news_guard_status_handler(
     responses(
         (status = 200, description = "Returns a log of all signals generated in the last 12 hours", body = Vec<HistoricalSignal>)
     )
-)]
-/// Handler to return a log of all signals generated in the last 12 hours.
-pub async fn get_signals_handler(State(state): State<Arc<ApplicationStateWithTicks>>) -> Json<Vec<HistoricalSignal>> {
-    let history = state.inner.signal_history.lock().await;
-    // Return a clone of the current history
-    Json(history.iter().cloned().collect())
-}
-
-/// This handler now acts as the primary data ingress point.
-#[utoipa::path(
-    post,
-    path = "/data",
-    request_body = EvalRequest,
-    responses(
-        (status = 200, description = "Data processed successfully")
-    )
-)]
-#[axum::debug_handler]
-pub async fn process_data_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Json(req): Json<EvalRequest<'static>>,
-) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
-    // The service handles all logic including metrics, history, and notifications.
-    let service = crate::services::trading::TradingService::new(state);
-    
-    // Delegate the entire processing to the service, which will offload to a background thread.
-    service.process_eval_request(req).await?;
-    
-    Ok((StatusCode::OK, Json("Data processed")))
-}
-
-#[utoipa::path(
-    get,
-    path = "/signals/{symbol}",
-    params(
-        ("symbol" = String, Path, description = "The trading symbol, e.g., XAUUSD")
-    ),
-    responses(
-        (status = 200, description = "Returns the latest scalp and swing signals for the symbol", body = LatestSignalsForSymbol),
-        (status = 404, description = "No session found for symbol")
-    )
-)]
-/// Handler to return the last generated signals for a specific symbol.
-pub async fn get_latest_signals_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-    Path(symbol): Path<String>,
-) -> Result<Json<LatestSignalsForSymbol>, StatusCode> {
-    let sessions = &state.inner.session_manager.sessions;
-
-    if let Some(session_arc) = sessions.get(&symbol) {
-        let session = session_arc.lock().await;
-        let (scalp_signal, swing_signal) = session.get_latest_signals();
-        Ok(Json(LatestSignalsForSymbol {
-            symbol: symbol.clone(),
-            scalp_signal,
-            swing_signal,
-        }))
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/signals/latest",
-    responses(
-        (status = 200, description = "Returns the latest signals for all active symbols", body = Vec<LatestSignalsForSymbol>)
-    )
-)]
-/// Handler to return the latest signals for all active symbols.
-pub async fn get_all_latest_signals_handler(
-    State(state): State<Arc<ApplicationStateWithTicks>>,
-) -> Json<Vec<LatestSignalsForSymbol>> {
-    let sessions = &state.inner.session_manager.sessions;
-
-    let mut all_signals = Vec::new();
-
-    for r in sessions.iter() {
-        let symbol = r.key();
-        let session_arc = r.value();
-        let session = session_arc.lock().await;
-        let (scalp_signal, swing_signal) = session.get_latest_signals();
-        
-        // Only include symbols that have generated at least one signal
-        if scalp_signal.is_some() || swing_signal.is_some() {
-            all_signals.push(LatestSignalsForSymbol {
-                symbol: symbol.clone(),
-                scalp_signal,
-                swing_signal,
-            });
-        }
-    }
-
-    Json(all_signals)
-}
+)]
