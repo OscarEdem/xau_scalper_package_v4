@@ -15,6 +15,11 @@ static ERROR_COUNT_429: AtomicI64 = AtomicI64::new(0);
 const CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
 const CIRCUIT_BREAKER_COOLDOWN_SEC: i64 = 600; // 10 minutes
 
+// --- Rate Limiter State ---
+static CURRENT_MINUTE: AtomicI64 = AtomicI64::new(0);
+static MINUTE_REQUEST_COUNT: AtomicI64 = AtomicI64::new(0);
+const MAX_REQUESTS_PER_MIN: i64 = 14;
+
 fn check_circuit_breaker() -> Result<()> {
     let now = Utc::now().timestamp();
     let last_429 = LAST_429_TIME.load(Ordering::SeqCst);
@@ -33,6 +38,25 @@ fn check_circuit_breaker() -> Result<()> {
     Ok(())
 }
 
+async fn check_rate_limit() {
+    let now_min = Utc::now().timestamp() / 60;
+    let current = CURRENT_MINUTE.load(Ordering::SeqCst);
+    if now_min > current {
+        CURRENT_MINUTE.store(now_min, Ordering::SeqCst);
+        MINUTE_REQUEST_COUNT.store(1, Ordering::SeqCst);
+    } else {
+        let count = MINUTE_REQUEST_COUNT.fetch_add(1, Ordering::SeqCst);
+        if count >= MAX_REQUESTS_PER_MIN {
+            let now_sec = Utc::now().timestamp();
+            let sleep_sec = 60 - (now_sec % 60) + 1;
+            tracing::warn!("Rate limit ({} req/min) reached. Proactively sleeping for {}s...", MAX_REQUESTS_PER_MIN, sleep_sec);
+            sleep(Duration::from_secs(sleep_sec as u64)).await;
+            CURRENT_MINUTE.store(Utc::now().timestamp() / 60, Ordering::SeqCst);
+            MINUTE_REQUEST_COUNT.store(1, Ordering::SeqCst);
+        }
+    }
+}
+
 // Use the v1beta endpoint for the latest models
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -46,8 +70,9 @@ pub async fn generate_analysis(
     account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
 ) -> Result<serde_json::Value> {
     metrics.http_requests.inc();
-    // 1. Check Circuit Breaker
+    // 1. Check Circuit Breaker & Token Bucket
     check_circuit_breaker()?;
+    check_rate_limit().await;
 
     // 2. Get API Key
     let api_key = std::env::var("GEMINI_API_KEY")
@@ -87,9 +112,6 @@ pub async fn generate_analysis(
                 "text": prompt
             }]
         },
-        "tools": [{
-            "google_search": {}
-        }],
         "generationConfig": {
             "temperature": 0.4,
             "topP": 0.9,
@@ -98,12 +120,8 @@ pub async fn generate_analysis(
         }
     });
 
-    // Free-tier GA models only (Gemini 2.5 and 2.0 families)
-    let models = [
-        "gemini-2.5-flash-lite",  // Free tier: fastest, highest RPM/RPD
-        "gemini-2.5-flash",       // Free tier: higher quality
-        "gemini-2.0-flash",       // Free tier: solid fallback
-    ];
+    // Phase 1: Dedicated model for JSON reasoning
+    let models = ["gemini-2.5-flash"];
     let mut last_error = anyhow!("No models available");
 
     for model in models {
@@ -209,11 +227,19 @@ pub async fn generate_analysis(
                 break; // Try next model
             }
             
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS { 
+                metrics.gemini_429_errors.inc(); 
+                LAST_429_TIME.store(Utc::now().timestamp(), Ordering::SeqCst);
+                ERROR_COUNT_429.fetch_add(1, Ordering::SeqCst);
+                // Phase 1: Deep sleep for 60s on 429
+                backoff = Duration::from_secs(60);
+            }
             tracing::warn!("Gemini API error ({}) for {}. Retrying in {:?}...", status, model, backoff);
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS { metrics.gemini_429_errors.inc(); }
             sleep(backoff).await;
             attempt += 1;
-            backoff *= 2;
+            if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                backoff *= 2;
+            }
         } else {
             let status = res.status();
             let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
@@ -221,6 +247,115 @@ pub async fn generate_analysis(
             last_error = anyhow!("Gemini API Error {} for {}: {}", status, model, error_text);
             break; // Try next model
         }
+        }
+    }
+    
+    Err(last_error)
+}
+
+/// Phase 2: Pass 1 - Gather live market intelligence using web search
+pub async fn gather_market_intelligence(
+    client: &Client,
+    symbol: &str,
+    metrics: &AppMetrics,
+) -> Result<String> {
+    metrics.http_requests.inc();
+    check_rate_limit().await;
+    
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
+
+    let prompt = format!("Search for the latest, breaking macroeconomic news affecting the {} trading pair. Output a concise 3-bullet-point summary of the most critical drivers.", symbol);
+
+    let body = json!({
+        "contents": [{
+            "parts": [{ "text": prompt }]
+        }],
+        "tools": [{
+            "google_search": {}
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.9,
+            "maxOutputTokens": 500,
+        }
+    });
+
+    let models = ["gemini-2.5-flash-lite"];
+    let mut last_error = anyhow!("No models available");
+
+    for model in models {
+        let url = format!("{}/{}:generateContent", GEMINI_BASE_URL, model);
+        let mut attempt = 0;
+        let max_retries = 3;
+        let mut backoff = Duration::from_secs(2);
+
+        loop {
+            let res_result = client
+                .post(&url)
+                .header("x-goog-api-key", &api_key)
+                .json(&body)
+                .send()
+                .await;
+
+            let res = match res_result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = anyhow!("Search Request failed for {}: {}", model, e);
+                    if attempt >= max_retries { break; }
+                    tracing::warn!("Search Request failed for {}: {}. Retrying...", model, e);
+                    sleep(backoff).await;
+                    attempt += 1;
+                    backoff *= 2;
+                    continue;
+                }
+            };
+
+            if res.status().is_success() {
+                let json: serde_json::Value = res.json().await?;
+                
+                let candidate_parts = json.get("candidates")
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("content"))
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|c| c.as_array());
+
+                let result_text = candidate_parts
+                    .and_then(|parts| {
+                        parts.iter().find_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    })
+                    .ok_or_else(|| anyhow!("Failed to extract search text from Gemini response: {:?}", json))?;
+
+                return Ok(result_text.to_string());
+            } else if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS || res.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                let status = res.status();
+                if attempt >= max_retries {
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS { metrics.gemini_429_errors.inc(); }
+                    let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                    last_error = anyhow!("Gemini API Error {} (Max retries reached) for {}: {}", status, model, error_text);
+                    break;
+                }
+                
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS { 
+                    metrics.gemini_429_errors.inc(); 
+                    LAST_429_TIME.store(Utc::now().timestamp(), Ordering::SeqCst);
+                    ERROR_COUNT_429.fetch_add(1, Ordering::SeqCst);
+                    backoff = Duration::from_secs(60);
+                }
+                tracing::warn!("Gemini API search error ({}) for {}. Retrying in {:?}...", status, model, backoff);
+                sleep(backoff).await;
+                attempt += 1;
+                if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    backoff *= 2;
+                }
+            } else {
+                let status = res.status();
+                let error_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                tracing::warn!("Search Model '{}' skipped. Status: {}. Error: {}", model, status, error_text);
+                last_error = anyhow!("Gemini API Search Error {} for {}: {}", status, model, error_text);
+                break;
+            }
         }
     }
     
@@ -239,6 +374,7 @@ pub async fn stream_generate_content(
     account_info: Option<(f64, f64, f64)>, // (balance, equity, drawdown)
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>> {
     metrics.http_requests.inc();
+    check_rate_limit().await;
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|e| anyhow!("GEMINI_API_KEY environment variable not set: {}", e))?;
 
@@ -288,12 +424,8 @@ pub async fn stream_generate_content(
         }
     });
 
-    // Free-tier GA models only for streaming
-    let models = [
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-    ];
+    // Phase 1: Dedicated fast model for streaming
+    let models = ["gemini-2.5-flash-lite"];
     let mut last_res = None;
 
     for model in models {

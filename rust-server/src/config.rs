@@ -111,26 +111,16 @@ pub struct ScalpSettings {
     pub kalman_period: usize,
     pub base_kalman_threshold: f64,
     pub base_m1_surge_threshold: f64,
-    pub min_conviction: f64,
-    pub max_limit_dist_atr_mult: f64,
-    pub htf_bias_weight: f64,
-    pub ensemble_weight: f64,
-    pub flow_surge_confluence_boost: f64,
-    pub inducement_weight: f64,
-    pub risk_reward_ratio_tp1: f64,
-    pub risk_reward_ratio_tp2: f64,
-    pub sl_atr_multiplier_inducement: f64,
-    pub sl_atr_multiplier_flow: f64,
-    pub logistic_scale: f64,
-    pub logistic_offset: f64,
+    
+    // Spread Guard
+    #[serde(default = "default_max_spread_points")]
+    pub max_spread_points: f64,
+
     pub limit_order_expiration: u64,
     pub time_stop_seconds: u32,
     pub news_pre_event_block_minutes: i64,
     pub news_post_event_block_minutes: i64,
     pub news_guard_atr_spike_multiplier: f64,
-    // Mode Classification Thresholds
-    pub momentum_kalman_threshold: f64,
-    pub momentum_m1_threshold: f64,
 
     // Fade Strategy
     pub fade_sma_period: usize,
@@ -144,6 +134,7 @@ pub struct ScalpSettings {
     pub momentum_risk_atr_mult: f64,
     pub momentum_tp1_atr_mult: f64,
     pub momentum_tp2_atr_mult: f64,
+    pub momentum_min_risk_atr: f64,
 
     // Pullback Strategy
     pub pullback_sl_atr_mult: f64,
@@ -153,8 +144,6 @@ pub struct ScalpSettings {
     // Safety & Scoring
     pub min_sl_atr_mult: f64,
     pub max_sl_atr_mult: f64,
-    pub kalman_weight: f64,
-    pub m1_surge_weight: f64,
 
     // Session Toggles
     #[serde(default)]
@@ -163,20 +152,16 @@ pub struct ScalpSettings {
     pub allow_london_open_momentum: bool,
     #[serde(default)]
     pub allow_ny_late_momentum: bool,
+    
     pub m1_roc_period: usize,
-    pub m1_atr_conversion_div: f64,
-    pub vol_regime_clamp_min: f64,
-    pub vol_regime_clamp_max: f64,
-    pub flow_threshold_mult: f64,
-    pub inducement_opposing_reduction: f64,
-    pub momentum_min_risk_atr: f64,
+
     #[serde(default)]
     pub filter_scalp_by_swing: bool,
     #[serde(default = "default_push_notifications_enabled")]
     pub push_notifications_enabled: bool,
     #[serde(default = "default_push_notification_threshold")]
     pub push_notification_threshold: f64,
-    // (swing evaluation knobs moved to `SwingSettings`)
+    
     #[serde(default = "default_pullback_entry_displacement_atr")]
     pub pullback_entry_displacement_atr: f64,
     #[serde(default = "default_momentum_require_ml_confluence")]
@@ -200,25 +185,12 @@ impl Default for ScalpSettings {
             kalman_period: 20,
             base_kalman_threshold: 0.08, // Lowered to catch trends earlier
             base_m1_surge_threshold: 0.20, // Sniper: Catch smaller initial impulses (0.2 ATR)
-            min_conviction: 60.0,
-            max_limit_dist_atr_mult: 0.6,
-            htf_bias_weight: 0.35,
-            ensemble_weight: 0.25,
-            flow_surge_confluence_boost: 0.15,
-            inducement_weight: 0.6,
-            risk_reward_ratio_tp1: 1.25,
-            risk_reward_ratio_tp2: 2.5,
-            sl_atr_multiplier_inducement: 0.6,
-            sl_atr_multiplier_flow: 1.2,
-            logistic_scale: 2.93,
-            logistic_offset: 0.75,
+            max_spread_points: 25.0,
             limit_order_expiration: 180,
             time_stop_seconds: 3600,
             news_pre_event_block_minutes: 30,
             news_post_event_block_minutes: 15,
             news_guard_atr_spike_multiplier: 2.5,
-            momentum_kalman_threshold: 0.7,
-            momentum_m1_threshold: 0.6,
             
             fade_sma_period: 20,
             fade_std_dev_mult: 3.0,
@@ -229,38 +201,30 @@ impl Default for ScalpSettings {
             momentum_risk_atr_mult: 0.24,
             momentum_tp1_atr_mult: 1.5, // Widened from 0.7
             momentum_tp2_atr_mult: 3.0, // Widened from 1.3
+            momentum_min_risk_atr: 0.21,
             pullback_tp1_atr_mult: 1.0, // Widened from 0.5
             pullback_tp2_atr_mult: 2.0, // Widened from 1.0
-            // FIXED: Raised from 0.09 → 0.30 ATR. The original 0.09 ATR stop
-            // (~$0.30–$0.80 on XAUUSD) was smaller than typical broker spread
-            // and would be hit by spread widening alone on market execution.
             pullback_sl_atr_mult: 0.30,
             min_sl_atr_mult: 0.15,
             max_sl_atr_mult: 1.5,
-            kalman_weight: 0.6,
-            m1_surge_weight: 0.35,
             
             allow_asia_trading: false,
             allow_london_open_momentum: false,
             allow_ny_late_momentum: false,
             m1_roc_period: 3, // FIXED: Require 3-bar sustained M1 move (was 1 — single-bar noise)
-            m1_atr_conversion_div: 5.0,
-            vol_regime_clamp_min: 0.5,
-            vol_regime_clamp_max: 2.0,
-            flow_threshold_mult: 0.5,
-            inducement_opposing_reduction: 0.5,
-            momentum_min_risk_atr: 0.21,
+            
             filter_scalp_by_swing: true, // ENABLED: Only scalp in the direction of H1 swing bias
             push_notifications_enabled: true,
             push_notification_threshold: 60.0,
             pullback_entry_displacement_atr: 0.30, // RAISED: Require deeper pullbacks to fair value (was 0.20)
             momentum_require_ml_confluence: true,
-            // note: swing evaluation knobs belong to `SwingSettings`
             max_signals_per_day: 8, // Unified with swing engine
             circuit_breaker_enabled: true,
         }
     }
 }
+
+fn default_max_spread_points() -> f64 { 25.0 }
 
 fn default_pullback_entry_displacement_atr() -> f64 { 0.20 }
 fn default_momentum_require_ml_confluence() -> bool { true }
@@ -273,9 +237,6 @@ fn default_eval_m15_check_enabled() -> bool { true }
 
 impl ScalpSettings {
     pub fn validate(&self) -> Result<(), String> {
-        if self.min_conviction < 0.0 || self.min_conviction > 100.0 {
-            return Err(format!("Scalp min_conviction must be between 0.0 and 100.0, got {}", self.min_conviction));
-        }
         if self.push_notification_threshold < 0.0 || self.push_notification_threshold > 100.0 {
             return Err(format!("Scalp push_notification_threshold must be between 0.0 and 100.0, got {}", self.push_notification_threshold));
         }

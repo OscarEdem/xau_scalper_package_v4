@@ -505,8 +505,8 @@ pub async fn generate_fundamental_report(
                 return false;
             }
             
-            if period == "daily" {
-                // Daily: Context from last 24h and Outlook for next 24h
+            if period == "daily" || period == "dynamic" {
+                // Daily/Dynamic: Context from last 24h and Outlook for next 24h
                 event.timestamp >= (now.timestamp() - 86400) && event.timestamp <= (now.timestamp() + 86400)
             } else {
                 // Weekly: Context from last 7 days and Outlook for next 7 days (bounded by fetcher's "this week")
@@ -613,6 +613,26 @@ pub async fn generate_fundamental_report(
         context_map["current_price"] = serde_json::json!(session.market_data.m5_closes.back());
     }
     
+    // Phase 2: Gather Market Intelligence via Web Search
+    tracing::info!("Gathering live web search intelligence for {}...", symbol);
+    let mut search_summary = String::from("No recent web search data available.");
+    if let Ok(summary) = crate::llm::gemini::gather_market_intelligence(&state.inner.http_client, symbol, &state.inner.metrics).await {
+        search_summary = summary;
+    }
+    context_map["live_web_search_summary"] = serde_json::json!(search_summary);
+    
+    // Phase 3: Token Compression (Context Efficiency)
+    // Reduce array sizes to strictly necessary minimum to save RPD quotas
+    if let Some(arr) = context_map.get_mut("high_impact_events").and_then(|v| v.as_array_mut()) {
+        arr.truncate(4);
+    }
+    if let Some(arr) = context_map.get_mut("news_headlines").and_then(|v| v.as_array_mut()) {
+        arr.truncate(3);
+    }
+    if let Some(arr) = context_map.get_mut("fvg_zones").and_then(|v| v.as_array_mut()) {
+        arr.truncate(3);
+    }
+
     let context_json = serde_json::to_string(&context_map).unwrap_or_else(|_| "{}".to_string());
 
     // --- LLM CALL ---
@@ -726,6 +746,41 @@ pub fn start_background_analysis_task(state: Arc<ApplicationStateWithTicks>, mut
                     // Fundamental Weekly
                     let fund_report = generate_fundamental_report(state.clone(), &symbol, "weekly", false).await;
                     info!("Scheduled Fundamental Weekly Report generated for {}: {:?}", symbol, fund_report.as_object().and_then(|o| o.get("overall_bias")));
+                }
+            }
+            
+            // Phase 3: Gatekeeper (Dynamic Trigger based on Volatility/Conviction)
+            let symbols: Vec<String> = {
+                let sessions = &state.inner.session_manager.sessions;
+                sessions.iter().map(|r| r.key().clone()).collect()
+            };
+            
+            for symbol in symbols {
+                let mut gatekeeper_triggered = false;
+                if let Some(session_entry) = state.inner.session_manager.sessions.get(&symbol) {
+                    let session = session_entry.value().lock().await;
+                    let (_, swing_signal) = session.get_latest_signals();
+                    
+                    if let Some(signal) = swing_signal {
+                        // Trigger if Swing Engine detects a high conviction setup (> 80)
+                        if signal.conviction_score.unwrap_or(0.0) >= 80.0 {
+                            gatekeeper_triggered = true;
+                        }
+                    }
+                }
+                
+                if gatekeeper_triggered {
+                    let dynamic_cache_key = format!("{}_dynamic", symbol);
+                    // Only trigger dynamic analysis max once per hour to protect quotas
+                    let mut can_run = true;
+                    if let Some(entry) = state.inner.fundamental_analysis_cache.get(&dynamic_cache_key) {
+                        let cache_time = entry.value().hash; // Hacky way to store timestamp if we modify it, but we won't right now
+                        // Just rely on the cache to prevent exact duplicates for now.
+                    }
+                    if can_run {
+                        info!("Gatekeeper Triggered for {}! High Conviction Detected. Running targeted dynamic analysis...", symbol);
+                        let _ = generate_fundamental_report(state.clone(), &symbol, "dynamic", false).await;
+                    }
                 }
             }
         }

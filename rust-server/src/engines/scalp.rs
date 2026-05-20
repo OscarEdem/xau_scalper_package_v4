@@ -65,10 +65,10 @@ impl ScalpEngine {
         }
 
         // ---- Guard: Spread Check ----
-        if let (Some(spread), Some(limit)) = (req.spread_points, req.spread_limit_points) {
-            if spread > limit {
-                return EvalResponse { reason: format!("Spread too high: {:.0} > {:.0}", spread, limit), ..Default::default() };
-            }
+        let spread = req.spread_points.unwrap_or(0.0);
+        let limit = req.spread_limit_points.unwrap_or(settings.max_spread_points); // Use explicit request limit, fallback to settings
+        if spread > limit {
+            return EvalResponse { reason: format!("Blocked: Spread too wide ({:.0} > {:.0})", spread, limit), ..Default::default() };
         }
 
         // ---- Volatility: ATR on M5 (used to normalize thresholds) ----
@@ -123,7 +123,7 @@ impl ScalpEngine {
         } else if let Some(d) = Self::evaluate_pullback(req, settings, predictor_cache, last_atr, vol_regime) {
             d
         // Priority D: Mean Reversion (Fade) - Lowest priority
-        } else if let Some(d) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals, last_swing_high, last_swing_low, &fvg_zones) {
+        } else if let Some(d) = Self::evaluate_fade(req, m5_closes, last_atr, settings, &adx_vals, last_swing_high, last_swing_low, &fvg_zones, predictor_cache) {
             d
         } else {
             Decision::default()
@@ -157,8 +157,7 @@ impl ScalpEngine {
         // ---- Risk Calculation (SL/TP) ----
         let (sl, tp1, tp2) = Self::calculate_risk(&mut decision, last_atr, last_swing_low, last_swing_high, settings);
 
-        // ---- Dynamic Position Sizing ----
-        // 1. Calculate Base Lot Size from Risk Settings (Equity % / SL Distance)
+        // ---- Dynamic Position Sizing (Conviction-Scaled Risk) ----
         let mut base_size = 0.0;
         if sl != 0.0 && decision.entry_price > 0.0 {
             let sl_dist = (decision.entry_price - sl).abs();
@@ -176,7 +175,19 @@ impl ScalpEngine {
                     }
                 }
                 let equity = req.account_equity.unwrap_or(risk_settings.account_equity);
-                let risk_amt = equity * risk_settings.risk_per_trade_pct;
+                
+                // Dynamic Risk Tiering based on Conviction
+                let conviction = decision.conviction;
+                let risk_pct = if conviction >= 90.0 {
+                    0.02 // 2% Risk (A+ Setup)
+                } else if conviction >= 75.0 {
+                    0.01 // 1% Risk (Standard Setup)
+                } else {
+                    0.005 // 0.5% Risk (Low-tier Setup)
+                };
+                
+                let final_risk_pct = req.max_risk_pct.unwrap_or(risk_settings.risk_per_trade_pct).min(risk_pct);
+                let risk_amt = equity * final_risk_pct;
                 let risk_per_lot = sl_dist * risk_settings.xauusd_lot_point_value;
                 base_size = risk_amt / risk_per_lot;
             }
@@ -188,12 +199,8 @@ impl ScalpEngine {
             "ny" => 0.8,
             _ => 0.5,
         };
-        let conviction_mult = if decision.expectancy_class == ExpectancyClass::Linear && decision.conviction > 80.0 {
-            1.2
-        } else {
-            1.0
-        };
-        let position_size = base_size * session_mult * conviction_mult;
+        // Conviction multiplier removed here because it is now fundamentally built into the risk_pct tiering above.
+        let position_size = base_size * session_mult;
         
         // 5️⃣ Fix: Position sizing inversely proportional to SL distance
         let position_size = if sl != 0.0 && last_atr > 0.0 {
@@ -360,7 +367,8 @@ impl ScalpEngine {
         adx_vals: &[f64],
         last_swing_high: Option<f64>,
         last_swing_low: Option<f64>,
-        fvg_zones: &[PriceLevel]
+        fvg_zones: &[PriceLevel],
+        predictor_cache: &PredictorCache,
     ) -> Option<Decision> {
         if m5_closes.len() >= settings.fade_sma_period {
             // 3️⃣ Fix: Fade Guards (ADX & Trend Bias)
@@ -382,6 +390,12 @@ impl ScalpEngine {
             // Never fade strength: Check trend bias
             let trend_bias = get_trend_bias(m5_closes, 20);
             if (req.current_price > upper_fence && trend_bias > 0) || (req.current_price < lower_fence && trend_bias < 0) {
+                return None;
+            }
+            
+            // Strict Regime-Filtering (Don't Fade Trends)
+            let ml_bias = ensemble_predictor::calculate_bias(predictor_cache, "m5", m5_closes, req.current_price, 1.0);
+            if ml_bias.abs() > 0.8 { // 0.8 indicates a strong trend regime
                 return None;
             }
             
@@ -616,7 +630,8 @@ impl ScalpEngine {
                     let risk = (last_atr * settings.momentum_risk_atr_mult).max(last_atr * settings.momentum_min_risk_atr);
                     sl = if *entry_type == SignalDirection::Long { entry_price - risk } else { entry_price + risk };
                     tp1 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.momentum_tp1_atr_mult } else { entry_price - last_atr * settings.momentum_tp1_atr_mult };
-                    tp2 = if *entry_type == SignalDirection::Long { entry_price + last_atr * settings.momentum_tp2_atr_mult } else { entry_price - last_atr * settings.momentum_tp2_atr_mult };
+                    // Asymmetric TP for Momentum: Target a massive 5x ATR run, meant to trail behind Kalman
+                    tp2 = if *entry_type == SignalDirection::Long { entry_price + last_atr * 5.0 } else { entry_price - last_atr * 5.0 };
                 },
                 ScalpMode::Pullback => {
                     // 2️⃣ Fix: Structure-first, ATR-second. No structure = No trade.
