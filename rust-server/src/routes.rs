@@ -1,5 +1,6 @@
-use crate::{state::ApplicationStateWithTicks, llm::prompts::MACRO_SYSTEM_PROMPT_V1, HistoricalSignal};
-use xau_scalper_server::{NewsItem, CalendarEvent};
+use crate::{state::ApplicationStateWithTicks, llm::gemini::generate_analysis, llm::prompts::MACRO_SYSTEM_PROMPT_V1, HistoricalSignal};
+use xau_scalper_server::{NewsItem, CalendarEvent, SignalDirection};
+use crate::services::trading::TradingService;
 use xau_scalper_server::macro_analysis::builder::build_context;
 use xau_scalper_server::macro_analysis::types::TechnicalSignal;
 use axum::{
@@ -15,6 +16,8 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 use utoipa::{IntoParams, ToSchema};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::info;
 
