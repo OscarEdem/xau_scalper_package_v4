@@ -978,7 +978,7 @@ impl TradingSession {
         let rapid_reversal_seconds = 300; // Increased to 5m to prevent ping-pong
 
         // Require significantly higher conviction to override rapid reversal check
-        let reversal_conviction_threshold = (settings.scalp.min_conviction + 20.0).min(95.0);
+        let reversal_conviction_threshold = (settings.scalp.push_notification_threshold + 20.0).min(95.0);
 
         let should_notify = self.execution.evaluate_execution(
             &mut scalp_signal, 
