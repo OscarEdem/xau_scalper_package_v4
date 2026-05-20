@@ -9,7 +9,7 @@ use chrono::Utc;
 use prometheus::{Encoder, TextEncoder};
 use xau_scalper_server::config::TradingSettings;
 
-use crate::state::{ApplicationStateWithTicks, MetricsResponse, SavePushTokenRequest};
+use crate::state::{ApplicationStateWithTicks, MetricsResponse};
 
 #[utoipa::path(
     get,

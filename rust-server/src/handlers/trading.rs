@@ -15,6 +15,25 @@ use crate::state::{
 };
 
 
+/// This handler now acts as the primary data ingress point.
+#[utoipa::path(
+    post,
+    path = "/data",
+    request_body = EvalRequest,
+    responses(
+        (status = 200, description = "Data processed successfully")
+    )
+)]
+#[axum::debug_handler]
+pub async fn process_data_handler(
+    State(state): State<Arc<ApplicationStateWithTicks>>,
+    Json(req): Json<EvalRequest<'static>>,
+) -> Result<(StatusCode, Json<&'static str>), StatusCode> {
+    let service = crate::services::trading::TradingService::new(state);
+    service.process_eval_request(req).await?;
+    Ok((StatusCode::OK, Json("Data processed")))
+}
+
 #[utoipa::path(
     get,
     path = "/definitions/reasons",
@@ -93,11 +112,4 @@ pub async fn get_news_guard_status_handler(
     let result = xau_scalper_server::engines::news_guard::evaluate_news_guard(&symbol, now, &*news_events_guard, settings.scalp.news_pre_event_block_minutes, settings.scalp.news_post_event_block_minutes);
     Json(result)
 }
-
-#[utoipa::path(
-    get,
-    path = "/signals",
-    responses(
-        (status = 200, description = "Returns a log of all signals generated in the last 12 hours", body = Vec<HistoricalSignal>)
-    )
-)]
+
