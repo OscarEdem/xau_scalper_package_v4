@@ -256,7 +256,7 @@ impl Default for ScalpSettings {
             pullback_entry_displacement_atr: 0.30, // RAISED: Require deeper pullbacks to fair value (was 0.20)
             momentum_require_ml_confluence: true,
             // note: swing evaluation knobs belong to `SwingSettings`
-            max_signals_per_day: 8,
+            max_signals_per_day: 8, // Unified with swing engine
             circuit_breaker_enabled: true,
         }
     }
@@ -264,7 +264,7 @@ impl Default for ScalpSettings {
 
 fn default_pullback_entry_displacement_atr() -> f64 { 0.20 }
 fn default_momentum_require_ml_confluence() -> bool { true }
-fn default_max_scalp_signals_per_day() -> usize { 8 }
+fn default_max_scalp_signals_per_day() -> usize { default_max_signals_per_day() }
 fn default_circuit_breaker_enabled() -> bool { true }
 fn default_eval_on_h1_only() -> bool { false }
 fn default_eval_atr_multiplier() -> f64 { 1.5 }
@@ -406,7 +406,7 @@ impl Default for SwingSettings {
             eval_atr_multiplier: 1.5,
             eval_struct_margin_atr: 0.5,
             eval_m15_check_enabled: true,
-            max_signals_per_day: 4,
+            max_signals_per_day: 8, // Unified with scalp engine
             circuit_breaker_enabled: true,
         }
     }
@@ -419,7 +419,10 @@ fn default_m30_swing_lookback() -> usize { 30 }
 fn default_fractal_penalty() -> f64 { 25.0 }
 fn default_push_notifications_enabled() -> bool { true }
 fn default_push_notification_threshold() -> f64 { 60.0 }
-fn default_max_swing_signals_per_day() -> usize { 4 }
+/// Single source of truth for both scalp and swing daily signal cap.
+/// Override via API: POST /settings  or env: APP__TRADING__SCALP__MAX_SIGNALS_PER_DAY
+fn default_max_signals_per_day() -> usize { 8 }
+fn default_max_swing_signals_per_day() -> usize { default_max_signals_per_day() }
 
 impl SwingSettings {
     pub fn validate(&self) -> Result<(), String> {
