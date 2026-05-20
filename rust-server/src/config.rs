@@ -421,7 +421,7 @@ fn default_push_notifications_enabled() -> bool { true }
 fn default_push_notification_threshold() -> f64 { 60.0 }
 /// Single source of truth for both scalp and swing daily signal cap.
 /// Override via API: POST /settings  or env: APP__TRADING__SCALP__MAX_SIGNALS_PER_DAY
-fn default_max_signals_per_day() -> usize { 8 }
+fn default_max_signals_per_day() -> usize { 24 }
 fn default_max_swing_signals_per_day() -> usize { default_max_signals_per_day() }
 
 impl SwingSettings {

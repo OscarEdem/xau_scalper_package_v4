@@ -18,7 +18,7 @@ python train_lstm.py
 
 # All .onnx files in models/ must be copied to rust-server/models/ before building Docker
 # Run this from the ml_training/ directory:
-# Windows:  Copy-Item "models\*.onnx","models\*.json" "..\rust-server\models\" -Force
+# Windows:  Copy-Item "ml_training\models\*.onnx","ml_training\models\*.json" "rust-server\models\" -Force
 # Linux:    cp models/*.onnx models/*.json ../rust-server/models/
 
 
@@ -38,5 +38,4 @@ python train_heston.py
 python train_lstm.py
 
 # Copy models to rust-server
-Copy-Item "models\*.onnx","models\*.json" "..\rust-server\models\" -Force
-
+Copy-Item "ml_training\models\*.onnx","ml_training\models\*.json" "rust-server\models\" -Force
